@@ -1,0 +1,25 @@
+{
+  "name": "TEXOL Collect",
+  "short_name": "TEXOL",
+  "description": "Record money drops fast — TEXOL employee portal",
+  "start_url": "/?mode=collect",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b1a2e",
+  "theme_color": "#0b1a2e",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

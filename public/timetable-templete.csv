@@ -1,0 +1,3 @@
+date,shift_type,supervisor_email,manager_email,ambassador_email,attendant_emails,notes
+2026-09-22,day,supervisor@texol.ug,manager@texol.ug,ambassador@texol.ug,"attendant1@texol.ug;attendant2@texol.ug",Extra delivery at noon
+2026-09-22,night,supervisor2@texol.ug,manager@texol.ug,ambassador2@texol.ug,"attendant3@texol.ug;attendant4@texol.ug",
