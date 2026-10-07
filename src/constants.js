@@ -30,6 +30,7 @@ export const MENU = [
       { id: 'drops',         label: 'Money Drops',   icon: 'fa-money-bill-wave', minAccess: 60 },
       { id: 'transactions',  label: 'Transactions',  icon: 'fa-receipt',         minAccess: 30 },
       { id: 'balance',       label: 'Shift Balance', icon: 'fa-cash-register',   minAccess: 60 },
+      { id: 'balancing', label: 'Balancing Sheet', icon: 'fa-balance-scale', minAccess: 30 },
     ]
   },
   {

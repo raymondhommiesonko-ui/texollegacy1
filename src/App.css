@@ -1808,3 +1808,78 @@ button { font-family: inherit; }
 }
 .settings-screen .screen-head h3 { font-size: 22px; font-weight: 700; }
 .settings-screen .screen-head .sub { font-size: 13px; color: #6b85a0; margin-top: 4px; }
+/* Balancing sheet */
+.balancing-screen { padding-bottom: 40px; }
+.balance-sheet-head {
+  padding: 24px 32px 16px;
+  display: flex; justify-content: space-between; align-items: center;
+  flex-wrap: wrap; gap: 16px;
+}
+.balance-sheet-head h3 { font-size: 22px; font-weight: 700; }
+.balance-sheet-head .sub { font-size: 13px; color: #6b85a0; margin-top: 4px; }
+.balance-sheet-actions { display: flex; gap: 10px; }
+
+.balance-sheet {
+  border-collapse: collapse;
+  background: #fff;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid #eef2f6;
+  font-size: 13px;
+  min-width: 100%;
+}
+.balance-sheet th {
+  padding: 12px 10px;
+  background: #f8fafc;
+  border: 1px solid #eef2f6;
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  color: #6b85a0;
+  font-weight: 700;
+}
+.balance-sheet td {
+  padding: 8px 10px;
+  border: 1px solid #eef2f6;
+  vertical-align: middle;
+}
+.sticky-col {
+  position: sticky;
+  left: 0;
+  background: #f8fafc !important;
+  z-index: 2;
+  min-width: 160px;
+  font-weight: 600;
+}
+.total-col {
+  background: #fffbeb !important;
+  font-weight: 700;
+  text-align: right;
+  min-width: 100px;
+}
+.staff-head { text-align: center !important; min-width: 130px; }
+.staff-head .staff-name { font-size: 13px; color: #0b1a2e; font-weight: 700; }
+.staff-head .staff-role { font-size: 10px; color: #8ba0b9; margin-top: 2px; }
+
+.section-head td {
+  background: #0b1a2e !important;
+  color: #f0c94b !important;
+  font-weight: 700;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.auto-row { background: #f0fdf4; }
+.auto-row td:not(.sticky-col):not(.total-col) { color: #047857; font-weight: 600; }
+
+.balance-row td {
+  font-weight: 800;
+  font-size: 15px;
+}
+.balance-zero { background: #d1fae5 !important; color: #065f46; }
+.balance-short { background: #fee2e2 !important; color: #991b1b; }
+.balance-excess { background: #dbeafe !important; color: #1e40af; }
+
+.expense-cell { text-align: right; }

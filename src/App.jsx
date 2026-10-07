@@ -22,6 +22,7 @@ import Settings from './screens/Settings'
 import CompanyPhones from './screens/CompanyPhones'
 import SetupGuide from './screens/SetupGuide'
 import Incidents from './screens/Incidents'
+import Balancing from './screens/Balancing'
 import './App.css'
 
 export default function App() {
@@ -301,6 +302,7 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
           {screen === 'company-phones' && <CompanyPhones profile={profile} />}
           {screen === 'setup-guide' && <SetupGuide profile={profile} />}
           {screen === 'incidents' && <Incidents profile={profile} />}
+          {screen === 'balancing' && <Balancing profile={profile} />}
 
           {screen !== 'home' && screen !== 'attendance' && screen !== 'drops' &&
           screen !== 'timetable' && screen !== 'balance' && screen !== 'staff' &&
@@ -308,7 +310,8 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
           screen !== 'fuel-cards' && screen !== 'shortages' &&
           screen !== 'customers' && screen !== 'reports' &&
           screen !== 'transactions' && screen !== 'incidents' &&
-          screen !== 'company-phones' && screen !== 'setup-guide' && (
+          screen !== 'company-phones' && screen !== 'setup-guide' && 
+          screen !== 'balancing' && (
         <Placeholder screenId={screen} onBack={() => go('home')} />
 )}
         </div>
