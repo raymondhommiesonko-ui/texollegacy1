@@ -8,9 +8,10 @@ export default function Transactions({ profile }) {
   const isSupervisor = user.role === 'supervisor'
   const isAttendant = user.role === 'attendant'
   const isAmbassador = user.role === 'ambassador'
+  const [onShift, setOnShift] = useState(true)
 
-  const canViewAll = isManager || isSupervisor
-  const canExport = isManager || isSupervisor
+  const powers = profile.powers || {}
+  const canViewAll = isManager || isSupervisor || powers.view_transactions
 
   const [rows, setRows] = useState([])
   const [staffCodes, setStaffCodes] = useState({})     // user_id -> { code, color, name }

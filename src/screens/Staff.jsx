@@ -668,6 +668,7 @@ const POWER_GROUPS = [
     { id: 'view_staff_list', label: 'View staff list' },
     { id: 'view_fuelcards', label: 'View uploaded fuel card files' },
     { id: 'view_customers', label: 'View customer records' },
+    { id: 'view_transactions', label: 'View all transactions' },
   ]},
   { name: 'Clock In/Out', powers: [
     { id: 'clock_self', label: 'Clock in / out for self' },
@@ -699,6 +700,7 @@ const POWER_GROUPS = [
     { id: 'export_incidents', label: 'Export incidents' },
     { id: 'export_audit', label: 'Export audit' },
     { id: 'export_transactions', label: 'Export transactions to Excel' },
+    { id: 'export_reports', label: 'Download reports' },
   ]},
   { name: 'Approvals', powers: [
     { id: 'approve_warnings', label: 'Approve warnings stage 1' },
@@ -734,6 +736,7 @@ const POWER_GROUPS = [
     { id: 'edit_sidebar', label: 'Change sidebar color' },
     { id: 'switch_station', label: 'Switch station' },
     { id: 'send_to_hq', label: 'Send to HQ' },
+    { id: 'open_shift', label: 'Open a new shift' },
   ]},
 ]
 

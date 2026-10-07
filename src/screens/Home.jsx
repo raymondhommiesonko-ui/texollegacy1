@@ -17,7 +17,7 @@ export default function Home({ profile, onNavigate }) {
 }
 
 /* ============================================================
-   MOTIVATION BANNER — rotating + editable
+   MOTIVATION BANNER
    ============================================================ */
 function MotivationBanner({ stationId, canEdit }) {
   const [messages, setMessages] = useState([])
@@ -110,17 +110,12 @@ function MotivationEditor({ stationId, messages, onClose, onSaved }) {
       for (const m of list) {
         if (m.id.startsWith('new-')) {
           await supabase.from('motivation_messages').insert({
-            station_id: stationId,
-            head: m.head,
-            body: m.body,
-            is_active: true,
-            sort_order: m.sort_order,
+            station_id: stationId, head: m.head, body: m.body,
+            is_active: true, sort_order: m.sort_order,
           })
         } else {
           await supabase.from('motivation_messages').update({
-            head: m.head,
-            body: m.body,
-            sort_order: m.sort_order,
+            head: m.head, body: m.body, sort_order: m.sort_order,
           }).eq('id', m.id)
         }
       }
@@ -176,8 +171,7 @@ function MotivationEditor({ stationId, messages, onClose, onSaved }) {
 }
 
 /* ============================================================
-   WINNER STRIP — rotating tiles
-   Includes: today's drops + fuel card champions
+   WINNER STRIP — now includes Transactions
    ============================================================ */
 function WinnerStrip({ profile }) {
   const user = profile.user
@@ -191,7 +185,7 @@ function WinnerStrip({ profile }) {
       const today = new Date().toISOString().slice(0, 10)
       const computed = []
 
-      // ---- Top collectors by drops today
+      // Today's drops
       const { data: shifts } = await supabase
         .from('shifts')
         .select('id')
@@ -224,9 +218,7 @@ function WinnerStrip({ profile }) {
 
       if (sorted[0]) {
         computed.push({
-          type: 'liters',
-          icon: 'fa-money-bill-wave',
-          label: 'Top collector · today',
+          type: 'liters', icon: 'fa-money-bill-wave', label: 'Top collector · today',
           name: nameById[sorted[0][0]] || '—',
           reason: `UGX ${sorted[0][1].toLocaleString()} collected`,
           crown: '👑',
@@ -234,23 +226,20 @@ function WinnerStrip({ profile }) {
       }
       if (sorted[1]) {
         computed.push({
-          type: 'cards',
-          icon: 'fa-credit-card',
-          label: 'Runner-up · today',
+          type: 'cards', icon: 'fa-credit-card', label: 'Runner-up · today',
           name: nameById[sorted[1][0]] || '—',
           reason: `UGX ${sorted[1][1].toLocaleString()} collected`,
           crown: '🏆',
         })
       }
 
-      // ---- Fuel card champions (appointed by manager/supervisor/admin)
+      // Fuel card champions
       const weekStart = getMondayISO()
       const { data: champs } = await supabase
         .from('card_champions')
         .select('*, user:users(name)')
         .eq('station_id', user.station_id)
         .eq('week_start', weekStart)
-
       const kindMeta = {
         best_cards:     { icon: 'fa-credit-card',    label: 'Best cards worked' },
         best_sales:     { icon: 'fa-money-bill-wave', label: 'Best card sales' },
@@ -258,22 +247,17 @@ function WinnerStrip({ profile }) {
         best_app_users: { icon: 'fa-mobile-alt',     label: 'Best app users' },
         best_topups:    { icon: 'fa-arrow-up',       label: 'Best top-ups' },
       }
-
-      if (champs && champs.length > 0) {
-        champs.forEach(c => {
-          const meta = kindMeta[c.kind] || { icon: 'fa-star', label: c.kind }
-          computed.push({
-            type: 'cards',
-            icon: meta.icon,
-            label: meta.label,
-            name: c.user?.name || '—',
-            reason: c.reason || 'Champion this week',
-            crown: '👑',
-          })
+      ;(champs || []).forEach(c => {
+        const meta = kindMeta[c.kind] || { icon: 'fa-star', label: c.kind }
+        computed.push({
+          type: 'cards', icon: meta.icon, label: meta.label,
+          name: c.user?.name || '—',
+          reason: c.reason || 'Champion this week',
+          crown: '👑',
         })
-      }
+      })
 
-      // ---- Today's top card worker (from card_sales view)
+      // Top card worker today
       const { data: staffCards } = await supabase
         .from('v_staff_daily_cards')
         .select('*')
@@ -281,41 +265,55 @@ function WinnerStrip({ profile }) {
         .eq('day', today)
         .order('cards_worked', { ascending: false })
         .limit(1)
-
       if (staffCards && staffCards[0]) {
         const top = staffCards[0]
         computed.push({
-          type: 'cards',
-          icon: 'fa-id-card',
-          label: 'Top card worker · today',
+          type: 'cards', icon: 'fa-id-card', label: 'Top card worker · today',
           name: top.staff_name || '—',
           reason: `${top.cards_worked} cards worked · ${Number(top.card_sales_liters || 0).toLocaleString()} L`,
           crown: '🎖',
         })
       }
 
-      // ---- Fallback if no data at all
+      // Top transaction claimant today
+      const { data: txns } = await supabase
+        .from('transactions')
+        .select('claimed_by, amount')
+        .eq('station_id', user.station_id)
+        .eq('status', 'claimed')
+        .gte('received_at', today + 'T00:00:00')
+        .lte('received_at', today + 'T23:59:59')
+      const txnTotals = {}
+      ;(txns || []).forEach(t => {
+        if (!t.claimed_by) return
+        txnTotals[t.claimed_by] = (txnTotals[t.claimed_by] || 0) + Number(t.amount || 0)
+      })
+      const txnSorted = Object.entries(txnTotals).sort((a,b) => b[1] - a[1])
+      if (txnSorted[0]) {
+        computed.push({
+          type: 'cards', icon: 'fa-receipt', label: 'Top transactions · today',
+          name: nameById[txnSorted[0][0]] || '—',
+          reason: `UGX ${txnSorted[0][1].toLocaleString()} claimed`,
+          crown: '💎',
+        })
+      }
+
       if (computed.length === 0) {
         computed.push({
-          type: 'liters',
-          icon: 'fa-gas-pump',
-          label: 'Waiting for first activity',
+          type: 'liters', icon: 'fa-gas-pump', label: 'Waiting for first activity',
           name: 'No data yet',
           reason: 'Winners will appear here once the team starts working',
           crown: '👑',
         })
       }
 
-      // Ensure at least 4 tiles (filler)
       const fillers = [
         { type:'cards', icon:'fa-credit-card', label:'Top on cards', name:'—', reason:'Card leaders appear here', crown:'🏆' },
         { type:'gas',   icon:'fa-fire',        label:'Top on gas',   name:'—', reason:'LPG leaders appear here',   crown:'🥇' },
         { type:'lub',   icon:'fa-oil-can',     label:'Top on lubricants', name:'—', reason:'Lubricant leaders appear here', crown:'🥈' },
       ]
       let fi = 0
-      while (computed.length < 4 && fi < fillers.length) {
-        computed.push(fillers[fi++])
-      }
+      while (computed.length < 4 && fi < fillers.length) computed.push(fillers[fi++])
 
       setTiles(computed)
       setLoading(false)
@@ -364,9 +362,7 @@ function WinnerStrip({ profile }) {
 }
 
 /* ============================================================
-   WINNER CARDS
-   - Today's Top Attendant: automatic (from drops)
-   - This Week's Champion: MANUAL (set by manager/supervisor/admin)
+   WINNER CARDS — 3 cards now
    ============================================================ */
 function WinnerCards({ profile }) {
   const user = profile.user
@@ -374,11 +370,13 @@ function WinnerCards({ profile }) {
 
   const [today, setToday] = useState(null)
   const [week, setWeek] = useState(null)
+  const [txnTop, setTxnTop] = useState(null)
   const [openPicker, setOpenPicker] = useState(false)
 
   async function load() {
     const today_iso = new Date().toISOString().slice(0, 10)
 
+    // Today's drops
     const { data: todayShifts } = await supabase
       .from('shifts')
       .select('id')
@@ -414,6 +412,7 @@ function WinnerCards({ profile }) {
       setToday(null)
     }
 
+    // Week champion (manual)
     const weekStart = getMondayISO()
     const { data: champ } = await supabase
       .from('champion_selections')
@@ -427,10 +426,30 @@ function WinnerCards({ profile }) {
       setWeek({
         name: nameById[champ.user_id] || '—',
         reason: champ.reason || 'Champion this week',
-        selectedBy: champ.selected_by,
       })
     } else {
       setWeek(null)
+    }
+
+    // Today's transaction top claimant
+    const { data: txns } = await supabase
+      .from('transactions')
+      .select('claimed_by, amount')
+      .eq('station_id', user.station_id)
+      .eq('status', 'claimed')
+      .gte('received_at', today_iso + 'T00:00:00')
+      .lte('received_at', today_iso + 'T23:59:59')
+
+    const txnTotals = {}
+    ;(txns || []).forEach(t => {
+      if (!t.claimed_by) return
+      txnTotals[t.claimed_by] = (txnTotals[t.claimed_by] || 0) + Number(t.amount || 0)
+    })
+    const txnSorted = Object.entries(txnTotals).sort((a,b) => b[1] - a[1])
+    if (txnSorted[0]) {
+      setTxnTop({ name: nameById[txnSorted[0][0]] || '—', total: txnSorted[0][1] })
+    } else {
+      setTxnTop(null)
     }
   }
 
@@ -452,22 +471,27 @@ function WinnerCards({ profile }) {
       <div className="winner-card week">
         <div className="label"><i className="fas fa-calendar-week" /> This Week's Champion</div>
         {canEdit && (
-          <button
-            className="champion-edit"
-            onClick={() => setOpenPicker(true)}
-            title="Choose this week's champion"
-          >
+          <button className="champion-edit" onClick={() => setOpenPicker(true)} title="Choose this week's champion">
             <i className="fas fa-pen" />
           </button>
         )}
         <div className="crown">🏆</div>
         <div className="name">{week?.name || '—'}</div>
-        <div className="role">
-          {week ? 'Selected by manager' : 'Not chosen yet'}
-        </div>
+        <div className="role">{week ? 'Selected by manager' : 'Not chosen yet'}</div>
         <div className="metric">
           <i className="fas fa-fire" />
           {week ? week.reason : 'Waiting for manager to pick'}
+        </div>
+      </div>
+
+      <div className="winner-card txn">
+        <div className="label"><i className="fas fa-receipt" /> Top Transaction Attendant</div>
+        <div className="crown">💎</div>
+        <div className="name">{txnTop?.name || '—'}</div>
+        <div className="role">Most confirmed transactions today</div>
+        <div className="metric">
+          <i className="fas fa-money-bill-wave" />
+          {txnTop ? `UGX ${txnTop.total.toLocaleString()} claimed` : 'No transactions claimed yet'}
         </div>
       </div>
 
@@ -483,7 +507,7 @@ function WinnerCards({ profile }) {
 }
 
 /* ============================================================
-   CHAMPION PICKER (for week champion — the manual one)
+   CHAMPION PICKER
    ============================================================ */
 function ChampionPicker({ profile, onClose, onSaved }) {
   const user = profile.user
@@ -594,7 +618,7 @@ function ThanksList({ profile }) {
 
       const { data: users } = await supabase
         .from('users')
-        .select('id, name, initials, role')
+        .select('id, name, initials')
         .eq('station_id', user.station_id)
       const map = {}
       ;(users || []).forEach(u => { map[u.id] = u })
@@ -612,11 +636,7 @@ function ThanksList({ profile }) {
       }))
 
       if (built.length === 0) {
-        built.push({
-          initials: 'TX',
-          name: 'TEXOL LEGACY team',
-          reason: 'Ready for another great shift',
-        })
+        built.push({ initials: 'TX', name: 'TEXOL LEGACY team', reason: 'Ready for another great shift' })
       }
 
       setItems(built)
@@ -643,13 +663,14 @@ function ThanksList({ profile }) {
 }
 
 /* ============================================================
-   LIVE STATS + QUICK ACTIONS
+   LIVE STATS
    ============================================================ */
 function LiveStats({ profile, onNavigate }) {
   const user = profile.user
   const station = profile.station
   const [stats, setStats] = useState({
-    staffCount: null, dropTotal: null, dropCount: null, openShifts: null, pendingAttendance: null,
+    staffCount: null, dropTotal: null, dropCount: null,
+    openShifts: null, pendingAttendance: null, txnCount: null,
   })
   const [loading, setLoading] = useState(true)
 
@@ -660,13 +681,16 @@ function LiveStats({ profile, onNavigate }) {
       const stationId = user.station_id
       const today = new Date().toISOString().slice(0, 10)
 
-      const [staffRes, shiftsRes, attRes] = await Promise.all([
+      const [staffRes, shiftsRes, attRes, txnRes] = await Promise.all([
         supabase.from('users').select('id', { count: 'exact', head: true })
           .eq('station_id', stationId).eq('is_active', true),
         supabase.from('shifts').select('id, status')
           .eq('station_id', stationId).eq('shift_date', today),
         supabase.from('attendance').select('id', { count: 'exact', head: true })
           .eq('status', 'pending'),
+        supabase.from('transactions').select('id', { count: 'exact', head: true })
+          .eq('station_id', stationId).eq('status', 'claimed')
+          .gte('received_at', today + 'T00:00:00'),
       ])
 
       if (cancelled) return
@@ -684,6 +708,7 @@ function LiveStats({ profile, onNavigate }) {
         dropTotal: drops.reduce((s, d) => s + Number(d.amount), 0),
         dropCount: drops.length,
         pendingAttendance: attRes.count ?? 0,
+        txnCount: txnRes.count ?? 0,
       })
       setLoading(false)
     }
@@ -696,8 +721,7 @@ function LiveStats({ profile, onNavigate }) {
       <div className="card-panel" style={{ gridTemplateColumns: '1fr', paddingBottom: 20 }}>
         <div className="card" style={{
           background: 'linear-gradient(135deg, #d4a91e 0%, #f0c94b 100%)',
-          border: 'none',
-          color: '#0b1a2e',
+          border: 'none', color: '#0b1a2e',
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 20, flexWrap: 'wrap' }}>
             <div style={{
@@ -721,11 +745,9 @@ function LiveStats({ profile, onNavigate }) {
               onClick={() => window.location.href = '/?mode=collect'}
               style={{
                 background: '#0b1a2e', color: '#f0c94b',
-                padding: '14px 26px',
-                border: 'none', borderRadius: 12,
+                padding: '14px 26px', border: 'none', borderRadius: 12,
                 fontWeight: 700, fontSize: 14, cursor: 'pointer',
-                fontFamily: 'inherit',
-                display: 'inline-flex', alignItems: 'center', gap: 10,
+                fontFamily: 'inherit', display: 'inline-flex', alignItems: 'center', gap: 10,
               }}
             >
               <i className="fas fa-arrow-right" /> Open
@@ -738,7 +760,7 @@ function LiveStats({ profile, onNavigate }) {
         <StatCard title="👥 Staff on register" value={loading ? '—' : `${stats.staffCount}`} sub="Active at your station" />
         <StatCard title="🟢 Open shifts today" value={loading ? '—' : `${stats.openShifts}`} sub={new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })} />
         <StatCard title="💰 Drops today" value={loading ? '—' : `UGX ${stats.dropTotal.toLocaleString()}`} sub={loading ? '' : `${stats.dropCount} drops`} />
-        <StatCard title="⏰ Pending clock-ins" value={loading ? '—' : `${stats.pendingAttendance}`} sub="Awaiting approval" />
+        <StatCard title="📱 Transactions claimed" value={loading ? '—' : `${stats.txnCount}`} sub="Today" />
       </div>
 
       <div className="card-panel">
@@ -782,7 +804,7 @@ function StatCard({ title, value, sub }) {
 }
 
 /* ============================================================
-   DATE HELPERS
+   HELPERS
    ============================================================ */
 function getMondayISO() {
   const d = new Date()

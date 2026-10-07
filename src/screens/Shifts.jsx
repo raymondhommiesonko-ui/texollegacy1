@@ -3,10 +3,13 @@ import { supabase } from '../supabase'
 
 export default function Shifts({ profile, onOpenShift }) {
   const user = profile.user
-  // All three roles can open and close shifts directly
-  const canManageShift = ['manager','admin','supervisor'].includes(user.role)
-  const canEdit = ['manager','admin','supervisor'].includes(user.role)
-  const canViewAll = ['manager','admin','supervisor'].includes(user.role)
+  const powers = profile.powers || {}
+  const isAdminManager = ['admin','manager'].includes(user.role)
+  const isSupervisor = user.role === 'supervisor'
+  const canOpenShift = isAdminManager || (isSupervisor && powers.open_shift)
+  const canEdit = isAdminManager || isSupervisor
+  const canViewAll = isAdminManager || isSupervisor
+  const canManageShift = canEdit   // edit existing
 
   const [shifts, setShifts] = useState([])
   const [usersById, setUsersById] = useState({})

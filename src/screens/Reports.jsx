@@ -3,16 +3,17 @@ import { supabase } from '../supabase'
 
 export default function Reports({ profile }) {
   const user = profile.user
-  const access = user.access_score ?? 30
+  const powers = profile.powers || {}
   const isManager = ['admin','manager'].includes(user.role)
   const isSupervisor = user.role === 'supervisor'
-  const isAmbassador = user.role === 'ambassador'
   const isAttendant = user.role === 'attendant'
 
-  // Which report types are visible
+  const canExport = isManager || isSupervisor || powers.export_reports
+
   const REPORT_TYPES = [
     { id: 'attendance',   label: 'Attendance',         icon: 'fa-clock',              roles: ['admin','manager','supervisor','ambassador','attendant'] },
     { id: 'drops',        label: 'Money Drops',        icon: 'fa-money-bill-wave',    roles: ['admin','manager','supervisor','attendant'] },
+    { id: 'transactions', label: 'Transactions',       icon: 'fa-receipt',            roles: ['admin','manager','supervisor','ambassador','attendant'] },
     { id: 'balance',      label: 'Shift Balances',     icon: 'fa-cash-register',      roles: ['admin','manager','supervisor'] },
     { id: 'card_sales',   label: 'Fuel Card Sales',    icon: 'fa-credit-card',        roles: ['admin','manager','supervisor','ambassador','attendant'] },
     { id: 'card_topups',  label: 'Card Top-ups',       icon: 'fa-arrow-up',           roles: ['admin','manager','supervisor','ambassador'] },
@@ -58,7 +59,6 @@ export default function Reports({ profile }) {
           .lte('clock_in_at', toISO)
           .order('clock_in_at', { ascending: false })
           .limit(500)
-        // Attendant and Ambassador: only own
         if (!isManager && !isSupervisor) q = q.eq('user_id', user.id)
 
         const { data: d, error: e } = await q
@@ -83,7 +83,6 @@ export default function Reports({ profile }) {
       }
 
       else if (type === 'drops') {
-        // Find shifts of station in range
         const { data: shifts } = await supabase
           .from('shifts')
           .select('id, shift_date, shift_type')
@@ -122,6 +121,41 @@ export default function Reports({ profile }) {
         ]
       }
 
+      else if (type === 'transactions') {
+        let q = supabase
+          .from('transactions')
+          .select('*, claimer:users!transactions_claimed_by_fkey(name), code:staff_codes!staff_codes_user_id_fkey(code, color)')
+          .eq('station_id', stationId)
+          .gte('received_at', fromISO)
+          .lte('received_at', toISO)
+          .order('received_at', { ascending: false })
+          .limit(3000)
+        if (!isManager && !isSupervisor && !powers.view_transactions) {
+          q = q.eq('claimed_by', user.id)
+        }
+
+        const { data: d, error: e } = await q
+        if (e) throw e
+        data = (d || []).map(r => ({
+          Date: String(r.received_at).slice(0, 10),
+          Time: fmtTime(r.received_at),
+          'Txn ID': r.txn_id,
+          Amount: Number(r.amount || 0),
+          Provider: r.provider,
+          'From': r.customer_name || r.customer_phone || '',
+          'Claimed by': r.claimer?.name || '—',
+          Code: r.code?.code || '—',
+          Status: r.status,
+        }))
+        cols = ['Date','Time','Txn ID','Amount','Provider','From','Claimed by','Code','Status']
+        const claimed = data.filter(r => r.Status === 'claimed')
+        summ = [
+          { label: 'Total txn', value: data.length },
+          { label: 'Claimed', value: claimed.length },
+          { label: 'Total UGX', value: claimed.reduce((s, r) => s + r.Amount, 0).toLocaleString() },
+        ]
+      }
+
       else if (type === 'balance') {
         const { data: shifts } = await supabase
           .from('shifts')
@@ -132,25 +166,29 @@ export default function Reports({ profile }) {
         const shiftIds = (shifts || []).map(s => s.id)
 
         const { data: d, error: e } = await supabase
-          .from('shift_balances')
-          .select('*, attendant:users!shift_balances_attendant_id_fkey(name)')
+          .from('balance_entries')
+          .select('*, users(name, role)')
           .in('shift_id', shiftIds)
         if (e) throw e
         data = (d || []).map(r => ({
           Date: shifts.find(s => s.id === r.shift_id)?.shift_date || '',
           Shift: shifts.find(s => s.id === r.shift_id)?.shift_type || '',
-          Attendant: r.attendant?.name || '—',
-          Expected: Number(r.expected_sales || 0),
-          Dropped: Number(r.cash_dropped || 0),
-          'In hand': Number(r.cash_in_hand || 0),
-          Variance: Number(r.variance || 0),
-          Balanced: r.balanced ? 'yes' : 'no',
+          Attendant: r.users?.name || '—',
+          'Total sales': Number(r.total_sales || 0),
+          Drops: Number(r.drops || 0),
+          Visa: Number(r.visa || 0),
+          Momo: Number(r.momo || 0),
+          'Card sales': Number(r.card_sales_manual || 0),
+          'App users': Number(r.app_user || 0),
+          Cash: Number(r.cash_in_hand || 0),
+          Balance: Number(r.balance || 0),
+          Status: r.balance_status,
         }))
-        cols = ['Date','Shift','Attendant','Expected','Dropped','In hand','Variance','Balanced']
+        cols = ['Date','Shift','Attendant','Total sales','Drops','Visa','Momo','Card sales','App users','Cash','Balance','Status']
         summ = [
-          { label: 'Attendants', value: data.length },
-          { label: 'Balanced', value: data.filter(r => r.Balanced === 'yes').length },
-          { label: 'Total variance', value: data.reduce((s, r) => s + r.Variance, 0).toLocaleString() },
+          { label: 'Entries', value: data.length },
+          { label: 'Total sales', value: data.reduce((s,r) => s + r['Total sales'], 0).toLocaleString() },
+          { label: 'Total balance', value: data.reduce((s,r) => s + r.Balance, 0).toLocaleString() },
         ]
       }
 
@@ -447,12 +485,20 @@ export default function Reports({ profile }) {
           <div className="sub">Download any report as CSV or Word</div>
         </div>
         <div className="reports-actions">
-          <button className="btn-ghost" onClick={downloadCSV} disabled={filtered.length === 0}>
-            <i className="fas fa-file-csv" /> CSV
-          </button>
-          <button className="btn-primary" onClick={downloadWord} disabled={filtered.length === 0}>
-            <i className="fas fa-file-word" /> Word
-          </button>
+          {canExport ? (
+            <>
+              <button className="btn-ghost" onClick={downloadCSV} disabled={filtered.length === 0}>
+                <i className="fas fa-file-csv" /> CSV
+              </button>
+              <button className="btn-primary" onClick={downloadWord} disabled={filtered.length === 0}>
+                <i className="fas fa-file-word" /> Word
+              </button>
+            </>
+          ) : (
+            <div className="field-hint" style={{ padding: '10px 14px', background: '#fef3c7', color: '#92400e' }}>
+              <i className="fas fa-lock" /> Ask a supervisor to grant you the "Download reports" power
+            </div>
+          )}
         </div>
       </div>
 
