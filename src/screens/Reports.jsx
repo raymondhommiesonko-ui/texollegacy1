@@ -124,7 +124,7 @@ export default function Reports({ profile }) {
       else if (type === 'transactions') {
         let q = supabase
           .from('transactions')
-          .select('*, claimer:users!transactions_claimed_by_fkey(name), code:staff_codes!staff_codes_user_id_fkey(code, color)')
+          .select('*')
           .eq('station_id', stationId)
           .gte('received_at', fromISO)
           .lte('received_at', toISO)
@@ -136,6 +136,22 @@ export default function Reports({ profile }) {
 
         const { data: d, error: e } = await q
         if (e) throw e
+
+        // Fetch staff names + codes separately
+        const { data: staffList } = await supabase
+          .from('users')
+          .select('id, name')
+          .eq('station_id', stationId)
+        const nameMap = {}
+        ;(staffList || []).forEach(u => { nameMap[u.id] = u.name })
+
+        const { data: codeList } = await supabase
+          .from('staff_codes')
+          .select('user_id, code, color')
+          .eq('station_id', stationId)
+        const codeMap = {}
+        ;(codeList || []).forEach(c => { codeMap[c.user_id] = c })
+
         data = (d || []).map(r => ({
           Date: String(r.received_at).slice(0, 10),
           Time: fmtTime(r.received_at),
@@ -143,8 +159,8 @@ export default function Reports({ profile }) {
           Amount: Number(r.amount || 0),
           Provider: r.provider,
           'From': r.customer_name || r.customer_phone || '',
-          'Claimed by': r.claimer?.name || '—',
-          Code: r.code?.code || '—',
+          'Claimed by': nameMap[r.claimed_by] || '—',
+          Code: codeMap[r.claimed_by]?.code || '—',
           Status: r.status,
         }))
         cols = ['Date','Time','Txn ID','Amount','Provider','From','Claimed by','Code','Status']

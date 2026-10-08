@@ -4,18 +4,19 @@ import { supabase } from '../supabase'
 
 export default function Transactions({ profile }) {
   const user = profile.user
+  const powers = profile.powers || {}
   const isManager = ['admin','manager'].includes(user.role)
   const isSupervisor = user.role === 'supervisor'
-  const isAttendant = user.role === 'attendant'
-  const isAmbassador = user.role === 'ambassador'
-  const [onShift, setOnShift] = useState(true)
 
-  const powers = profile.powers || {}
   const canViewAll = isManager || isSupervisor || powers.view_transactions
+  const canExport = isManager || isSupervisor || powers.export_transactions
 
   const [rows, setRows] = useState([])
-  const [staffCodes, setStaffCodes] = useState({})     // user_id -> { code, color, name }
+  const [staffCodes, setStaffCodes] = useState({})
   const [loading, setLoading] = useState(true)
+  const [onShift, setOnShift] = useState(true)
+  const [errorMsg, setErrorMsg] = useState('')
+
   const [filter, setFilter] = useState({
     from: new Date().toISOString().slice(0,10),
     to: new Date().toISOString().slice(0,10),
@@ -27,22 +28,52 @@ export default function Transactions({ profile }) {
     search: '',
   })
 
-  // Load staff codes map
   async function loadStaffCodes() {
-    const { data } = await supabase
-      .from('staff_codes')
-      .select('user_id, code, color, users(name, role, station_id)')
-      .eq('station_id', user.station_id)
-    const map = {}
-    ;(data || []).forEach(sc => {
-      map[sc.user_id] = { code: sc.code, color: sc.color, name: sc.users?.name || '—' }
-    })
-    setStaffCodes(map)
+    try {
+      const { data: codes } = await supabase
+        .from('staff_codes')
+        .select('user_id, code, color')
+        .eq('station_id', user.station_id)
+
+      const { data: users } = await supabase
+        .from('users')
+        .select('id, name, role')
+        .eq('station_id', user.station_id)
+
+      const userMap = {}
+      ;(users || []).forEach(u => { userMap[u.id] = u })
+
+      const map = {}
+      ;(codes || []).forEach(sc => {
+        map[sc.user_id] = {
+          code: sc.code,
+          color: sc.color,
+          name: userMap[sc.user_id]?.name || '—',
+        }
+      })
+      setStaffCodes(map)
+    } catch (e) {
+      console.error('loadStaffCodes:', e)
+    }
   }
 
   async function loadTransactions() {
     setLoading(true)
+    setErrorMsg('')
+
     try {
+      // Check shift for staff without elevated access
+      if (!canViewAll) {
+        const { data: on } = await supabase.rpc('am_i_on_shift')
+        if (!on) {
+          setRows([])
+          setOnShift(false)
+          setLoading(false)
+          return
+        }
+      }
+      setOnShift(true)
+
       const fromISO = filter.from + 'T00:00:00'
       const toISO = filter.to + 'T23:59:59'
 
@@ -55,7 +86,6 @@ export default function Transactions({ profile }) {
         .order('received_at', { ascending: false })
         .limit(2000)
 
-      // Attendants/ambassadors: only own
       if (!canViewAll) {
         q = q.eq('claimed_by', user.id)
       }
@@ -63,23 +93,12 @@ export default function Transactions({ profile }) {
       const { data, error } = await q
       if (error) throw error
 
-      // Apply client-side filters (time, provider, attendant, status, search)
       let result = data || []
-      if (filter.timeFrom) {
-        result = result.filter(t => String(t.received_at).slice(11,16) >= filter.timeFrom)
-      }
-      if (filter.timeTo) {
-        result = result.filter(t => String(t.received_at).slice(11,16) <= filter.timeTo)
-      }
-      if (filter.provider !== 'all') {
-        result = result.filter(t => t.provider === filter.provider)
-      }
-      if (filter.attendant !== 'all') {
-        result = result.filter(t => t.claimed_by === filter.attendant)
-      }
-      if (filter.status !== 'all') {
-        result = result.filter(t => t.status === filter.status)
-      }
+      if (filter.timeFrom) result = result.filter(t => String(t.received_at).slice(11,16) >= filter.timeFrom)
+      if (filter.timeTo) result = result.filter(t => String(t.received_at).slice(11,16) <= filter.timeTo)
+      if (filter.provider !== 'all') result = result.filter(t => t.provider === filter.provider)
+      if (filter.attendant !== 'all') result = result.filter(t => t.claimed_by === filter.attendant)
+      if (filter.status !== 'all') result = result.filter(t => t.status === filter.status)
       if (filter.search) {
         const s = filter.search.toLowerCase()
         result = result.filter(t =>
@@ -91,6 +110,7 @@ export default function Transactions({ profile }) {
       setRows(result)
     } catch (e) {
       console.error('Load transactions error:', e)
+      setErrorMsg(e.message || 'Could not load transactions')
     }
     setLoading(false)
   }
@@ -98,7 +118,6 @@ export default function Transactions({ profile }) {
   useEffect(() => { loadStaffCodes() }, [user.station_id])
   useEffect(() => { loadTransactions() }, [user.station_id, filter])
 
-  // Stats
   const stats = useMemo(() => {
     const total = rows.reduce((s, r) => s + Number(r.amount || 0), 0)
     const claimed = rows.filter(r => r.status === 'claimed').length
@@ -106,7 +125,6 @@ export default function Transactions({ profile }) {
     return { total, claimed, unclaimed, count: rows.length }
   }, [rows])
 
-  // Summary by attendant (for the right block in Excel)
   const byAttendant = useMemo(() => {
     const map = {}
     rows.forEach(r => {
@@ -128,12 +146,9 @@ export default function Transactions({ profile }) {
     return Object.values(map).sort((a,b) => b.total - a.total)
   }, [rows, staffCodes])
 
-  // Best attendant
   const best = byAttendant[0] || null
 
-  // ---- Excel export
   async function exportExcel(provider) {
-    // Filter to that provider
     const list = rows.filter(r => r.provider === provider)
     if (list.length === 0) {
       alert('No ' + provider + ' transactions in this range')
@@ -149,7 +164,6 @@ export default function Transactions({ profile }) {
       { views: [{ state: 'frozen', ySplit: 1 }] }
     )
 
-    // Columns: A = Time, B = Txn ID, C = Amount, D = spacer, E = Name, F = Total
     sheet.columns = [
       { key: 'time',   width: 12 },
       { key: 'txn',    width: 20 },
@@ -159,7 +173,6 @@ export default function Transactions({ profile }) {
       { key: 'total',  width: 16 },
     ]
 
-    // Header row
     const header = sheet.getRow(1)
     header.getCell('A').value = 'TIME'
     header.getCell('B').value = 'TXN ID'
@@ -174,8 +187,6 @@ export default function Transactions({ profile }) {
     }
     header.height = 22
 
-    // Body rows: for each transaction, put time/txn/amount in A/B/C
-    // Amount cell colored by claimed attendant
     list.slice().reverse().forEach((r, i) => {
       const rowNum = i + 2
       const row = sheet.getRow(rowNum)
@@ -185,21 +196,18 @@ export default function Transactions({ profile }) {
                       String(time.getSeconds()).padStart(2,'0')
       row.getCell(1).value = timeStr
       row.getCell(2).value = String(r.txn_id)
-      row.getCell(2).numFmt = '@'  // text format so Excel doesn't scientific-notate
+      row.getCell(2).numFmt = '@'
       row.getCell(3).value = Number(r.amount || 0)
       row.getCell(3).numFmt = '#,##0'
 
-      // Color the amount cell by attendant
       const sc = r.claimed_by ? staffCodes[r.claimed_by] : null
       const colorHex = sc?.color ? sc.color.replace('#','').toUpperCase() : null
       if (colorHex) {
         row.getCell(3).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + colorHex } }
       }
-
       row.getCell(3).alignment = { horizontal: 'right' }
     })
 
-    // Summary block on the right starting at row 3
     byAttendant.forEach((a, idx) => {
       const rowNum = 3 + idx
       const row = sheet.getRow(rowNum)
@@ -213,7 +221,6 @@ export default function Transactions({ profile }) {
       row.getCell(6).alignment = { horizontal: 'right' }
     })
 
-    // Grand total row for the left block
     const totalRow = list.length + 2
     sheet.getRow(totalRow).getCell(2).value = 'TOTAL'
     sheet.getRow(totalRow).getCell(2).font = { bold: true }
@@ -222,7 +229,6 @@ export default function Transactions({ profile }) {
     sheet.getRow(totalRow).getCell(3).font = { bold: true }
     sheet.getRow(totalRow).getCell(3).border = { top: { style: 'thin' } }
 
-    // Download
     const buf = await wb.xlsx.writeBuffer()
     const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
     const url = URL.createObjectURL(blob)
@@ -237,6 +243,21 @@ export default function Transactions({ profile }) {
     .map(([id, v]) => ({ id, name: v.name, code: v.code, color: v.color }))
     .sort((a,b) => a.name.localeCompare(b.name))
 
+  if (!user) return <div className="drops-empty">Loading…</div>
+  if (loading) return <div className="drops-empty">Loading…</div>
+
+  if (!onShift) {
+    return (
+      <div className="txns-screen">
+        <div className="drops-empty">
+          <i className="fas fa-clock" />
+          <h4>You are not on shift</h4>
+          <p>Transactions are only visible to staff currently on shift.</p>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="txns-screen">
       <div className="txns-head">
@@ -247,7 +268,7 @@ export default function Transactions({ profile }) {
           </div>
         </div>
         <div className="txns-actions">
-          {canExport && (
+          {canExport ? (
             <>
               <button className="btn-ghost" onClick={() => exportExcel('airtel')}>
                 <i className="fas fa-file-excel" style={{ color: '#dc2626' }} /> Download Airtel
@@ -256,6 +277,10 @@ export default function Transactions({ profile }) {
                 <i className="fas fa-file-excel" style={{ color: '#f59e0b' }} /> Download MTN
               </button>
             </>
+          ) : (
+            <div className="field-hint" style={{ padding: '10px 14px', background: '#fef3c7', color: '#92400e' }}>
+              <i className="fas fa-lock" /> Ask a supervisor to grant you the "Export transactions" power
+            </div>
           )}
         </div>
       </div>
@@ -300,7 +325,10 @@ export default function Transactions({ profile }) {
         })}>Today</button>
       </div>
 
-      {/* Best attendant card */}
+      {errorMsg && (
+        <div className="auth-err" style={{ margin: '0 32px 20px' }}>{errorMsg}</div>
+      )}
+
       {best && (
         <div className="best-card">
           <div className="best-label">🏆 Best attendant</div>
@@ -313,9 +341,7 @@ export default function Transactions({ profile }) {
         </div>
       )}
 
-      {loading ? (
-        <div className="drops-empty">Loading…</div>
-      ) : rows.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="drops-empty">
           <i className="fas fa-receipt" />
           <h4>No transactions</h4>
@@ -364,13 +390,11 @@ export default function Transactions({ profile }) {
                     <td>
                       {sc ? (
                         <>
-                          <span
-                            style={{
-                              display: 'inline-block', width: 10, height: 10,
-                              borderRadius: '50%', background: sc.color,
-                              marginRight: 8, verticalAlign: 'middle',
-                            }}
-                          />
+                          <span style={{
+                            display: 'inline-block', width: 10, height: 10,
+                            borderRadius: '50%', background: sc.color,
+                            marginRight: 8, verticalAlign: 'middle',
+                          }} />
                           {sc.name} <span style={{ color: '#8ba0b9', fontSize: 12 }}>({sc.code})</span>
                         </>
                       ) : '—'}
