@@ -32,46 +32,34 @@ function CompanyPhones({ profile, canManage }) {
   const user = profile.user
   const [rows, setRows] = useState([])
   const [loading, setLoading] = useState(true)
-  const [newLabel, setNewLabel] = useState('')
-  const [newFingerprint, setNewFingerprint] = useState('')
-  const [busy, setBusy] = useState(false)
+  const [openNew, setOpenNew] = useState(false)
+  const [createdInfo, setCreatedInfo] = useState(null)
 
   async function load() {
     setLoading(true)
-    const { data } = await supabase
-      .from('company_devices')
-      .select('*')
+    const { data, error } = await supabase
+      .from('company_phone_accounts')
+      .select('*, users(id, name, email, is_active, last_login_at)')
       .eq('station_id', user.station_id)
-      .order('added_at', { ascending: false })
+      .order('created_at', { ascending: false })
+    if (error) console.error('load phones:', error)
     setRows(data || [])
     setLoading(false)
   }
 
   useEffect(() => { load() }, [user.station_id])
 
-  async function add() {
-    if (!newLabel.trim()) return
-    setBusy(true)
-    const { error } = await supabase.from('company_devices').insert({
-      station_id: user.station_id,
-      device_label: newLabel.trim(),
-      device_fingerprint: newFingerprint.trim() || null,
-      added_by: user.id,
-    })
-    setBusy(false)
-    if (error) { alert(error.message); return }
-    setNewLabel(''); setNewFingerprint('')
+  async function toggleActive(row) {
+    await supabase
+      .from('users')
+      .update({ is_active: !row.users?.is_active })
+      .eq('id', row.user_id)
     await load()
   }
 
-  async function toggleActive(d) {
-    await supabase.from('company_devices').update({ is_active: !d.is_active }).eq('id', d.id)
-    await load()
-  }
-
-  async function remove(d) {
-    if (!confirm(`Remove "${d.device_label}"?`)) return
-    await supabase.from('company_devices').delete().eq('id', d.id)
+  async function removePhone(row) {
+    if (!confirm(`Delete the account for "${row.label}"? The phone will be logged out and can't sign in again.`)) return
+    await supabase.from('users').update({ is_active: false }).eq('id', row.user_id)
     await load()
   }
 
@@ -79,25 +67,13 @@ function CompanyPhones({ profile, canManage }) {
     <div className="card">
       <h3><i className="fas fa-mobile-alt" /> Company phones</h3>
       <div className="sub" style={{ color: '#6b85a0', fontSize: 13, marginBottom: 14 }}>
-        Only these devices show the real-time transaction popup. Others can view the log but won't be interrupted.
+        Each company phone gets its own account. Company phones see only Home, Transactions, and Money Drops — extra access is granted by Admin via Manage Staff → Access Control.
       </div>
 
       {canManage && (
-        <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' }}>
-          <input
-            placeholder="Device label (e.g. Airtel phone, Supervisor phone)"
-            value={newLabel}
-            onChange={e => setNewLabel(e.target.value)}
-            style={{ flex: 1, minWidth: 200, padding: '10px 14px', borderRadius: 10, border: '1px solid #e2e8f0', fontFamily: 'inherit' }}
-          />
-          <input
-            placeholder="Device fingerprint (optional)"
-            value={newFingerprint}
-            onChange={e => setNewFingerprint(e.target.value)}
-            style={{ flex: 1, minWidth: 200, padding: '10px 14px', borderRadius: 10, border: '1px solid #e2e8f0', fontFamily: 'inherit' }}
-          />
-          <button className="btn-primary" onClick={add} disabled={busy || !newLabel.trim()}>
-            <i className="fas fa-plus" /> Add device
+        <div style={{ marginBottom: 20 }}>
+          <button className="btn-primary" onClick={() => setOpenNew(true)}>
+            <i className="fas fa-plus" /> Register a new phone
           </button>
         </div>
       )}
@@ -107,8 +83,8 @@ function CompanyPhones({ profile, canManage }) {
       ) : rows.length === 0 ? (
         <div className="drops-empty">
           <i className="fas fa-mobile-alt" />
-          <h4>No company phones registered</h4>
-          <p>Add phones that should receive popups. Others won't be disturbed.</p>
+          <h4>No phones registered</h4>
+          <p>Register a phone account for each company device.</p>
         </div>
       ) : (
         <div className="drops-table-wrap">
@@ -116,30 +92,41 @@ function CompanyPhones({ profile, canManage }) {
             <thead>
               <tr>
                 <th>Label</th>
-                <th>Fingerprint</th>
-                <th>Added</th>
+                <th>Login email</th>
+                <th>Last login</th>
                 <th>Status</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {rows.map(d => (
-                <tr key={d.id}>
-                  <td><strong>{d.device_label}</strong></td>
-                  <td><span style={{ fontFamily: 'monospace', fontSize: 12 }}>{d.device_fingerprint || '—'}</span></td>
-                  <td>{new Date(d.added_at).toLocaleDateString('en-GB')}</td>
+              {rows.map(r => (
+                <tr key={r.user_id}>
+                  <td><strong>{r.label}</strong></td>
                   <td>
-                    <span className={`pill ${d.is_active ? 'green' : 'red'}`}>
-                      {d.is_active ? 'active' : 'inactive'}
+                    <span style={{ fontFamily: 'ui-monospace, monospace', fontSize: 12 }}>
+                      {r.users?.email || '—'}
+                    </span>
+                  </td>
+                  <td style={{ fontSize: 12, color: '#6b85a0' }}>
+                    {r.users?.last_login_at
+                      ? new Date(r.users.last_login_at).toLocaleString('en-GB', {
+                          day: '2-digit', month: 'short',
+                          hour: '2-digit', minute: '2-digit',
+                        })
+                      : 'never'}
+                  </td>
+                  <td>
+                    <span className={`pill ${r.users?.is_active ? 'green' : 'red'}`}>
+                      {r.users?.is_active ? 'active' : 'disabled'}
                     </span>
                   </td>
                   <td>
                     {canManage && (
                       <>
-                        <button className="btn-tiny" onClick={() => toggleActive(d)}>
-                          {d.is_active ? 'Deactivate' : 'Activate'}
+                        <button className="btn-tiny" onClick={() => toggleActive(r)}>
+                          {r.users?.is_active ? 'Disable' : 'Enable'}
                         </button>
-                        <button className="btn-tiny danger" onClick={() => remove(d)}>
+                        <button className="btn-tiny danger" onClick={() => removePhone(r)}>
                           <i className="fas fa-trash" />
                         </button>
                       </>
@@ -151,6 +138,160 @@ function CompanyPhones({ profile, canManage }) {
           </table>
         </div>
       )}
+
+      {openNew && (
+        <RegisterPhoneModal
+          profile={profile}
+          onClose={() => setOpenNew(false)}
+          onSaved={async (info) => {
+            setOpenNew(false)
+            setCreatedInfo(info)
+            await load()
+          }}
+        />
+      )}
+
+      {createdInfo && (
+        <div className="modal-bg" onClick={() => setCreatedInfo(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <h3>
+              <i className="fas fa-check-circle" style={{ color: '#10b981' }} /> Phone registered
+            </h3>
+            <div className="modal-sub">
+              Give these credentials to the phone. Write them down — the password can't be shown again.
+            </div>
+
+            <div className="detail-row" style={{ padding: 14, background: '#f8fafc', borderRadius: 10 }}>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, textTransform: 'uppercase', color: '#6b85a0', fontWeight: 700 }}>Label</div>
+                <div style={{ fontWeight: 700 }}>{createdInfo.label}</div>
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, textTransform: 'uppercase', color: '#6b85a0', fontWeight: 700 }}>Login email</div>
+                <div style={{ fontFamily: 'ui-monospace, monospace' }}>{createdInfo.email}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 11, textTransform: 'uppercase', color: '#6b85a0', fontWeight: 700 }}>Password</div>
+                <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 16, fontWeight: 700 }}>{createdInfo.password}</div>
+              </div>
+            </div>
+
+            <div className="modal-actions">
+              <button className="btn-primary-full" onClick={() => setCreatedInfo(null)}>Done</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/* ============================================================
+   REGISTER PHONE MODAL
+   ============================================================ */
+function RegisterPhoneModal({ profile, onClose, onSaved }) {
+  const user = profile.user
+  const [label, setLabel] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState(() => generatePassword())
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+
+  function generatePassword() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'
+    return Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join('')
+  }
+
+  async function save() {
+    if (!label.trim()) { setErr('Label required'); return }
+    if (!email.trim()) { setErr('Email required'); return }
+    if (password.length < 6) { setErr('Password must be at least 6 characters'); return }
+    setBusy(true); setErr('')
+
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) throw new Error('Not signed in')
+
+      // Supabase URL from env or fallback to known project
+      const SUPABASE_URL =
+        import.meta.env.VITE_SUPABASE_URL ||
+        'https://tofrboakpcmjvrixxxtl.supabase.co'
+
+      const url = `${SUPABASE_URL}/functions/v1/create-company-phone`
+
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          email: email.trim().toLowerCase(),
+          password,
+          label: label.trim(),
+          station_id: user.station_id,
+        }),
+      })
+
+      const data = await resp.json()
+      if (!resp.ok || !data.ok) {
+        throw new Error(data.error || 'Failed to create account')
+      }
+
+      onSaved({
+        label: label.trim(),
+        email: email.trim().toLowerCase(),
+        password,
+      })
+    } catch (e) {
+      setErr(e.message || 'Could not register phone')
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal">
+        <h3>Register a phone</h3>
+        <div className="modal-sub">Creates a dedicated login for a company device</div>
+
+        <label>Label</label>
+        <input
+          value={label}
+          onChange={e => setLabel(e.target.value)}
+          placeholder="e.g. Airtel phone 1, Reception"
+          autoFocus
+        />
+
+        <label>Login email</label>
+        <input
+          type="email"
+          value={email}
+          onChange={e => setEmail(e.target.value)}
+          placeholder="airtel-phone-1@texol.ug"
+        />
+
+        <label>Password</label>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+            style={{ flex: 1, fontFamily: 'ui-monospace, monospace' }}
+          />
+          <button className="btn-ghost btn-sm" onClick={() => setPassword(generatePassword())} title="Generate new password">
+            <i className="fas fa-redo" />
+          </button>
+        </div>
+
+        {err && <div className="auth-err">{err}</div>}
+
+        <div className="modal-actions">
+          <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
+          <button className="btn-primary-full" onClick={save} disabled={busy}>
+            {busy ? 'Creating…' : 'Register phone'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -209,7 +350,7 @@ function SMSIntegration({ profile }) {
         <ol start="7" style={{ paddingLeft: 20, lineHeight: 1.9, fontSize: 14, marginTop: 8 }}>
           <li>Save the rule</li>
           <li>Grant the app SMS permission and disable battery optimization for it</li>
-          <li>Send a test SMS — you should see the popup on this portal within 2 seconds</li>
+          <li>Send a test SMS — the popup should appear on all company phones within 2 seconds</li>
         </ol>
       </div>
 
