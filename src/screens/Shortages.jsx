@@ -3,9 +3,11 @@ import { supabase } from '../supabase'
 
 export default function Shortages({ profile }) {
   const user = profile.user
+  const powers = profile.powers || {}
   const isManager = ['admin','manager'].includes(user.role)
   const isSupervisor = user.role === 'supervisor'
-  const canSeeAll = isManager || isSupervisor || (profile.powers?.view_all_shortages)
+  const canSeeAll = isManager || isSupervisor || powers.view_all_shortages
+  const canAdd = isManager || isSupervisor
 
   const [tab, setTab] = useState(canSeeAll ? 'staff' : 'me')
   const [staffRows, setStaffRows] = useState([])
@@ -13,60 +15,106 @@ export default function Shortages({ profile }) {
   const [myStaff, setMyStaff] = useState(null)
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
+  const [errorMsg, setErrorMsg] = useState('')
   const [openAddShortage, setOpenAddShortage] = useState(false)
   const [openAddCredit, setOpenAddCredit] = useState(false)
   const [openPayment, setOpenPayment] = useState(null)
 
   async function loadAll() {
     setLoading(true)
+    setErrorMsg('')
 
-    if (canSeeAll) {
-      const { data: s } = await supabase
-        .from('v_staff_shortages')
-        .select('*')
-        .eq('station_id', user.station_id)
-        .order('balance', { ascending: false })
-      setStaffRows(s || [])
+    try {
+      if (canSeeAll) {
+        // Manager/Supervisor view — everyone
+        const { data: s, error: sErr } = await supabase
+          .from('v_staff_shortages')
+          .select('*')
+          .eq('station_id', user.station_id)
+          .order('balance', { ascending: false })
 
-      const { data: c } = await supabase
-        .from('v_customer_credits')
-        .select('*')
-        .eq('station_id', user.station_id)
-        .order('balance', { ascending: false })
-      setCustomerRows(c || [])
-    } else {
-      // Attendant/Ambassador: fetch own shortage from raw tables
-      // (views may be blocked by RLS for non-manager roles)
-      const [userRow, credits, payments] = await Promise.all([
-        supabase.from('users').select('id, name, role, station_id').eq('id', user.id).single(),
-        supabase.from('shortages_credits')
-          .select('amount, status')
-          .eq('category', 'shortage')
-          .eq('subject_id', user.id),
-        supabase.from('shortage_payments')
-          .select('amount, status')
-          .eq('subject_user_id', user.id)
-          .eq('status', 'approved'),
-      ])
+        if (sErr) {
+          console.warn('v_staff_shortages failed, using fallback:', sErr.message)
+          // Fallback: compute from raw tables
+          const { data: staffList } = await supabase
+            .from('users')
+            .select('id, name, role, station_id')
+            .eq('station_id', user.station_id)
+            .eq('is_active', true)
+          const computed = await Promise.all((staffList || []).map(async u => {
+            const [cr, pm] = await Promise.all([
+              supabase.from('shortages_credits')
+                .select('amount, status')
+                .eq('category', 'shortage')
+                .eq('subject_id', u.id),
+              supabase.from('shortage_payments')
+                .select('amount, status')
+                .eq('subject_user_id', u.id)
+                .eq('status', 'approved'),
+            ])
+            const owed = (cr.data || []).filter(c => c.status !== 'rejected')
+              .reduce((sum, c) => sum + Number(c.amount || 0), 0)
+            const paid = (pm.data || []).reduce((sum, p) => sum + Number(p.amount || 0), 0)
+            return {
+              user_id: u.id,
+              name: u.name,
+              role: u.role,
+              station_id: u.station_id,
+              total_owed: owed,
+              total_paid: paid,
+              balance: owed - paid,
+              entries: (cr.data || []).length,
+            }
+          }))
+          setStaffRows(computed)
+        } else {
+          setStaffRows(s || [])
+        }
 
-      const totalOwed = (credits.data || [])
-        .filter(c => c.status !== 'rejected')
-        .reduce((s, c) => s + Number(c.amount || 0), 0)
-      const totalPaid = (payments.data || [])
-        .reduce((s, p) => s + Number(p.amount || 0), 0)
+        const { data: c } = await supabase
+          .from('v_customer_credits')
+          .select('*')
+          .eq('station_id', user.station_id)
+          .order('balance', { ascending: false })
+        setCustomerRows(c || [])
+      } else {
+        // Attendant/Ambassador view — only their own
+        const [userRow, credits, payments] = await Promise.all([
+          supabase.from('users')
+            .select('id, name, role, station_id')
+            .eq('id', user.id)
+            .single(),
+          supabase.from('shortages_credits')
+            .select('amount, status')
+            .eq('category', 'shortage')
+            .eq('subject_id', user.id),
+          supabase.from('shortage_payments')
+            .select('amount, status')
+            .eq('subject_user_id', user.id)
+            .eq('status', 'approved'),
+        ])
 
-      setMyStaff({
-        user_id: user.id,
-        name: userRow.data?.name || user.name,
-        role: userRow.data?.role || user.role,
-        station_id: userRow.data?.station_id || user.station_id,
-        total_owed: totalOwed,
-        total_paid: totalPaid,
-        balance: totalOwed - totalPaid,
-        entries: (credits.data || []).length,
-      })
+        const totalOwed = (credits.data || [])
+          .filter(c => c.status !== 'rejected')
+          .reduce((s, c) => s + Number(c.amount || 0), 0)
+        const totalPaid = (payments.data || [])
+          .reduce((s, p) => s + Number(p.amount || 0), 0)
+
+        setMyStaff({
+          user_id: user.id,
+          name: userRow.data?.name || user.name,
+          role: userRow.data?.role || user.role,
+          station_id: userRow.data?.station_id || user.station_id,
+          total_owed: totalOwed,
+          total_paid: totalPaid,
+          balance: totalOwed - totalPaid,
+          entries: (credits.data || []).length,
+        })
+      }
+    } catch (e) {
+      console.error('Load shortages error:', e)
+      setErrorMsg(e.message || 'Could not load shortages')
     }
-
     setLoading(false)
   }
 
@@ -97,7 +145,7 @@ export default function Shortages({ profile }) {
   function downloadStaffCSV() {
     const header = 'Name,Role,Total Owed,Total Paid,Unpaid,Entries\n'
     const body = filteredStaff.map(s => [
-      (s.name || '').replace(/,/g,''), s.role,
+      (s.name || '').replace(/,/g, ''), s.role,
       Number(s.total_owed || 0), Number(s.total_paid || 0),
       Number(s.balance || 0), s.entries || 0,
     ].join(',')).join('\n')
@@ -107,7 +155,7 @@ export default function Shortages({ profile }) {
   function downloadCustomerCSV() {
     const header = 'Customer,Phone,Company,Card,Total Credit,Total Paid,Balance\n'
     const body = filteredCustomers.map(c => [
-      (c.name || '').replace(/,/g,''), c.phone || '', (c.company || '').replace(/,/g,''),
+      (c.name || '').replace(/,/g, ''), c.phone || '', (c.company || '').replace(/,/g, ''),
       c.card_number || '',
       Number(c.total_credit || 0), Number(c.total_paid || 0), Number(c.balance || 0),
     ].join(',')).join('\n')
@@ -136,7 +184,7 @@ export default function Shortages({ profile }) {
               <i className="fas fa-file-csv" /> Download list
             </button>
           )}
-          {canSeeAll && (
+          {canAdd && (
             <>
               <button className="btn-ghost" onClick={() => setOpenAddCredit(true)}>
                 <i className="fas fa-plus" /> Add credit
@@ -147,7 +195,11 @@ export default function Shortages({ profile }) {
             </>
           )}
           {!canSeeAll && (
-            <button className="btn-primary" onClick={() => setOpenPayment({ type: 'staff', row: myStaff })}>
+            <button
+              className="btn-primary"
+              onClick={() => setOpenPayment({ type: 'staff', row: myStaff })}
+              disabled={!myStaff}
+            >
               <i className="fas fa-money-bill" /> I paid
             </button>
           )}
@@ -176,14 +228,31 @@ export default function Shortages({ profile }) {
         </div>
       )}
 
+      {errorMsg && (
+        <div className="auth-err" style={{ margin: '0 32px 20px' }}>
+          <i className="fas fa-exclamation-triangle" /> {errorMsg}
+        </div>
+      )}
+
       {loading ? (
         <div className="drops-empty">Loading…</div>
       ) : !canSeeAll ? (
-        <MyShortageView myStaff={myStaff} onPaid={() => setOpenPayment({ type: 'staff', row: myStaff })} />
+        <MyShortageView
+          myStaff={myStaff}
+          onPaid={() => setOpenPayment({ type: 'staff', row: myStaff })}
+        />
       ) : tab === 'staff' ? (
-        <StaffTable rows={filteredStaff} onPay={row => setOpenPayment({ type: 'staff', row })} />
+        <StaffTable
+          rows={filteredStaff}
+          onPay={row => setOpenPayment({ type: 'staff', row })}
+          canApprove={isManager}
+        />
       ) : (
-        <CustomerTable rows={filteredCustomers} onPay={row => setOpenPayment({ type: 'credit', row })} />
+        <CustomerTable
+          rows={filteredCustomers}
+          onPay={row => setOpenPayment({ type: 'credit', row })}
+          canApprove={isManager}
+        />
       )}
 
       {openAddShortage && (
@@ -219,53 +288,107 @@ function MyShortageView({ myStaff, onPaid }) {
   const [entries, setEntries] = useState([])
   const [payments, setPayments] = useState([])
   const [loading, setLoading] = useState(true)
+  const [errorMsg, setErrorMsg] = useState('')
 
   useEffect(() => {
     async function load() {
       if (!myStaff?.user_id) { setLoading(false); return }
-      const { data: e } = await supabase
-        .from('shortages_credits')
-        .select('*')
-        .eq('category','shortage')
-        .eq('subject_id', myStaff.user_id)
-        .order('created_at', { ascending: false })
-      setEntries(e || [])
+      try {
+        const { data: e, error: eErr } = await supabase
+          .from('shortages_credits')
+          .select('*')
+          .eq('category', 'shortage')
+          .eq('subject_id', myStaff.user_id)
+          .order('created_at', { ascending: false })
+        if (eErr) throw eErr
+        setEntries(e || [])
 
-      const { data: p } = await supabase
-        .from('shortage_payments')
-        .select('*')
-        .eq('subject_user_id', myStaff.user_id)
-        .order('submitted_at', { ascending: false })
-      setPayments(p || [])
+        const { data: p, error: pErr } = await supabase
+          .from('shortage_payments')
+          .select('*')
+          .eq('subject_user_id', myStaff.user_id)
+          .order('submitted_at', { ascending: false })
+        if (pErr) throw pErr
+        setPayments(p || [])
+      } catch (err) {
+        console.error('MyShortageView load error:', err)
+        setErrorMsg(err.message || 'Could not load your shortage')
+      }
       setLoading(false)
     }
     load()
   }, [myStaff?.user_id])
 
+  const balance = Number(myStaff?.balance || 0)
+
   return (
     <>
-      <div className="dashboard-grid">
-        <Stat label="Your total owed" value={`UGX ${Number(myStaff?.total_owed || 0).toLocaleString()}`} sub={`${myStaff?.entries || 0} entries`} />
-        <Stat label="You have paid" value={`UGX ${Number(myStaff?.total_paid || 0).toLocaleString()}`} sub="Approved payments" />
-        <Stat label="Current balance" value={`UGX ${Number(myStaff?.balance || 0).toLocaleString()}`} sub={myStaff?.balance > 0 ? 'Still owed' : 'All clear ✓'} />
+      <div className="dashboard-grid" style={{ padding: '0 32px 20px' }}>
+        <div className="stat-card">
+          <div className="stat-title">Your total owed</div>
+          <div className="stat-value">UGX {Number(myStaff?.total_owed || 0).toLocaleString()}</div>
+          <div className="stat-sub">{myStaff?.entries || 0} entries</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-title">You have paid</div>
+          <div className="stat-value" style={{ color: '#10b981' }}>
+            UGX {Number(myStaff?.total_paid || 0).toLocaleString()}
+          </div>
+          <div className="stat-sub">Approved payments</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-title">Current balance</div>
+          <div
+            className="stat-value"
+            style={{ color: balance > 0 ? '#dc2626' : balance < 0 ? '#1e40af' : '#10b981' }}
+          >
+            UGX {balance.toLocaleString()}
+          </div>
+          <div className="stat-sub">
+            {balance > 0 ? 'Still owed' : balance < 0 ? 'Credit to you' : 'All clear ✓'}
+          </div>
+        </div>
       </div>
 
-      <div className="section-title">Your shortage entries</div>
+      {errorMsg && (
+        <div className="auth-err" style={{ margin: '0 32px 20px' }}>
+          <i className="fas fa-exclamation-triangle" /> {errorMsg}
+        </div>
+      )}
+
+      <div className="section-title" style={{ padding: '0 32px 8px' }}>
+        Your shortage entries
+      </div>
       {loading ? (
         <div className="drops-empty">Loading…</div>
       ) : entries.length === 0 ? (
-        <div className="drops-empty"><i className="fas fa-check-circle" /><h4>No shortages recorded</h4><p>Keep it that way!</p></div>
+        <div className="drops-empty">
+          <i className="fas fa-check-circle" />
+          <h4>No shortages recorded</h4>
+          <p>Keep it that way!</p>
+        </div>
       ) : (
         <div className="drops-table-wrap">
           <table className="drops-table">
-            <thead><tr><th>Date</th><th>Amount</th><th>Reason</th><th>Status</th></tr></thead>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Amount</th>
+                <th>Reason</th>
+                <th>Status</th>
+              </tr>
+            </thead>
             <tbody>
               {entries.map(e => (
                 <tr key={e.id}>
                   <td>{new Date(e.created_at).toLocaleDateString('en-GB')}</td>
                   <td><strong>UGX {Number(e.amount).toLocaleString()}</strong></td>
                   <td>{e.reason || '—'}</td>
-                  <td><span className={`pill ${e.status === 'cleared' ? 'green' : 'amber'}`}>{e.status}</span></td>
+                  <td>
+                    <span className={`pill ${e.status === 'cleared' ? 'green' : 'amber'}`}>
+                      {e.status}
+                    </span>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -273,21 +396,36 @@ function MyShortageView({ myStaff, onPaid }) {
         </div>
       )}
 
-      <div className="section-title">Your payments</div>
+      <div className="section-title" style={{ padding: '20px 32px 8px' }}>
+        Your payments
+      </div>
       {payments.length === 0 ? (
-        <div className="drops-empty"><i className="fas fa-receipt" /><h4>No payments yet</h4></div>
+        <div className="drops-empty">
+          <i className="fas fa-receipt" />
+          <h4>No payments yet</h4>
+        </div>
       ) : (
         <div className="drops-table-wrap">
           <table className="drops-table">
-            <thead><tr><th>Date</th><th>Amount</th><th>Status</th><th>Note</th></tr></thead>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Amount</th>
+                <th>Status</th>
+                <th>Note</th>
+              </tr>
+            </thead>
             <tbody>
               {payments.map(p => (
                 <tr key={p.id}>
                   <td>{new Date(p.submitted_at).toLocaleDateString('en-GB')}</td>
                   <td><strong>UGX {Number(p.amount).toLocaleString()}</strong></td>
-                  <td><span className={`pill ${
-                    p.status === 'approved' ? 'green' : p.status === 'rejected' ? 'red' : 'amber'
-                  }`}>{p.status}</span></td>
+                  <td>
+                    <span className={`pill ${
+                      p.status === 'approved' ? 'green' :
+                      p.status === 'rejected' ? 'red' : 'amber'
+                    }`}>{p.status}</span>
+                  </td>
                   <td>{p.note || '—'}</td>
                 </tr>
               ))}
@@ -295,15 +433,30 @@ function MyShortageView({ myStaff, onPaid }) {
           </table>
         </div>
       )}
+
+      {balance > 0 && (
+        <div style={{ padding: '20px 32px' }}>
+          <button className="btn-primary-full" onClick={onPaid}>
+            <i className="fas fa-money-bill" /> I paid — submit payment
+          </button>
+        </div>
+      )}
     </>
   )
 }
 
 /* ============================================================
-   STAFF TABLE
+   STAFF TABLE (manager view)
    ============================================================ */
-function StaffTable({ rows, onPay }) {
-  if (rows.length === 0) return <div className="drops-empty"><i className="fas fa-user-tie" /><h4>No shortages</h4></div>
+function StaffTable({ rows, onPay, canApprove }) {
+  if (rows.length === 0) {
+    return (
+      <div className="drops-empty">
+        <i className="fas fa-user-tie" />
+        <h4>No shortages</h4>
+      </div>
+    )
+  }
 
   return (
     <div className="drops-table-wrap">
@@ -322,11 +475,13 @@ function StaffTable({ rows, onPay }) {
           {rows.map(r => (
             <tr key={r.user_id}>
               <td><strong>{r.name}</strong></td>
-              <td><span className={`pill ${
-                r.role === 'attendant' ? 'blue' :
-                r.role === 'ambassador' ? 'green' :
-                r.role === 'supervisor' ? 'amber' : 'gold'
-              }`}>{r.role}</span></td>
+              <td>
+                <span className={`pill ${
+                  r.role === 'attendant' ? 'blue' :
+                  r.role === 'ambassador' ? 'green' :
+                  r.role === 'supervisor' ? 'amber' : 'gold'
+                }`}>{r.role}</span>
+              </td>
               <td>UGX {Number(r.total_owed || 0).toLocaleString()}</td>
               <td>UGX {Number(r.total_paid || 0).toLocaleString()}</td>
               <td>
@@ -335,7 +490,7 @@ function StaffTable({ rows, onPay }) {
                 </span>
               </td>
               <td>
-                {Number(r.balance || 0) > 0 && (
+                {Number(r.balance || 0) > 0 && canApprove && (
                   <button className="btn-tiny success" onClick={() => onPay(r)}>
                     <i className="fas fa-money-bill" /> Record payment
                   </button>
@@ -352,8 +507,15 @@ function StaffTable({ rows, onPay }) {
 /* ============================================================
    CUSTOMER TABLE
    ============================================================ */
-function CustomerTable({ rows, onPay }) {
-  if (rows.length === 0) return <div className="drops-empty"><i className="fas fa-users" /><h4>No customer credits</h4></div>
+function CustomerTable({ rows, onPay, canApprove }) {
+  if (rows.length === 0) {
+    return (
+      <div className="drops-empty">
+        <i className="fas fa-users" />
+        <h4>No customer credits</h4>
+      </div>
+    )
+  }
 
   return (
     <div className="drops-table-wrap">
@@ -372,9 +534,17 @@ function CustomerTable({ rows, onPay }) {
         <tbody>
           {rows.map(c => (
             <tr key={c.customer_id}>
-              <td><strong>{c.name}</strong><br /><span style={{fontSize:11,color:'#8ba0b9'}}>{c.company || ''}</span></td>
+              <td>
+                <strong>{c.name}</strong>
+                <br />
+                <span style={{ fontSize: 11, color: '#8ba0b9' }}>{c.company || ''}</span>
+              </td>
               <td>{c.phone || '—'}</td>
-              <td>{c.card_number ? <span className="code-pill" style={{fontSize:11}}>{c.card_number}</span> : '—'}</td>
+              <td>
+                {c.card_number ? (
+                  <span className="code-pill" style={{ fontSize: 11 }}>{c.card_number}</span>
+                ) : '—'}
+              </td>
               <td>UGX {Number(c.total_credit || 0).toLocaleString()}</td>
               <td>UGX {Number(c.total_paid || 0).toLocaleString()}</td>
               <td>
@@ -383,7 +553,7 @@ function CustomerTable({ rows, onPay }) {
                 </span>
               </td>
               <td>
-                {Number(c.balance || 0) > 0 && (
+                {Number(c.balance || 0) > 0 && canApprove && (
                   <button className="btn-tiny success" onClick={() => onPay(c)}>
                     <i className="fas fa-money-bill" /> Payment
                   </button>
@@ -398,7 +568,7 @@ function CustomerTable({ rows, onPay }) {
 }
 
 /* ============================================================
-   ADD SHORTAGE
+   ADD SHORTAGE MODAL
    ============================================================ */
 function AddShortageModal({ profile, onClose, onSaved }) {
   const user = profile.user
@@ -415,7 +585,7 @@ function AddShortageModal({ profile, onClose, onSaved }) {
         .from('users')
         .select('id, name, role')
         .eq('station_id', user.station_id)
-        .neq('role','admin')
+        .neq('role', 'admin')
         .eq('is_active', true)
         .order('name')
       setStaff(data || [])
@@ -453,14 +623,20 @@ function AddShortageModal({ profile, onClose, onSaved }) {
         <label>Staff member</label>
         <select value={subjectId} onChange={e => setSubjectId(e.target.value)}>
           <option value="">— Pick —</option>
-          {staff.map(s => <option key={s.id} value={s.id}>{s.name} ({s.role})</option>)}
+          {staff.map(s => (
+            <option key={s.id} value={s.id}>{s.name} ({s.role})</option>
+          ))}
         </select>
 
         <label>Amount (UGX)</label>
         <input type="number" value={amount} onChange={e => setAmount(e.target.value)} />
 
         <label>Reason</label>
-        <input value={reason} onChange={e => setReason(e.target.value)} placeholder="e.g. Cash short at balance" />
+        <input
+          value={reason}
+          onChange={e => setReason(e.target.value)}
+          placeholder="e.g. Cash short at balance"
+        />
 
         {err && <div className="auth-err">{err}</div>}
 
@@ -476,7 +652,7 @@ function AddShortageModal({ profile, onClose, onSaved }) {
 }
 
 /* ============================================================
-   ADD CREDIT
+   ADD CREDIT MODAL
    ============================================================ */
 function AddCreditModal({ profile, onClose, onSaved }) {
   const user = profile.user
@@ -530,14 +706,20 @@ function AddCreditModal({ profile, onClose, onSaved }) {
         <label>Customer</label>
         <select value={customerId} onChange={e => setCustomerId(e.target.value)}>
           <option value="">— Pick —</option>
-          {customers.map(c => <option key={c.id} value={c.id}>{c.name} · {c.phone || ''}</option>)}
+          {customers.map(c => (
+            <option key={c.id} value={c.id}>{c.name} · {c.phone || ''}</option>
+          ))}
         </select>
 
         <label>Amount (UGX)</label>
         <input type="number" value={amount} onChange={e => setAmount(e.target.value)} />
 
         <label>Reason</label>
-        <input value={reason} onChange={e => setReason(e.target.value)} placeholder="e.g. Fuel on credit · Sept" />
+        <input
+          value={reason}
+          onChange={e => setReason(e.target.value)}
+          placeholder="e.g. Fuel on credit · Sept"
+        />
 
         {err && <div className="auth-err">{err}</div>}
 
@@ -607,7 +789,7 @@ function PaymentModal({ profile, payment, onClose, onSaved }) {
         </div>
 
         <label>Amount (UGX)</label>
-        <input type="number" value={amount} onChange={e => setAmount(e.target.value)} />
+        <input type="number" value={amount} onChange={e => setAmount(e.target.value)} autoFocus />
 
         <div className="quick-amounts">
           <button onClick={() => setAmount(String(balance))}>Full balance</button>
@@ -648,14 +830,4 @@ function downloadFile(name, content, type) {
   a.download = name
   a.click()
   URL.revokeObjectURL(url)
-}
-
-function Stat({ label, value, sub }) {
-  return (
-    <div className="stat-card">
-      <div className="stat-title">{label}</div>
-      <div className="stat-value">{value}</div>
-      {sub && <div className="stat-sub">{sub}</div>}
-    </div>
-  )
 }
