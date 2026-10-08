@@ -58,7 +58,7 @@ function CompanyPhones({ profile, canManage }) {
   }
 
   async function removePhone(row) {
-    if (!confirm(`Delete the account for "${row.label}"? The phone will be logged out and can't sign in again.`)) return
+    if (!confirm(`Delete "${row.label}"? The phone will be logged out and blocked.`)) return
     await supabase.from('users').update({ is_active: false }).eq('id', row.user_id)
     await load()
   }
@@ -67,7 +67,8 @@ function CompanyPhones({ profile, canManage }) {
     <div className="card">
       <h3><i className="fas fa-mobile-alt" /> Company phones</h3>
       <div className="sub" style={{ color: '#6b85a0', fontSize: 13, marginBottom: 14 }}>
-        Each company phone gets its own account. Company phones see only Home, Transactions, and Money Drops — extra access is granted by Admin via Manage Staff → Access Control.
+        Each company phone gets its own account. Company phones see only Home, Transactions, and Money Drops.
+        Extra access is granted by Admin via Manage Staff → Access Control.
       </div>
 
       {canManage && (
@@ -161,7 +162,7 @@ function CompanyPhones({ profile, canManage }) {
               Give these credentials to the phone. Write them down — the password can't be shown again.
             </div>
 
-            <div className="detail-row" style={{ padding: 14, background: '#f8fafc', borderRadius: 10 }}>
+            <div style={{ padding: 14, background: '#f8fafc', borderRadius: 10 }}>
               <div style={{ marginBottom: 10 }}>
                 <div style={{ fontSize: 11, textTransform: 'uppercase', color: '#6b85a0', fontWeight: 700 }}>Label</div>
                 <div style={{ fontWeight: 700 }}>{createdInfo.label}</div>
@@ -212,12 +213,11 @@ function RegisterPhoneModal({ profile, onClose, onSaved }) {
       const { data: { session } } = await supabase.auth.getSession()
       if (!session) throw new Error('Not signed in')
 
-      // Supabase URL from env or fallback to known project
       const SUPABASE_URL =
         import.meta.env.VITE_SUPABASE_URL ||
         'https://tofrboakpcmjvrixxxtl.supabase.co'
 
-      const url = `${SUPABASE_URL}/functions/v1/create-company-phone`
+      const url = `${SUPABASE_URL}/functions/v1/register-phone`
 
       const resp = await fetch(url, {
         method: 'POST',
