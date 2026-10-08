@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { supabase } from '../supabase'
 
 export default function Balancing({ profile }) {
@@ -11,19 +11,33 @@ export default function Balancing({ profile }) {
   const isAttendant = user.role === 'attendant' || user.role === 'ambassador'
 
   const [shift, setShift] = useState(null)
+  const [pumps, setPumps] = useState([])
+  const [entries, setEntries] = useState({})      // keyed by pump_number
   const [staff, setStaff] = useState([])
-  const [entries, setEntries] = useState({})
-  const [expenses, setExpenses] = useState({})
-  const [credits, setCredits] = useState({})
   const [customers, setCustomers] = useState([])
+  const [expenses, setExpenses] = useState({})    // keyed by pump_number -> array
+  const [credits, setCredits] = useState({})      // keyed by pump_number -> array
   const [customExpenseTypes, setCustomExpenseTypes] = useState([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
 
   const [openExpense, setOpenExpense] = useState(null)
   const [openCredit, setOpenCredit] = useState(null)
+  const [openAssign, setOpenAssign] = useState(null)  // pump_number
+  const [openAddPump, setOpenAddPump] = useState(false)
+  const [newPumpNumber, setNewPumpNumber] = useState('')
+  const [newPumpProduct, setNewPumpProduct] = useState('PMS')
+
   const [showAddExpenseType, setShowAddExpenseType] = useState(false)
   const [newExpenseName, setNewExpenseName] = useState('')
+  const [focusPump, setFocusPump] = useState(null)   // for detail modal
+
+  // Names map for the pump header
+  const nameById = useMemo(() => {
+    const m = {}
+    staff.forEach(s => { m[s.id] = s.name })
+    return m
+  }, [staff])
 
   async function loadAll() {
     setLoading(true)
@@ -39,7 +53,16 @@ export default function Balancing({ profile }) {
       const cur = shifts?.[0] || null
       setShift(cur)
 
-      // 2) Staff (filtered by role)
+      // 2) Load pumps for station
+      const { data: pumpList } = await supabase
+        .from('pumps')
+        .select('*')
+        .eq('station_id', user.station_id)
+        .eq('is_active', true)
+        .order('pump_number')
+      setPumps(pumpList || [])
+
+      // 3) Staff list (attendants + ambassadors + supervisor on shift)
       let staffQuery = supabase
         .from('users')
         .select('id, name, role, initials')
@@ -47,15 +70,10 @@ export default function Balancing({ profile }) {
         .eq('is_active', true)
         .in('role', ['attendant','ambassador','supervisor'])
         .order('name')
-
-      if (!canEditAll) {
-        staffQuery = staffQuery.eq('id', user.id)
-      }
-
       const { data: us } = await staffQuery
       setStaff(us || [])
 
-      // 3) Customers for credit picker
+      // 4) Customers
       const { data: cust } = await supabase
         .from('customers')
         .select('id, name, customer_type')
@@ -66,37 +84,26 @@ export default function Balancing({ profile }) {
 
       if (!cur) { setLoading(false); return }
 
-      // 4) Auto-create balance_entries
+      // 5) Existing entries for this shift
       const { data: existing } = await supabase
         .from('balance_entries')
         .select('*')
         .eq('shift_id', cur.id)
 
-      const byUser = {}
-      ;(existing || []).forEach(e => { byUser[e.user_id] = e })
-
-      const toCreate = (us || []).filter(s => !byUser[s.id])
-      let reload = existing || []
-      if (toCreate.length > 0) {
-        const rows = toCreate.map(s => ({
-          shift_id: cur.id,
-          station_id: user.station_id,
-          user_id: s.id,
-        }))
-        await supabase.from('balance_entries').insert(rows)
-        const { data: fresh } = await supabase
-          .from('balance_entries')
-          .select('*')
-          .eq('shift_id', cur.id)
-        reload = fresh || []
+      // Filter visible pumps if attendant
+      let visibleEntries = existing || []
+      if (!canEditAll) {
+        visibleEntries = visibleEntries.filter(e => e.user_id === user.id)
       }
 
-      const map = {}
-      ;(reload || []).forEach(e => { map[e.user_id] = e })
-      setEntries(map)
+      const byPump = {}
+      visibleEntries.forEach(e => {
+        if (e.pump_number) byPump[e.pump_number] = e
+      })
+      setEntries(byPump)
 
-      // 5) Load expenses + credits
-      const ids = (reload || []).map(e => e.id)
+      // 6) Load expenses + credits
+      const ids = visibleEntries.map(e => e.id)
       const expMap = {}
       const crMap = {}
       const customTypes = new Set()
@@ -107,10 +114,11 @@ export default function Balancing({ profile }) {
           .select('*')
           .in('entry_id', ids)
         ;(exp || []).forEach(x => {
-          const entry = (reload || []).find(e => e.id === x.entry_id)
+          const entry = visibleEntries.find(e => e.id === x.entry_id)
           if (entry) {
-            if (!expMap[entry.user_id]) expMap[entry.user_id] = []
-            expMap[entry.user_id].push(x)
+            const p = entry.pump_number
+            if (!expMap[p]) expMap[p] = []
+            expMap[p].push(x)
             if (x.expense_type) customTypes.add(x.expense_type)
           }
         })
@@ -120,10 +128,11 @@ export default function Balancing({ profile }) {
           .select('*')
           .in('entry_id', ids)
         ;(cr || []).forEach(x => {
-          const entry = (reload || []).find(e => e.id === x.entry_id)
+          const entry = visibleEntries.find(e => e.id === x.entry_id)
           if (entry) {
-            if (!crMap[entry.user_id]) crMap[entry.user_id] = []
-            crMap[entry.user_id].push(x)
+            const p = entry.pump_number
+            if (!crMap[p]) crMap[p] = []
+            crMap[p].push(x)
           }
         })
       }
@@ -138,8 +147,42 @@ export default function Balancing({ profile }) {
 
   useEffect(() => { loadAll() }, [user.station_id])
 
-  async function saveField(userId, field, value) {
-    const entry = entries[userId]
+  // ---------- Pump allocation ----------
+  async function assignPump(pumpNumber, userId, product) {
+    if (!shift) return
+    setBusy(true)
+    const { error } = await supabase.rpc('assign_pump', {
+      p_shift: shift.id,
+      p_pump: pumpNumber,
+      p_user: userId || null,
+      p_product: product || 'PMS',
+    })
+    setBusy(false)
+    if (error) { alert(error.message); return }
+    setOpenAssign(null)
+    await loadAll()
+  }
+
+  // ---------- Add a new pump ----------
+  async function addPump() {
+    const num = parseInt(newPumpNumber, 10)
+    if (!num || num < 1) return
+    setBusy(true)
+    const { error } = await supabase.from('pumps').insert({
+      station_id: user.station_id,
+      pump_number: num,
+      product: newPumpProduct,
+    })
+    setBusy(false)
+    if (error) { alert(error.message); return }
+    setNewPumpNumber('')
+    setOpenAddPump(false)
+    await loadAll()
+  }
+
+  // ---------- Save a cell value ----------
+  async function saveField(pumpNumber, field, value) {
+    const entry = entries[pumpNumber]
     if (!entry) return
     await supabase
       .from('balance_entries')
@@ -148,24 +191,22 @@ export default function Balancing({ profile }) {
     await loadAll()
   }
 
+  // ---------- Aggregations ----------
   function sumRow(field) {
-    return staff.reduce((s, u) => s + Number(entries[u.id]?.[field] || 0), 0)
+    return Object.values(entries).reduce((s, e) => s + Number(e[field] || 0), 0)
   }
-  function sumExpenseType(userId, type) {
-    return (expenses[userId] || [])
+  function sumExpenseType(pumpNumber, type) {
+    return (expenses[pumpNumber] || [])
       .filter(x => x.expense_type === type && x.status === 'approved')
-      .reduce((s,x) => s + Number(x.amount||0), 0)
+      .reduce((s, x) => s + Number(x.amount || 0), 0)
   }
-  function sumRowCustom(fn) {
-    return staff.reduce((s, u) => s + fn(u.id), 0)
-  }
-  function sumCredits(userId) {
-    return (credits[userId] || [])
+  function sumCredits(pumpNumber) {
+    return (credits[pumpNumber] || [])
       .filter(x => x.status === 'approved')
-      .reduce((s,x) => s + Number(x.amount||0), 0)
+      .reduce((s, x) => s + Number(x.amount || 0), 0)
   }
 
-  // Approval helpers
+  // ---------- Approvals ----------
   async function approveExpense(id) {
     await supabase.from('balance_expenses').update({
       status: 'approved', approved_by: user.id, approved_at: new Date().toISOString(),
@@ -190,13 +231,26 @@ export default function Balancing({ profile }) {
     }).eq('id', id)
     await loadAll()
   }
-  async function approveBalanceEntry(userId) {
-    const entry = entries[userId]
+
+  // ---------- Submit / approve pump sheet ----------
+  async function submitEntry(pumpNumber) {
+    const entry = entries[pumpNumber]
     if (!entry) return
-    if (!confirm(`Approve balance for ${staff.find(s=>s.id===userId)?.name}?`)) return
     setBusy(true)
-    await supabase.rpc('approve_balance', { p_entry: entry.id })
+    const { data, error } = await supabase.rpc('submit_balance_entry', { p_entry: entry.id })
     setBusy(false)
+    if (error || !data?.ok) { alert(error?.message || data?.error || 'Failed'); return }
+    await loadAll()
+  }
+
+  async function approveSubmission(pumpNumber) {
+    const entry = entries[pumpNumber]
+    if (!entry) return
+    if (!confirm(`Approve submission for Pump ${pumpNumber}?`)) return
+    setBusy(true)
+    const { data, error } = await supabase.rpc('approve_submission', { p_entry: entry.id })
+    setBusy(false)
+    if (error || !data?.ok) { alert(error?.message || data?.error || 'Failed'); return }
     await loadAll()
   }
 
@@ -224,42 +278,86 @@ export default function Balancing({ profile }) {
     )
   }
 
+  // Which pumps are visible to this user
+  const visiblePumps = canEditAll
+    ? pumps
+    : pumps.filter(p => entries[p.pump_number]?.user_id === user.id)
+
   return (
     <div className="balancing-screen">
-      {/* HEADER */}
       <div className="balance-sheet-head">
         <div>
           <h3>TEXOL LEGACY — {shift.shift_date}</h3>
           <div className="sub">
-            {shift.shift_type.toUpperCase()} SHIFT · {shift.status}
+            {shift.shift_type.toUpperCase()} SHIFT · {shift.status} · {visiblePumps.length} pump{visiblePumps.length !== 1 ? 's' : ''} visible
           </div>
         </div>
         <div className="balance-sheet-actions">
           {canApprove && (
             <>
-              <button className="btn-ghost" onClick={() => exportCSV(staff, entries, expenses, credits, customExpenseTypes, shift)}>
+              <button className="btn-ghost" onClick={() => exportCSV(visiblePumps, entries, expenses, credits, customExpenseTypes, shift, nameById)}>
                 <i className="fas fa-file-csv" /> CSV
               </button>
-              <button className="btn-primary" onClick={() => exportWord(staff, entries, expenses, credits, shift, customExpenseTypes)}>
+              <button className="btn-primary" onClick={() => exportWord(visiblePumps, entries, expenses, credits, shift, customExpenseTypes, nameById)}>
                 <i className="fas fa-file-word" /> Word
               </button>
             </>
           )}
+          {canEditAll && (
+            <button className="btn-ghost" onClick={() => setOpenAddPump(true)}>
+              <i className="fas fa-plus" /> Add pump
+            </button>
+          )}
         </div>
       </div>
 
-      {/* TABLE */}
       <div style={{ overflowX: 'auto', padding: '0 32px 32px' }}>
         <table className="balance-sheet">
           <thead>
+            {/* Row 1: NAMES + PUMP labels + TOTAL */}
             <tr>
               <th className="sticky-col">NAMES</th>
-              {staff.map(s => (
-                <th key={s.id} className="staff-head">
-                  <div className="staff-name">{s.name.toUpperCase()}</div>
+              {visiblePumps.map(p => (
+                <th key={p.id} className="staff-head" style={{ cursor: 'pointer' }}
+                    onClick={() => canEditAll && setOpenAssign(p.pump_number)}>
+                  <div className="staff-name">PUMP {p.pump_number}</div>
+                  <div style={{ fontSize: 9, color: '#8ba0b9', marginTop: 2, fontWeight: 500 }}>
+                    {p.product}
+                  </div>
                 </th>
               ))}
               {canEditAll && <th className="total-col">TOTAL</th>}
+            </tr>
+            {/* Row 2: attendant name per pump */}
+            <tr>
+              <th className="sticky-col" style={{ fontSize: 10 }}>ATTENDANT</th>
+              {visiblePumps.map(p => {
+                const e = entries[p.pump_number]
+                return (
+                  <th key={p.id} className="staff-head" style={{ fontSize: 11, padding: '6px 8px' }}>
+                    {e ? (
+                      <>
+                        <div style={{ color: '#92400e', fontWeight: 700 }}>
+                          {nameById[e.user_id] || '—'}
+                        </div>
+                        {e.submission_status === 'submitted' && (
+                          <span className="pill amber" style={{ fontSize: 8, marginTop: 4, display: 'inline-block' }}>
+                            SUBMITTED
+                          </span>
+                        )}
+                        {e.submission_status === 'approved' && (
+                          <span className="pill green" style={{ fontSize: 8, marginTop: 4, display: 'inline-block' }}>
+                            APPROVED
+                          </span>
+                        )}
+                      </>
+                    ) : (
+                      <span style={{ color: '#8ba0b9', fontStyle: 'italic' }}>unassigned</span>
+                    )}
+                  </th>
+                )
+              })}
+              {canEditAll && <th className="total-col"></th>}
             </tr>
           </thead>
           <tbody>
@@ -268,7 +366,7 @@ export default function Balancing({ profile }) {
             <SimpleEditRow
               label="TOTAL SALES"
               field="total_sales"
-              staff={staff}
+              pumps={visiblePumps}
               entries={entries}
               canEdit={canEditAll}
               canEditOwn={false}
@@ -282,7 +380,7 @@ export default function Balancing({ profile }) {
             {/* DROPS */}
             <ReadonlyRow
               label="DROPS"
-              staff={staff}
+              pumps={visiblePumps}
               entries={entries}
               field="drops"
               showTotal={canEditAll}
@@ -293,7 +391,7 @@ export default function Balancing({ profile }) {
             <SimpleEditRow
               label="VISA"
               field="visa"
-              staff={staff}
+              pumps={visiblePumps}
               entries={entries}
               canEdit={canEditAll}
               canEditOwn={false}
@@ -306,7 +404,7 @@ export default function Balancing({ profile }) {
             {/* MOMO / AIRTEL */}
             <ReadonlyRow
               label="MOMO / AIRTEL"
-              staff={staff}
+              pumps={visiblePumps}
               entries={entries}
               field="momo"
               showTotal={canEditAll}
@@ -317,7 +415,7 @@ export default function Balancing({ profile }) {
             <SimpleEditRow
               label="CARD SALES"
               field="card_sales_manual"
-              staff={staff}
+              pumps={visiblePumps}
               entries={entries}
               canEdit={canEditAll}
               canEditOwn={false}
@@ -331,7 +429,7 @@ export default function Balancing({ profile }) {
             <SimpleEditRow
               label="APP USER"
               field="app_user"
-              staff={staff}
+              pumps={visiblePumps}
               entries={entries}
               canEdit={canEditAll}
               canEditOwn={true}
@@ -344,7 +442,7 @@ export default function Balancing({ profile }) {
             {/* EXPENSES SECTION */}
             <tr className="section-head">
               <td className="sticky-col">EXPENSES</td>
-              {staff.map(s => <td key={s.id}></td>)}
+              {visiblePumps.map(p => <td key={p.id}></td>)}
               {canEditAll && <td className="total-col"></td>}
             </tr>
 
@@ -353,7 +451,7 @@ export default function Balancing({ profile }) {
                 <td className="sticky-col" style={{ color: '#8ba0b9', fontStyle: 'italic' }}>
                   No expense rows yet
                 </td>
-                {staff.map(s => <td key={s.id}></td>)}
+                {visiblePumps.map(p => <td key={p.id}></td>)}
                 {canEditAll && <td className="total-col"></td>}
               </tr>
             )}
@@ -361,19 +459,20 @@ export default function Balancing({ profile }) {
             {customExpenseTypes.map(type => (
               <tr key={type}>
                 <td className="sticky-col">{type}</td>
-                {staff.map(s => {
-                  const list = (expenses[s.id] || []).filter(x => x.expense_type === type)
+                {visiblePumps.map(p => {
+                  const list = (expenses[p.pump_number] || []).filter(x => x.expense_type === type)
                   const approvedTotal = list.filter(x => x.status === 'approved').reduce((a,x) => a + Number(x.amount||0), 0)
                   const pendingCount = list.filter(x => x.status === 'pending').length
-                  const canUserEdit = canEditAll || s.id === user.id
+                  const entry = entries[p.pump_number]
+                  const canUserEdit = canEditAll || (entry && entry.user_id === user.id)
 
                   return (
-                    <td key={s.id} className="expense-cell">
+                    <td key={p.id} className="expense-cell">
                       <div style={{ fontWeight: 700, textAlign: 'right' }}>{approvedTotal.toLocaleString()}</div>
-                      {canUserEdit && (
+                      {canUserEdit && entry && (
                         <button
                           className="btn-tiny"
-                          onClick={() => setOpenExpense({ userId: s.id, type })}
+                          onClick={() => setOpenExpense({ pumpNumber: p.pump_number, type })}
                           title="Add expense"
                         >
                           <i className="fas fa-plus" />
@@ -382,10 +481,10 @@ export default function Balancing({ profile }) {
                       {pendingCount > 0 && (
                         <div style={{ fontSize: 10, marginTop: 4, textAlign: 'right' }}>
                           <span className="pill amber" style={{ fontSize: 9 }}>{pendingCount} pending</span>
-                          {canApprove && list.filter(x => x.status === 'pending').map(p => (
-                            <span key={p.id} style={{ display: 'inline-flex', gap: 2, marginLeft: 4 }}>
-                              <button className="btn-tiny success" onClick={() => approveExpense(p.id)}>✓</button>
-                              <button className="btn-tiny danger" onClick={() => rejectExpense(p.id)}>✕</button>
+                          {canApprove && list.filter(x => x.status === 'pending').map(pn => (
+                            <span key={pn.id} style={{ display: 'inline-flex', gap: 2, marginLeft: 4 }}>
+                              <button className="btn-tiny success" onClick={() => approveExpense(pn.id)}>✓</button>
+                              <button className="btn-tiny danger" onClick={() => rejectExpense(pn.id)}>✕</button>
                             </span>
                           ))}
                         </div>
@@ -395,13 +494,13 @@ export default function Balancing({ profile }) {
                 })}
                 {canEditAll && (
                   <td className="total-col">
-                    {sumRowCustom(id => sumExpenseType(id, type)).toLocaleString()}
+                    {visiblePumps.reduce((s, p) => s + sumExpenseType(p.pump_number, type), 0).toLocaleString()}
                   </td>
                 )}
               </tr>
             ))}
 
-            {/* Add new expense type row */}
+            {/* Add new expense type */}
             {(canEditAll || isAttendant) && (
               <tr>
                 <td className="sticky-col">
@@ -424,15 +523,15 @@ export default function Balancing({ profile }) {
                     </div>
                   )}
                 </td>
-                {staff.map(s => <td key={s.id}></td>)}
+                {visiblePumps.map(p => <td key={p.id}></td>)}
                 {canEditAll && <td className="total-col"></td>}
               </tr>
             )}
 
-            {/* CREDITS SECTION */}
+            {/* CREDITS */}
             <tr className="section-head">
               <td className="sticky-col">CREDITS</td>
-              {staff.map(s => <td key={s.id}></td>)}
+              {visiblePumps.map(p => <td key={p.id}></td>)}
               {canEditAll && <td className="total-col"></td>}
             </tr>
 
@@ -443,19 +542,20 @@ export default function Balancing({ profile }) {
                   Click + to add
                 </span>
               </td>
-              {staff.map(s => {
-                const list = credits[s.id] || []
+              {visiblePumps.map(p => {
+                const list = credits[p.pump_number] || []
                 const approvedTotal = list.filter(x => x.status === 'approved').reduce((a,x) => a + Number(x.amount||0), 0)
                 const pendingCount = list.filter(x => x.status === 'pending').length
-                const canUserEdit = canEditAll || s.id === user.id
+                const entry = entries[p.pump_number]
+                const canUserEdit = canEditAll || (entry && entry.user_id === user.id)
 
                 return (
-                  <td key={s.id} className="expense-cell">
+                  <td key={p.id} className="expense-cell">
                     <div style={{ fontWeight: 700, textAlign: 'right' }}>{approvedTotal.toLocaleString()}</div>
-                    {canUserEdit && (
+                    {canUserEdit && entry && (
                       <button
                         className="btn-tiny"
-                        onClick={() => setOpenCredit({ userId: s.id })}
+                        onClick={() => setOpenCredit({ pumpNumber: p.pump_number })}
                         title="Add customer credit"
                       >
                         <i className="fas fa-plus" />
@@ -464,20 +564,12 @@ export default function Balancing({ profile }) {
                     {pendingCount > 0 && (
                       <div style={{ fontSize: 10, marginTop: 4, textAlign: 'right' }}>
                         <span className="pill amber" style={{ fontSize: 9 }}>{pendingCount} pending</span>
-                        {canApprove && list.filter(x => x.status === 'pending').map(p => (
-                          <span key={p.id} style={{ display: 'inline-flex', gap: 2, marginLeft: 4 }}>
-                            <button className="btn-tiny success" onClick={() => approveCredit(p.id)}>✓</button>
-                            <button className="btn-tiny danger" onClick={() => rejectCredit(p.id)}>✕</button>
+                        {canApprove && list.filter(x => x.status === 'pending').map(pn => (
+                          <span key={pn.id} style={{ display: 'inline-flex', gap: 2, marginLeft: 4 }}>
+                            <button className="btn-tiny success" onClick={() => approveCredit(pn.id)}>✓</button>
+                            <button className="btn-tiny danger" onClick={() => rejectCredit(pn.id)}>✕</button>
                           </span>
                         ))}
-                      </div>
-                    )}
-                    {list.length > 0 && (
-                      <div style={{ fontSize: 10, color: '#6b85a0', marginTop: 4, textAlign: 'right' }}>
-                        {list.slice(0,2).map(x => (
-                          <div key={x.id}>{x.customer_name || '—'}: {Number(x.amount).toLocaleString()}</div>
-                        ))}
-                        {list.length > 2 && <div>+{list.length - 2} more</div>}
                       </div>
                     )}
                   </td>
@@ -485,7 +577,7 @@ export default function Balancing({ profile }) {
               })}
               {canEditAll && (
                 <td className="total-col">
-                  {sumRowCustom(id => sumCredits(id)).toLocaleString()}
+                  {visiblePumps.reduce((s, p) => s + sumCredits(p.pump_number), 0).toLocaleString()}
                 </td>
               )}
             </tr>
@@ -494,7 +586,7 @@ export default function Balancing({ profile }) {
             <SimpleEditRow
               label="CASH"
               field="cash_in_hand"
-              staff={staff}
+              pumps={visiblePumps}
               entries={entries}
               canEdit={canEditAll}
               canEditOwn={true}
@@ -508,20 +600,27 @@ export default function Balancing({ profile }) {
             {/* BALANCE */}
             <tr className="balance-row">
               <td className="sticky-col">BALANCE</td>
-              {staff.map(s => {
-                const e = entries[s.id]
-                if (!e) return <td key={s.id}>—</td>
+              {visiblePumps.map(p => {
+                const e = entries[p.pump_number]
+                if (!e) return <td key={p.id}>—</td>
                 const b = Number(e.balance || 0)
                 const cls = b > 0 ? 'balance-short' : b < 0 ? 'balance-excess' : 'balance-zero'
                 return (
-                  <td key={s.id} className={cls}>
+                  <td key={p.id} className={cls}>
                     <div style={{ textAlign: 'right' }}>{b.toLocaleString()}</div>
-                    {e.balance_status === 'pending' && canApprove && (
-                      <button className="btn-tiny success" onClick={() => approveBalanceEntry(s.id)} disabled={busy}>
-                        <i className="fas fa-check" />
+                    {e.submission_status === 'draft' && isAttendant && e.user_id === user.id && (
+                      <button className="btn-tiny success" onClick={() => submitEntry(p.pump_number)} disabled={busy}>
+                        <i className="fas fa-paper-plane" /> Submit
                       </button>
                     )}
-                    {e.balance_status === 'approved' && (
+                    {e.submission_status === 'submitted' && canApprove && (
+                      <>
+                        <button className="btn-tiny success" onClick={() => approveSubmission(p.pump_number)} disabled={busy}>
+                          <i className="fas fa-check" /> Approve
+                        </button>
+                      </>
+                    )}
+                    {e.submission_status === 'approved' && (
                       <span className="pill green" style={{ fontSize: 10 }}>approved</span>
                     )}
                   </td>
@@ -533,7 +632,7 @@ export default function Balancing({ profile }) {
             {/* TOPUP */}
             <ReadonlyRow
               label="TOPUP"
-              staff={staff}
+              pumps={visiblePumps}
               entries={entries}
               field="topup"
               showTotal={canEditAll}
@@ -543,6 +642,39 @@ export default function Balancing({ profile }) {
           </tbody>
         </table>
       </div>
+
+      {/* MODALS */}
+      {openAssign !== null && (
+        <AssignPumpModal
+          profile={profile}
+          pumpNumber={openAssign}
+          currentEntry={entries[openAssign]}
+          pumps={pumps}
+          onClose={() => setOpenAssign(null)}
+          onSave={assignPump}
+        />
+      )}
+
+      {openAddPump && (
+        <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) setOpenAddPump(false) }}>
+          <div className="modal">
+            <h3>Add a pump</h3>
+            <div className="modal-sub">Beyond the existing 6</div>
+            <label>Pump number</label>
+            <input type="number" value={newPumpNumber} onChange={e => setNewPumpNumber(e.target.value)} autoFocus />
+            <label>Product</label>
+            <select value={newPumpProduct} onChange={e => setNewPumpProduct(e.target.value)}>
+              <option value="PMS">PMS only</option>
+              <option value="AGO">AGO only</option>
+              <option value="BOTH">Both PMS and AGO</option>
+            </select>
+            <div className="modal-actions">
+              <button className="btn-ghost-full" onClick={() => setOpenAddPump(false)}>Cancel</button>
+              <button className="btn-primary-full" onClick={addPump} disabled={busy}>Add pump</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {openExpense && (
         <ExpenseModal
@@ -569,19 +701,19 @@ export default function Balancing({ profile }) {
 /* ============================================================
    ROW COMPONENTS
    ============================================================ */
-function SimpleEditRow({ label, field, staff, entries, canEdit, canEditOwn, currentUserId, onSave, total, showTotal, highlight }) {
+function SimpleEditRow({ label, field, pumps, entries, canEdit, canEditOwn, currentUserId, onSave, total, showTotal, highlight }) {
   return (
     <tr className={highlight ? 'highlight-row' : ''}>
       <td className="sticky-col">{label}</td>
-      {staff.map(s => {
-        const e = entries[s.id]
-        const userCanEdit = canEdit || (canEditOwn && s.id === currentUserId)
+      {pumps.map(p => {
+        const e = entries[p.pump_number]
+        const userCanEdit = e && (canEdit || (canEditOwn && e.user_id === currentUserId))
         return (
-          <td key={s.id}>
+          <td key={p.id}>
             <CellInput
               value={e?.[field] ?? 0}
               canEdit={userCanEdit}
-              onSave={(v) => onSave(s.id, field, v)}
+              onSave={(v) => onSave(p.pump_number, field, v)}
             />
           </td>
         )
@@ -597,7 +729,11 @@ function CellInput({ value, canEdit, onSave }) {
 
   useEffect(() => { setV(value) }, [value])
 
-  if (!canEdit) return <span style={{ textAlign: 'right', display: 'block' }}>{Number(value || 0).toLocaleString()}</span>
+  if (!canEdit) {
+    return <span style={{ textAlign: 'right', display: 'block' }}>
+      {Number(value || 0).toLocaleString()}
+    </span>
+  }
 
   return (
     <input
@@ -622,13 +758,13 @@ function CellInput({ value, canEdit, onSave }) {
   )
 }
 
-function ReadonlyRow({ label, staff, entries, field, total, showTotal }) {
+function ReadonlyRow({ label, pumps, entries, field, total, showTotal }) {
   return (
     <tr className="auto-row">
       <td className="sticky-col">{label}</td>
-      {staff.map(s => (
-        <td key={s.id} style={{ textAlign: 'right' }}>
-          {Number(entries[s.id]?.[field] || 0).toLocaleString()}
+      {pumps.map(p => (
+        <td key={p.id} style={{ textAlign: 'right' }}>
+          {Number(entries[p.pump_number]?.[field] || 0).toLocaleString()}
         </td>
       ))}
       {showTotal && <td className="total-col">{total.toLocaleString()}</td>}
@@ -637,9 +773,91 @@ function ReadonlyRow({ label, staff, entries, field, total, showTotal }) {
 }
 
 /* ============================================================
-   MODALS
+   ASSIGN PUMP MODAL
    ============================================================ */
-function ExpenseModal({ profile, userId, type, onClose, onSaved }) {
+function AssignPumpModal({ profile, pumpNumber, currentEntry, pumps, onClose, onSave }) {
+  const user = profile.user
+  const [staffList, setStaffList] = useState([])
+  const [selectedUserId, setSelectedUserId] = useState(currentEntry?.user_id || '')
+  const [product, setProduct] = useState(currentEntry?.pump_product || 'PMS')
+  const [busy, setBusy] = useState(false)
+
+  const pump = pumps.find(p => p.pump_number === pumpNumber)
+
+  useEffect(() => {
+    async function load() {
+      const { data } = await supabase
+        .from('users')
+        .select('id, name, role')
+        .eq('station_id', user.station_id)
+        .eq('is_active', true)
+        .in('role', ['attendant','ambassador'])
+        .order('name')
+      setStaffList(data || [])
+    }
+    load()
+  }, [user.station_id])
+
+  async function save() {
+    setBusy(true)
+    await onSave(pumpNumber, selectedUserId || null, product)
+    setBusy(false)
+  }
+
+  async function unassign() {
+    if (!confirm('Remove the attendant from this pump?')) return
+    setBusy(true)
+    await onSave(pumpNumber, null, product)
+    setBusy(false)
+  }
+
+  return (
+    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal">
+        <h3>Pump {pumpNumber}</h3>
+        <div className="modal-sub">
+          {pump?.product === 'BOTH' ? 'Supports PMS and AGO' : pump?.product === 'PMS' ? 'PMS only' : 'AGO only'}
+        </div>
+
+        <label>Assign attendant</label>
+        <select value={selectedUserId} onChange={e => setSelectedUserId(e.target.value)}>
+          <option value="">— None —</option>
+          {staffList.map(s => (
+            <option key={s.id} value={s.id}>{s.name} ({s.role})</option>
+          ))}
+        </select>
+
+        {pump?.product === 'BOTH' && (
+          <>
+            <label>Product this attendant is selling</label>
+            <select value={product} onChange={e => setProduct(e.target.value)}>
+              <option value="PMS">PMS</option>
+              <option value="AGO">AGO</option>
+              <option value="BOTH">Both</option>
+            </select>
+          </>
+        )}
+
+        <div className="modal-actions">
+          <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
+          {currentEntry && (
+            <button className="btn-ghost-full" onClick={unassign} style={{ color: '#dc2626' }}>
+              Unassign
+            </button>
+          )}
+          <button className="btn-primary-full" onClick={save} disabled={busy}>
+            {busy ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ============================================================
+   EXPENSE MODAL
+   ============================================================ */
+function ExpenseModal({ profile, pumpNumber, type, onClose, onSaved }) {
   const user = profile.user
   const isManager = ['admin','manager','supervisor'].includes(user.role)
   const [amount, setAmount] = useState('')
@@ -651,19 +869,19 @@ function ExpenseModal({ profile, userId, type, onClose, onSaved }) {
     if (!amount || Number(amount) <= 0) { setErr('Enter amount'); return }
     setBusy(true); setErr('')
 
-    const entryResp = await supabase
+    const { data: entry } = await supabase
       .from('balance_entries')
       .select('id')
-      .eq('user_id', userId)
+      .eq('pump_number', pumpNumber)
       .eq('station_id', user.station_id)
       .order('created_at', { ascending: false })
       .limit(1)
       .single()
 
-    if (!entryResp.data) { setErr('Entry not found'); setBusy(false); return }
+    if (!entry) { setErr('Entry not found'); setBusy(false); return }
 
     const { error } = await supabase.from('balance_expenses').insert({
-      entry_id: entryResp.data.id,
+      entry_id: entry.id,
       expense_type: type,
       amount: Number(amount),
       note: note.trim() || null,
@@ -682,17 +900,13 @@ function ExpenseModal({ profile, userId, type, onClose, onSaved }) {
       <div className="modal">
         <h3>Add expense — {type}</h3>
         <div className="modal-sub">
-          {isManager ? 'Auto-approved as supervisor' : 'Will be sent to supervisor for approval'}
+          Pump {pumpNumber} · {isManager ? 'Auto-approved' : 'Sent to supervisor for approval'}
         </div>
-
         <label>Amount (UGX)</label>
         <input type="number" value={amount} onChange={e => setAmount(e.target.value)} autoFocus />
-
         <label>Note (optional)</label>
         <input value={note} onChange={e => setNote(e.target.value)} />
-
         {err && <div className="auth-err">{err}</div>}
-
         <div className="modal-actions">
           <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
           <button className="btn-primary-full" onClick={save} disabled={busy}>
@@ -704,7 +918,10 @@ function ExpenseModal({ profile, userId, type, onClose, onSaved }) {
   )
 }
 
-function CreditModal({ profile, userId, customers, onClose, onSaved }) {
+/* ============================================================
+   CREDIT MODAL
+   ============================================================ */
+function CreditModal({ profile, pumpNumber, customers, onClose, onSaved }) {
   const user = profile.user
   const isManager = ['admin','manager','supervisor'].includes(user.role)
   const [customerId, setCustomerId] = useState('')
@@ -718,21 +935,19 @@ function CreditModal({ profile, userId, customers, onClose, onSaved }) {
     if (!amount || Number(amount) <= 0) { setErr('Enter amount'); return }
     setBusy(true); setErr('')
 
-    const entryResp = await supabase
+    const { data: entry } = await supabase
       .from('balance_entries')
       .select('id')
-      .eq('user_id', userId)
+      .eq('pump_number', pumpNumber)
       .eq('station_id', user.station_id)
       .order('created_at', { ascending: false })
       .limit(1)
       .single()
 
-    if (!entryResp.data) { setErr('Entry not found'); setBusy(false); return }
-
-    const customer = customers.find(c => c.id === customerId)
+    if (!entry) { setErr('Entry not found'); setBusy(false); return }
 
     const { error } = await supabase.from('balance_credits').insert({
-      entry_id: entryResp.data.id,
+      entry_id: entry.id,
       customer_id: customerId,
       amount: Number(amount),
       note: note.trim() || null,
@@ -751,9 +966,8 @@ function CreditModal({ profile, userId, customers, onClose, onSaved }) {
       <div className="modal">
         <h3>Add customer credit</h3>
         <div className="modal-sub">
-          {isManager ? 'Auto-approved as supervisor' : 'Will be sent to supervisor for approval'}
+          Pump {pumpNumber} · {isManager ? 'Auto-approved' : 'Sent to supervisor for approval'}
         </div>
-
         <label>Customer</label>
         <select value={customerId} onChange={e => setCustomerId(e.target.value)}>
           <option value="">— Pick a customer —</option>
@@ -761,15 +975,11 @@ function CreditModal({ profile, userId, customers, onClose, onSaved }) {
             <option key={c.id} value={c.id}>{c.name} ({c.customer_type})</option>
           ))}
         </select>
-
         <label>Amount (UGX)</label>
         <input type="number" value={amount} onChange={e => setAmount(e.target.value)} />
-
         <label>Note (optional)</label>
         <input value={note} onChange={e => setNote(e.target.value)} />
-
         {err && <div className="auth-err">{err}</div>}
-
         <div className="modal-actions">
           <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
           <button className="btn-primary-full" onClick={save} disabled={busy}>
@@ -782,38 +992,44 @@ function CreditModal({ profile, userId, customers, onClose, onSaved }) {
 }
 
 /* ============================================================
-   DOWNLOADS
+   EXPORTS
    ============================================================ */
-function exportCSV(staff, entries, expenses, credits, expenseTypes, shift) {
-  const header = ['NAMES', ...staff.map(s => s.name), 'TOTAL'].join(',') + '\n'
+function exportCSV(pumps, entries, expenses, credits, expenseTypes, shift, nameById) {
+  const head = ['NAMES', ...pumps.map(p => `PUMP ${p.pump_number}`), 'TOTAL'].join(',') + '\n'
+  const attendantHead = ['ATTENDANT', ...pumps.map(p => {
+    const e = entries[p.pump_number]
+    return e ? (nameById[e.user_id] || '—') : ''
+  }), ''].join(',') + '\n'
+
   const rowOf = (label, fn) => {
-    const vals = staff.map(fn)
+    const vals = pumps.map(fn)
     const total = vals.reduce((s, v) => s + Number(v || 0), 0)
     return [label, ...vals, total].join(',') + '\n'
   }
 
   let csv = `TEXOL LEGACY — ${shift.shift_date} — ${shift.shift_type.toUpperCase()}\n`
   csv += `Generated: ${new Date().toLocaleString()}\n\n`
-  csv += header
-  csv += rowOf('TOTAL SALES', u => entries[u.id]?.total_sales || 0)
-  csv += rowOf('DROPS', u => entries[u.id]?.drops || 0)
-  csv += rowOf('VISA', u => entries[u.id]?.visa || 0)
-  csv += rowOf('MOMO / AIRTEL', u => entries[u.id]?.momo || 0)
-  csv += rowOf('CARD SALES', u => entries[u.id]?.card_sales_manual || 0)
-  csv += rowOf('APP USER', u => entries[u.id]?.app_user || 0)
+  csv += head
+  csv += attendantHead
+  csv += rowOf('TOTAL SALES', p => entries[p.pump_number]?.total_sales || 0)
+  csv += rowOf('DROPS', p => entries[p.pump_number]?.drops || 0)
+  csv += rowOf('VISA', p => entries[p.pump_number]?.visa || 0)
+  csv += rowOf('MOMO / AIRTEL', p => entries[p.pump_number]?.momo || 0)
+  csv += rowOf('CARD SALES', p => entries[p.pump_number]?.card_sales_manual || 0)
+  csv += rowOf('APP USER', p => entries[p.pump_number]?.app_user || 0)
   csv += '\nEXPENSES\n'
   expenseTypes.forEach(type => {
-    csv += rowOf(type, u => (expenses[u.id] || [])
+    csv += rowOf(type, p => (expenses[p.pump_number] || [])
       .filter(x => x.expense_type === type && x.status === 'approved')
-      .reduce((s,x) => s + Number(x.amount||0), 0))
+      .reduce((s, x) => s + Number(x.amount || 0), 0))
   })
   csv += '\nCREDITS\n'
-  csv += rowOf('Customer credits', u => (credits[u.id] || [])
+  csv += rowOf('Customer credits', p => (credits[p.pump_number] || [])
     .filter(x => x.status === 'approved')
-    .reduce((s,x) => s + Number(x.amount||0), 0))
-  csv += rowOf('CASH', u => entries[u.id]?.cash_in_hand || 0)
-  csv += rowOf('BALANCE', u => entries[u.id]?.balance || 0)
-  csv += rowOf('TOPUP', u => entries[u.id]?.topup || 0)
+    .reduce((s, x) => s + Number(x.amount || 0), 0))
+  csv += rowOf('CASH', p => entries[p.pump_number]?.cash_in_hand || 0)
+  csv += rowOf('BALANCE', p => entries[p.pump_number]?.balance || 0)
+  csv += rowOf('TOPUP', p => entries[p.pump_number]?.topup || 0)
 
   const blob = new Blob([csv], { type: 'text/csv' })
   const a = document.createElement('a')
@@ -822,43 +1038,47 @@ function exportCSV(staff, entries, expenses, credits, expenseTypes, shift) {
   a.click()
 }
 
-function exportWord(staff, entries, expenses, credits, shift, expenseTypes) {
+function exportWord(pumps, entries, expenses, credits, shift, expenseTypes, nameById) {
   let html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
   <head><meta charset="utf-8"><title>Balance Sheet</title></head>
   <body>
   <h1>TEXOL LEGACY — ${shift.shift_date}</h1>
   <h3>${shift.shift_type.toUpperCase()} SHIFT</h3>
   <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial;font-size:12px;">
-  <tr style="background:#0b1a2e;color:#f0c94b;"><th>NAMES</th>${staff.map(s=>`<th>${s.name.toUpperCase()}</th>`).join('')}<th>TOTAL</th></tr>`
+  <tr style="background:#0b1a2e;color:#f0c94b;"><th>NAMES</th>${pumps.map(p=>`<th>PUMP ${p.pump_number}</th>`).join('')}<th>TOTAL</th></tr>
+  <tr style="background:#fef3c7;color:#92400e;"><th>ATTENDANT</th>${pumps.map(p => {
+    const e = entries[p.pump_number]
+    return `<th>${e ? (nameById[e.user_id] || '—') : ''}</th>`
+  }).join('')}<th></th></tr>`
 
   const rowOf = (label, fn) => {
-    const vals = staff.map(fn)
+    const vals = pumps.map(fn)
     const total = vals.reduce((s, v) => s + Number(v || 0), 0)
     return `<tr><td><strong>${label}</strong></td>${vals.map(v=>`<td align="right">${Number(v).toLocaleString()}</td>`).join('')}<td align="right"><strong>${total.toLocaleString()}</strong></td></tr>`
   }
 
-  html += rowOf('TOTAL SALES', u => entries[u.id]?.total_sales || 0)
-  html += rowOf('DROPS', u => entries[u.id]?.drops || 0)
-  html += rowOf('VISA', u => entries[u.id]?.visa || 0)
-  html += rowOf('MOMO / AIRTEL', u => entries[u.id]?.momo || 0)
-  html += rowOf('CARD SALES', u => entries[u.id]?.card_sales_manual || 0)
-  html += rowOf('APP USER', u => entries[u.id]?.app_user || 0)
+  html += rowOf('TOTAL SALES', p => entries[p.pump_number]?.total_sales || 0)
+  html += rowOf('DROPS', p => entries[p.pump_number]?.drops || 0)
+  html += rowOf('VISA', p => entries[p.pump_number]?.visa || 0)
+  html += rowOf('MOMO / AIRTEL', p => entries[p.pump_number]?.momo || 0)
+  html += rowOf('CARD SALES', p => entries[p.pump_number]?.card_sales_manual || 0)
+  html += rowOf('APP USER', p => entries[p.pump_number]?.app_user || 0)
 
-  html += `<tr style="background:#0b1a2e;color:#f0c94b;"><td colspan="${staff.length+2}"><strong>EXPENSES</strong></td></tr>`
+  html += `<tr style="background:#0b1a2e;color:#f0c94b;"><td colspan="${pumps.length+2}"><strong>EXPENSES</strong></td></tr>`
   expenseTypes.forEach(type => {
-    html += rowOf(type, u => (expenses[u.id] || [])
+    html += rowOf(type, p => (expenses[p.pump_number] || [])
       .filter(x => x.expense_type === type && x.status === 'approved')
-      .reduce((s,x) => s + Number(x.amount||0), 0))
+      .reduce((s, x) => s + Number(x.amount || 0), 0))
   })
 
-  html += `<tr style="background:#0b1a2e;color:#f0c94b;"><td colspan="${staff.length+2}"><strong>CREDITS</strong></td></tr>`
-  html += rowOf('Customer credits', u => (credits[u.id] || [])
+  html += `<tr style="background:#0b1a2e;color:#f0c94b;"><td colspan="${pumps.length+2}"><strong>CREDITS</strong></td></tr>`
+  html += rowOf('Customer credits', p => (credits[p.pump_number] || [])
     .filter(x => x.status === 'approved')
-    .reduce((s,x) => s + Number(x.amount||0), 0))
+    .reduce((s, x) => s + Number(x.amount || 0), 0))
 
-  html += rowOf('CASH', u => entries[u.id]?.cash_in_hand || 0)
-  html += rowOf('BALANCE', u => entries[u.id]?.balance || 0)
-  html += rowOf('TOPUP', u => entries[u.id]?.topup || 0)
+  html += rowOf('CASH', p => entries[p.pump_number]?.cash_in_hand || 0)
+  html += rowOf('BALANCE', p => entries[p.pump_number]?.balance || 0)
+  html += rowOf('TOPUP', p => entries[p.pump_number]?.topup || 0)
 
   html += '</table></body></html>'
 

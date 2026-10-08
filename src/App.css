@@ -1982,3 +1982,10 @@ button { font-family: inherit; }
   background: #f8fafc !important;
   padding: 8px 10px;
 }
+.staff-head {
+  cursor: pointer;
+  transition: background .15s;
+}
+.staff-head:hover {
+  background: #fde68a !important;
+}
