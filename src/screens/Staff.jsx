@@ -10,6 +10,7 @@ export default function Staff({ profile }) {
   const canDelete = isAdmin
 
   const [staff, setStaff] = useState([])
+  const [staffCodes, setStaffCodes] = useState({})
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [roleFilter, setRoleFilter] = useState('all')
@@ -26,9 +27,19 @@ export default function Staff({ profile }) {
     const { data: stns } = await supabase.from('stations').select('*')
     setStations(stns || [])
 
+    // Load staff codes + colors
+    const { data: codes } = await supabase
+      .from('staff_codes')
+      .select('user_id, code, color')
+    const codeMap = {}
+    ;(codes || []).forEach(c => {
+      codeMap[c.user_id] = { code: c.code, color: c.color }
+    })
+    setStaffCodes(codeMap)
+
     let query = supabase
       .from('users')
-      .select('id, name, email, phone, role, access_score, station_id, is_active, initials, staff_number, created_at, deactivated_at, deactivation_reason')
+      .select('id, name, email, phone, role, access_score, station_id, is_active, initials, staff_number, created_at, deactivated_at, deactivation_reason, is_company_phone')
       .order('name', { ascending: true })
 
     if (user.role !== 'admin' && stationFilter !== 'all') {
@@ -146,6 +157,7 @@ export default function Staff({ profile }) {
           <option value="supervisor">Supervisors</option>
           <option value="manager">Managers</option>
           <option value="admin">Admins</option>
+          <option value="company_phone">Company Phones</option>
         </select>
         <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
           <option value="all">All status</option>
@@ -204,9 +216,36 @@ export default function Staff({ profile }) {
                       </div>
                     </td>
                     <td>
-                      <CodeCell staff={s} profile={profile} onChanged={loadAll} />
+                      {staffCodes[s.id] ? (
+                        <span
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 8,
+                            background: staffCodes[s.id].color + '33',
+                            padding: '4px 10px',
+                            borderRadius: 12,
+                            fontWeight: 700,
+                            fontSize: 13,
+                          }}
+                        >
+                          <span
+                            style={{
+                              width: 10, height: 10, borderRadius: '50%',
+                              background: staffCodes[s.id].color,
+                            }}
+                          />
+                          {staffCodes[s.id].code}
+                        </span>
+                      ) : (
+                        <span style={{ color: '#8ba0b9', fontSize: 12, fontStyle: 'italic' }}>none</span>
+                      )}
                     </td>
-                    <td><span className={`pill ${rolePillClass(s.role)}`}>{s.role}</span></td>
+                    <td>
+                      <span className={`pill ${rolePillClass(s.role)}`}>
+                        {s.role === 'company_phone' ? 'Company Phone' : s.role}
+                      </span>
+                    </td>
                     <td><span className="pill gold">{s.access_score}%</span></td>
                     <td>{s.phone || '—'}</td>
                     <td>
@@ -254,6 +293,7 @@ export default function Staff({ profile }) {
           profile={profile}
           staff={openEdit === 'new' ? null : openEdit}
           stations={stations}
+          existingCode={openEdit === 'new' ? null : staffCodes[openEdit?.id]}
           onClose={() => setOpenEdit(null)}
           onSaved={async () => { setOpenEdit(null); await loadAll() }}
         />
@@ -273,111 +313,19 @@ export default function Staff({ profile }) {
 }
 
 /* ============================================================
-   CODE CELL — 2-digit code + color chip
+   EDIT / CREATE STAFF
    ============================================================ */
-function CodeCell({ staff, profile, onChanged }) {
-  const user = profile.user
-  const canEdit = ['admin','manager','supervisor'].includes(user.role)
-  const [code, setCode] = useState('')
-  const [color, setColor] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [loaded, setLoaded] = useState(false)
+const COLOR_PALETTE = [
+  '#EF4444','#991B1B','#F97316','#F59E0B','#FACC15','#84CC16',
+  '#22C55E','#047857','#14B8A6','#06B6D4','#0EA5E9','#3B82F6',
+  '#6366F1','#8B5CF6','#A855F7','#D946EF','#EC4899','#F43F5E',
+  '#92400E','#64748B',
+]
 
-  useEffect(() => {
-    async function load() {
-      const { data } = await supabase
-        .from('staff_codes')
-        .select('*')
-        .eq('user_id', staff.id)
-        .maybeSingle()
-      if (data) {
-        setCode(data.code || '')
-        setColor(data.color || '')
-      }
-      setLoaded(true)
-    }
-    load()
-  }, [staff.id])
-
-  async function save(newCode, newColor) {
-    if (!newCode || newCode.length !== 2) {
-      alert('Code must be 2 digits')
-      return
-    }
-    setBusy(true)
-    const { error } = await supabase.from('staff_codes').upsert({
-      user_id: staff.id,
-      station_id: staff.station_id,
-      code: newCode,
-      color: newColor,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'user_id' })
-    setBusy(false)
-    if (error) { alert(error.message); return }
-    onChanged && onChanged()
-  }
-
-  if (!loaded) return <span style={{ color: '#8ba0b9' }}>…</span>
-
-  const display = code || '—'
-  const chipColor = color || '#e2e8f0'
-
-  if (!canEdit) {
-    return (
-      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-        <span
-          style={{
-            display: 'inline-block', width: 12, height: 12, borderRadius: '50%',
-            background: chipColor,
-          }}
-        />
-        <span style={{ fontFamily: 'ui-monospace, monospace', fontWeight: 700 }}>{display}</span>
-      </div>
-    )
-  }
-
-  return (
-    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-      <span
-        style={{
-          display: 'inline-block', width: 12, height: 12, borderRadius: '50%',
-          background: chipColor, flexShrink: 0,
-        }}
-      />
-      <input
-        type="text"
-        inputMode="numeric"
-        maxLength={2}
-        value={code}
-        onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 2))}
-        onBlur={e => save(e.target.value, color)}
-        style={{
-          width: 44, padding: '4px 6px', textAlign: 'center',
-          fontFamily: 'ui-monospace, monospace', fontWeight: 700,
-          border: '1px solid #e2e8f0', borderRadius: 6, outline: 'none',
-        }}
-        placeholder="00"
-        disabled={busy}
-      />
-      <input
-        type="color"
-        value={color || '#EF4444'}
-        onChange={e => { setColor(e.target.value); save(code, e.target.value) }}
-        style={{
-          width: 26, height: 26, borderRadius: 6,
-          border: '1px solid #e2e8f0', cursor: 'pointer', padding: 0,
-        }}
-      />
-    </div>
-  )
-}
-
-/* ============================================================
-   EDIT STAFF MODAL
-   ============================================================ */
-function EditStaffModal({ profile, staff, stations, onClose, onSaved }) {
+function EditStaffModal({ profile, staff, stations, existingCode, onClose, onSaved }) {
   const isNew = !staff
   const user = profile.user
+  const isAdmin = user.role === 'admin'
 
   const [name, setName] = useState(staff?.name || '')
   const [phone, setPhone] = useState(staff?.phone || '')
@@ -389,9 +337,31 @@ function EditStaffModal({ profile, staff, stations, onClose, onSaved }) {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
 
+  const [staffCode, setStaffCode] = useState(existingCode?.code || '')
+  const [staffColor, setStaffColor] = useState(existingCode?.color || COLOR_PALETTE[0])
+  const [usedCodes, setUsedCodes] = useState([])
+
+  useEffect(() => {
+    async function loadUsed() {
+      const { data } = await supabase
+        .from('staff_codes')
+        .select('user_id, code')
+        .eq('station_id', user.station_id)
+      setUsedCodes((data || []).filter(c => c.user_id !== staff?.id).map(c => c.code))
+    }
+    loadUsed()
+  }, [user.station_id, staff?.id])
+
   function onRoleChange(newRole) {
     setRole(newRole)
-    const map = { attendant: 30, ambassador: 40, supervisor: 60, manager: 80, admin: 100 }
+    const map = {
+      attendant: 30,
+      ambassador: 40,
+      supervisor: 60,
+      manager: 80,
+      admin: 100,
+      company_phone: 30,
+    }
     setAccess(map[newRole] ?? 30)
   }
 
@@ -399,15 +369,21 @@ function EditStaffModal({ profile, staff, stations, onClose, onSaved }) {
     if (!name.trim()) { setErr('Name required'); return }
     if (isNew && !email.trim()) { setErr('Email required'); return }
     if (isNew && password.length < 6) { setErr('Password must be at least 6 characters'); return }
+    if (staffCode && usedCodes.includes(staffCode)) {
+      setErr(`Code ${staffCode} is already in use`)
+      return
+    }
 
     setBusy(true); setErr('')
 
     try {
       if (isNew) {
         const { data: authData, error: authErr } = await supabase.auth.signUp({
-          email: email.trim(),
+          email: email.trim().toLowerCase(),
           password,
-          options: { data: { name: name.trim() } },
+          options: {
+            data: { name: name.trim() },
+          },
         })
         if (authErr) throw authErr
         if (!authData.user) throw new Error('Signup failed — email may already be in use')
@@ -423,9 +399,22 @@ function EditStaffModal({ profile, staff, stations, onClose, onSaved }) {
             access_score: access,
             station_id: stationId,
             initials: initialsOf(name),
+            is_company_phone: role === 'company_phone',
           })
           .eq('id', authData.user.id)
         if (updErr) throw updErr
+
+        // Save staff code + color if provided
+        if (staffCode && staffColor) {
+          await supabase
+            .from('staff_codes')
+            .upsert({
+              user_id: authData.user.id,
+              station_id: user.station_id,
+              code: staffCode,
+              color: staffColor,
+            }, { onConflict: 'user_id' })
+        }
       } else {
         const { error } = await supabase
           .from('users')
@@ -436,9 +425,22 @@ function EditStaffModal({ profile, staff, stations, onClose, onSaved }) {
             access_score: access,
             station_id: stationId,
             initials: initialsOf(name),
+            is_company_phone: role === 'company_phone',
           })
           .eq('id', staff.id)
         if (error) throw error
+
+        if (staffCode && staffColor) {
+          await supabase
+            .from('staff_codes')
+            .upsert({
+              user_id: staff.id,
+              station_id: user.station_id,
+              code: staffCode,
+              color: staffColor,
+              updated_at: new Date().toISOString(),
+            }, { onConflict: 'user_id' })
+        }
       }
 
       onSaved()
@@ -462,10 +464,20 @@ function EditStaffModal({ profile, staff, stations, onClose, onSaved }) {
         {isNew ? (
           <>
             <label>Email (used to log in)</label>
-            <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="nathan@texol.ug" />
+            <input
+              type="email"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              placeholder="nathan@texol.ug"
+            />
 
             <label>Temporary password</label>
-            <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="At least 6 chars" />
+            <input
+              type="password"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              placeholder="At least 6 chars"
+            />
           </>
         ) : (
           <>
@@ -486,13 +498,14 @@ function EditStaffModal({ profile, staff, stations, onClose, onSaved }) {
           <option value="ambassador">Ambassador</option>
           <option value="supervisor">Supervisor</option>
           <option value="manager">Manager</option>
-          {user.role === 'admin' && <option value="admin">Admin</option>}
+          {isAdmin && <option value="admin">Admin</option>}
+          {isAdmin && <option value="company_phone">Company Phone</option>}
         </select>
 
         <label>Access score (%)</label>
         <input type="number" value={access} onChange={e => setAccess(Number(e.target.value))} />
 
-        {user.role === 'admin' && (
+        {isAdmin && (
           <>
             <label>Station</label>
             <select value={stationId} onChange={e => setStationId(e.target.value)}>
@@ -502,6 +515,45 @@ function EditStaffModal({ profile, staff, stations, onClose, onSaved }) {
             </select>
           </>
         )}
+
+        <label>Staff code (2 digits)</label>
+        <input
+          type="text"
+          inputMode="numeric"
+          maxLength={2}
+          value={staffCode}
+          onChange={e => {
+            const v = e.target.value.replace(/\D/g, '').slice(0, 2)
+            setStaffCode(v)
+          }}
+          placeholder="01"
+        />
+        {staffCode && usedCodes.includes(staffCode) && (
+          <div className="field-hint" style={{ marginTop: 6 }}>
+            <i className="fas fa-exclamation-triangle" />
+            <span>
+              Code <strong>{staffCode}</strong> is already used by someone else. Pick another.
+            </span>
+          </div>
+        )}
+
+        <label>Color</label>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+          {COLOR_PALETTE.map(c => (
+            <button
+              key={c}
+              type="button"
+              onClick={() => setStaffColor(c)}
+              style={{
+                width: 34, height: 34, borderRadius: 8,
+                background: c,
+                border: staffColor === c ? '3px solid #0b1a2e' : '2px solid transparent',
+                cursor: 'pointer',
+              }}
+              title={c}
+            />
+          ))}
+        </div>
 
         {err && <div className="auth-err">{err}</div>}
 
@@ -609,7 +661,9 @@ function AccessModal({ staff, onClose, onSaved }) {
         granted: !!granted,
       }))
       if (rows.length > 0) {
-        await supabase.from('user_powers').upsert(rows, { onConflict: 'user_id,power_id' })
+        await supabase
+          .from('user_powers')
+          .upsert(rows, { onConflict: 'user_id,power_id' })
       }
       onSaved()
     } catch (e) {
@@ -622,10 +676,16 @@ function AccessModal({ staff, onClose, onSaved }) {
     <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="modal" style={{ maxWidth: 640 }}>
         <h3>Access control</h3>
-        <div className="modal-sub"><strong>{staff.name}</strong> · {staff.role}</div>
+        <div className="modal-sub">
+          <strong>{staff.name}</strong> · {staff.role === 'company_phone' ? 'Company Phone' : staff.role}
+        </div>
 
         <label>Access score (%)</label>
-        <input type="number" value={access} onChange={e => setAccess(Number(e.target.value))} />
+        <input
+          type="number"
+          value={access}
+          onChange={e => setAccess(Number(e.target.value))}
+        />
 
         <div className="power-groups">
           {POWER_GROUPS.map(group => (
@@ -633,8 +693,15 @@ function AccessModal({ staff, onClose, onSaved }) {
               <div className="power-group-title">{group.name}</div>
               <div className="power-grid">
                 {group.powers.map(p => (
-                  <label key={p.id} className={`power-item ${powers[p.id] ? 'checked' : ''}`}>
-                    <input type="checkbox" checked={!!powers[p.id]} onChange={() => toggle(p.id)} />
+                  <label
+                    key={p.id}
+                    className={`power-item ${powers[p.id] ? 'checked' : ''}`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={!!powers[p.id]}
+                      onChange={() => toggle(p.id)}
+                    />
                     <span>{p.label}</span>
                   </label>
                 ))}
@@ -656,96 +723,132 @@ function AccessModal({ staff, onClose, onSaved }) {
   )
 }
 
-/* ============================================================
-   POWER GROUPS
-   ============================================================ */
 const POWER_GROUPS = [
-  { name: 'Viewing', powers: [
-    { id: 'view_all_attendants', label: 'View all attendants performance' },
-    { id: 'view_all_ambassadors', label: 'View all ambassadors performance' },
-    { id: 'view_other_shifts', label: 'View other shifts & attendance' },
-    { id: 'view_audit_logs', label: 'View audit logs' },
-    { id: 'view_staff_list', label: 'View staff list' },
-    { id: 'view_fuelcards', label: 'View uploaded fuel card files' },
-    { id: 'view_customers', label: 'View customer records' },
-    { id: 'view_transactions', label: 'View all transactions' },
-  ]},
-  { name: 'Clock In/Out', powers: [
-    { id: 'clock_self', label: 'Clock in / out for self' },
-    { id: 'clock_others', label: 'Clock in / out for others' },
-    { id: 'approve_clockin', label: 'Approve clock-ins' },
-    { id: 'view_gps', label: 'View GPS coordinates' },
-    { id: 'view_photos', label: 'View clock-in selfies' },
-  ]},
-  { name: 'Uploads', powers: [
-    { id: 'upload_targets', label: 'Upload targets' },
-    { id: 'upload_timetable', label: 'Upload timetable' },
-    { id: 'upload_sales_reports', label: 'Upload sales reports' },
-    { id: 'upload_stock', label: 'Upload stock' },
-    { id: 'upload_incidents', label: 'Upload incidents' },
-    { id: 'upload_motivation', label: 'Edit motivation' },
-    { id: 'upload_fuelcards', label: 'Upload fuel card data' },
-    { id: 'upload_attendant_cards', label: 'Upload attendant card work' },
-    { id: 'upload_staff_data', label: 'Upload staff data' },
-    { id: 'upload_home_edits', label: 'Edit home content' },
-    { id: 'upload_theme', label: 'Change theme' },
-  ]},
-  { name: 'Exports', powers: [
-    { id: 'export_staff', label: 'Export staff' },
-    { id: 'export_customers', label: 'Export customers' },
-    { id: 'export_shortages', label: 'Export shortages' },
-    { id: 'export_performance', label: 'Export performance' },
-    { id: 'export_drops', label: 'Export drops' },
-    { id: 'export_balance', label: 'Export balance' },
-    { id: 'export_incidents', label: 'Export incidents' },
-    { id: 'export_audit', label: 'Export audit' },
-    { id: 'export_transactions', label: 'Export transactions to Excel' },
-    { id: 'export_reports', label: 'Download reports' },
-  ]},
-  { name: 'Approvals', powers: [
-    { id: 'approve_warnings', label: 'Approve warnings stage 1' },
-    { id: 'approve_warnings_stage2', label: 'Approve warnings stage 2' },
-    { id: 'approve_warnings_stage3', label: 'Approve warnings stage 3' },
-    { id: 'approve_shortages', label: 'Approve shortages' },
-    { id: 'approve_access', label: 'Approve access changes' },
-    { id: 'approve_fc_uploads', label: 'Approve card uploads' },
-    { id: 'approve_customers', label: 'Approve customers' },
-    { id: 'approve_theme', label: 'Approve theme' },
-    { id: 'approve_home_edits', label: 'Approve home edits' },
-    { id: 'approve_staff_data', label: 'Approve staff data' },
-    { id: 'approve_station_switch', label: 'Approve station switch' },
-    { id: 'approve_balance', label: 'Approve shift close' },
-  ]},
-  { name: 'Money', powers: [
-    { id: 'record_drops', label: 'Record money drops' },
-    { id: 'close_shift', label: 'Close / balance shifts' },
-    { id: 'give_discount', label: 'Give discounts' },
-    { id: 'issue_cards', label: 'Issue fuel cards' },
-    { id: 'topup_cards', label: 'Top up fuel cards' },
-    { id: 'record_expenses', label: 'Record expenses' },
-    { id: 'claim_transactions', label: 'Claim transactions' },
-  ]},
-  { name: 'Collect Mode', powers: [
-    { id: 'use_collect_mode', label: 'Access Collect mode' },
-    { id: 'link_collect_pwa', label: 'Install Collect as app' },
-  ]},
-  { name: 'Admin', powers: [
-    { id: 'reset_passwords', label: 'Reset passwords' },
-    { id: 'create_accounts', label: 'Create accounts' },
-    { id: 'edit_access', label: 'Edit access control' },
-    { id: 'edit_sidebar', label: 'Change sidebar color' },
-    { id: 'switch_station', label: 'Switch station' },
-    { id: 'send_to_hq', label: 'Send to HQ' },
-    { id: 'open_shift', label: 'Open a new shift' },
-  ]},
+  {
+    name: 'Viewing',
+    powers: [
+      { id: 'view_home', label: 'View Home screen' },
+      { id: 'view_all_attendants', label: "View all attendants' performance" },
+      { id: 'view_all_ambassadors', label: "View all ambassadors' performance" },
+      { id: 'view_other_shifts', label: 'View other shifts & attendance' },
+      { id: 'view_audit_logs', label: 'View audit logs' },
+      { id: 'view_staff_list', label: 'View staff list' },
+      { id: 'view_transactions', label: 'View all transactions' },
+      { id: 'view_own_transactions', label: 'View own transactions' },
+      { id: 'view_fuelcards', label: 'View uploaded fuel card files' },
+      { id: 'view_balancing', label: 'View balancing sheet' },
+    ],
+  },
+  {
+    name: 'Clock In/Out',
+    powers: [
+      { id: 'clock_self', label: 'Clock in / out for self' },
+      { id: 'clock_others', label: 'Clock in / out for others' },
+      { id: 'approve_clockin', label: 'Approve clock-ins' },
+      { id: 'view_gps', label: 'View GPS coordinates' },
+      { id: 'view_photos', label: 'View clock-in selfies' },
+    ],
+  },
+  {
+    name: 'Transactions',
+    powers: [
+      { id: 'claim_transactions', label: 'Claim transactions' },
+      { id: 'receive_popup', label: 'Receive transaction popups' },
+      { id: 'export_transactions', label: 'Export transactions' },
+    ],
+  },
+  {
+    name: 'Uploads',
+    powers: [
+      { id: 'upload_targets', label: 'Upload targets' },
+      { id: 'upload_timetable', label: 'Upload timetable' },
+      { id: 'upload_sales_reports', label: 'Upload sales reports' },
+      { id: 'upload_stock', label: 'Upload stock' },
+      { id: 'upload_incidents', label: 'Upload incidents' },
+      { id: 'upload_motivation', label: 'Edit motivation' },
+      { id: 'upload_fuelcards', label: 'Upload fuel card data' },
+      { id: 'upload_attendant_cards', label: 'Upload attendant card work' },
+      { id: 'upload_staff_data', label: 'Upload staff data' },
+      { id: 'upload_home_edits', label: 'Edit home content' },
+      { id: 'upload_theme', label: 'Change theme' },
+    ],
+  },
+  {
+    name: 'Exports',
+    powers: [
+      { id: 'export_staff', label: 'Export staff' },
+      { id: 'export_customers', label: 'Export customers' },
+      { id: 'export_shortages', label: 'Export shortages' },
+      { id: 'export_performance', label: 'Export performance' },
+      { id: 'export_drops', label: 'Export drops' },
+      { id: 'export_balance', label: 'Export balance' },
+      { id: 'export_incidents', label: 'Export incidents' },
+      { id: 'export_audit', label: 'Export audit' },
+      { id: 'export_reports', label: 'Download reports' },
+    ],
+  },
+  {
+    name: 'Approvals',
+    powers: [
+      { id: 'approve_warnings', label: 'Approve warnings stage 1' },
+      { id: 'approve_warnings_stage2', label: 'Approve warnings stage 2' },
+      { id: 'approve_warnings_stage3', label: 'Approve warnings stage 3' },
+      { id: 'approve_shortages', label: 'Approve shortages' },
+      { id: 'approve_access', label: 'Approve access changes' },
+      { id: 'approve_fc_uploads', label: 'Approve card uploads' },
+      { id: 'approve_customers', label: 'Approve customers' },
+      { id: 'approve_theme', label: 'Approve theme' },
+      { id: 'approve_home_edits', label: 'Approve home edits' },
+      { id: 'approve_staff_data', label: 'Approve staff data' },
+      { id: 'approve_station_switch', label: 'Approve station switch' },
+      { id: 'approve_balance', label: 'Approve shift close' },
+      { id: 'approve_balancing', label: 'Approve balancing sheets' },
+    ],
+  },
+  {
+    name: 'Money',
+    powers: [
+      { id: 'record_drops', label: 'Record money drops' },
+      { id: 'close_shift', label: 'Close / balance shifts' },
+      { id: 'give_discount', label: 'Give discounts' },
+      { id: 'issue_cards', label: 'Issue fuel cards' },
+      { id: 'topup_cards', label: 'Top up fuel cards' },
+      { id: 'record_expenses', label: 'Record expenses' },
+      { id: 'edit_balancing', label: 'Edit balancing sheet' },
+    ],
+  },
+  {
+    name: 'Collect Mode',
+    powers: [
+      { id: 'use_collect_mode', label: 'Access Collect mode' },
+      { id: 'link_collect_pwa', label: 'Install Collect as app' },
+    ],
+  },
+  {
+    name: 'Admin',
+    powers: [
+      { id: 'reset_passwords', label: 'Reset passwords' },
+      { id: 'create_accounts', label: 'Create accounts' },
+      { id: 'edit_access', label: 'Edit access control' },
+      { id: 'edit_sidebar', label: 'Change sidebar color' },
+      { id: 'switch_station', label: 'Switch station' },
+      { id: 'send_to_hq', label: 'Send to HQ' },
+      { id: 'open_shift', label: 'Open a new shift' },
+    ],
+  },
 ]
 
 function initialsOf(name = '') {
   return name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase() || '??'
 }
+
 function rolePillClass(role) {
   return {
-    admin: 'red', manager: 'gold', supervisor: 'amber',
-    ambassador: 'blue', attendant: 'gray',
+    admin: 'red',
+    manager: 'gold',
+    supervisor: 'amber',
+    ambassador: 'blue',
+    attendant: 'gray',
+    company_phone: 'purple',
   }[role] || 'gray'
 }

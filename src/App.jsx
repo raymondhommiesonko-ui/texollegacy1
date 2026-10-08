@@ -162,10 +162,21 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
     )
   }
 
-  const visibleMenu = MENU.map(group => ({
-    ...group,
-    items: group.items.filter(item => access >= item.minAccess)
-  })).filter(group => group.items.length > 0)
+    // COMPANY PHONE PORTAL — show only allowed items
+    const isCompanyPhone = user.role === 'company_phone'
+    let visibleMenu
+    if (isCompanyPhone) {
+      const allowedIds = ['home', 'transactions', 'drops']
+      visibleMenu = MENU.map(group => ({
+        ...group,
+        items: group.items.filter(item => allowedIds.includes(item.id))
+      })).filter(group => group.items.length > 0)
+    } else {
+      visibleMenu = MENU.map(group => ({
+        ...group,
+        items: group.items.filter(item => access >= item.minAccess)
+      })).filter(group => group.items.length > 0)
+    }
 
   function go(id) {
     setScreen(id)
@@ -236,10 +247,12 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
             </h2>
           </div>
           <div className="topbar-right">
-            <button className="notif-btn" onClick={() => go('notifications')}>
-              <i className="fas fa-bell" />
-              {unreadCount > 0 && <span className="dot" />}
-            </button>
+            {!isCompanyPhone && (
+              <button className="notif-btn" onClick={() => go('notifications')}>
+                <i className="fas fa-bell" />
+                {unreadCount > 0 && <span className="dot" />}
+              </button>
+            )}
             <div className="role-switcher">
               <button onClick={e => { e.stopPropagation(); setRoleMenuOpen(v => !v) }}>
                 <div className="avatar">{initialsOf(user.name)}</div>
