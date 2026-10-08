@@ -35,12 +35,36 @@ export default function Shortages({ profile }) {
         .order('balance', { ascending: false })
       setCustomerRows(c || [])
     } else {
-      const { data: s } = await supabase
-        .from('v_staff_shortages')
-        .select('*')
-        .eq('user_id', user.id)
-        .maybeSingle()
-      setMyStaff(s || null)
+      // Attendant/Ambassador: fetch own shortage from raw tables
+      // (views may be blocked by RLS for non-manager roles)
+      const [userRow, credits, payments] = await Promise.all([
+        supabase.from('users').select('id, name, role, station_id').eq('id', user.id).single(),
+        supabase.from('shortages_credits')
+          .select('amount, status')
+          .eq('category', 'shortage')
+          .eq('subject_id', user.id),
+        supabase.from('shortage_payments')
+          .select('amount, status')
+          .eq('subject_user_id', user.id)
+          .eq('status', 'approved'),
+      ])
+
+      const totalOwed = (credits.data || [])
+        .filter(c => c.status !== 'rejected')
+        .reduce((s, c) => s + Number(c.amount || 0), 0)
+      const totalPaid = (payments.data || [])
+        .reduce((s, p) => s + Number(p.amount || 0), 0)
+
+      setMyStaff({
+        user_id: user.id,
+        name: userRow.data?.name || user.name,
+        role: userRow.data?.role || user.role,
+        station_id: userRow.data?.station_id || user.station_id,
+        total_owed: totalOwed,
+        total_paid: totalPaid,
+        balance: totalOwed - totalPaid,
+        entries: (credits.data || []).length,
+      })
     }
 
     setLoading(false)
