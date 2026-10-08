@@ -15,14 +15,11 @@ import FuelCards from './screens/FuelCards'
 import Shortages from './screens/Shortages'
 import Customers from './screens/Customers'
 import Reports from './screens/Reports'
+import Balancing from './screens/Balancing'
 import Transactions from './screens/Transactions'
+import Settings from './screens/Settings'
 import TransactionPopup from './TransactionPopup'
 import { useRealtimeTransactions } from './useRealtimeTransactions'
-import Settings from './screens/Settings'
-import CompanyPhones from './screens/CompanyPhones'
-import SetupGuide from './screens/SetupGuide'
-import Incidents from './screens/Incidents'
-import Balancing from './screens/Balancing'
 import './App.css'
 
 export default function App() {
@@ -114,15 +111,6 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
 
   useEffect(() => { setCollectMode(autoCollect) }, [autoCollect])
 
-  // Real-time transactions
-  useRealtimeTransactions(profile?.user?.station_id, (txn) => {
-    if (popupTxn) {
-      setPopupQueue(q => [...q, txn])
-    } else {
-      setPopupTxn(txn)
-    }
-  })
-
   // Load unread notification count
   useEffect(() => {
     if (!profile?.user?.id) return
@@ -141,6 +129,37 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
     loadCount()
   }, [profile?.user?.id, screen])
 
+  // Realtime transactions — only for staff who can view or claim
+  const canReceivePopups = profile?.user && (
+    ['admin','manager','supervisor','ambassador','attendant','company_phone'].includes(profile.user.role)
+  )
+
+  useRealtimeTransactions(
+    canReceivePopups ? profile?.user?.station_id : null,
+    // New transaction arrives
+    (txn) => {
+      if (popupTxn) {
+        setPopupQueue(q => [...q, txn])
+      } else {
+        setPopupTxn(txn)
+      }
+    },
+    // Transaction was claimed elsewhere
+    (updated) => {
+      if (popupTxn && popupTxn.id === updated.id && updated.status === 'claimed') {
+        setPopupTxn(null)
+        setPopupQueue(q => {
+          if (q.length > 0) {
+            const [next, ...rest] = q
+            setTimeout(() => setPopupTxn(next), 300)
+            return rest
+          }
+          return q
+        })
+      }
+    }
+  )
+
   if (loading || !profile?.user) {
     return <div className="loading">Loading your profile…</div>
   }
@@ -148,6 +167,7 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
   const user = profile.user
   const station = profile.station
   const access = user.access_score ?? 30
+  const isCompanyPhone = user.role === 'company_phone'
 
   // Collect mode: full screen
   if (collectMode) {
@@ -162,21 +182,20 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
     )
   }
 
-    // COMPANY PHONE PORTAL — show only allowed items
-    const isCompanyPhone = user.role === 'company_phone'
-    let visibleMenu
-    if (isCompanyPhone) {
-      const allowedIds = ['home', 'transactions', 'drops']
-      visibleMenu = MENU.map(group => ({
-        ...group,
-        items: group.items.filter(item => allowedIds.includes(item.id))
-      })).filter(group => group.items.length > 0)
-    } else {
-      visibleMenu = MENU.map(group => ({
-        ...group,
-        items: group.items.filter(item => access >= item.minAccess)
-      })).filter(group => group.items.length > 0)
-    }
+  // Sidebar menu — different rules for company phones
+  let visibleMenu
+  if (isCompanyPhone) {
+    const allowedIds = ['home', 'transactions', 'drops']
+    visibleMenu = MENU.map(group => ({
+      ...group,
+      items: group.items.filter(item => allowedIds.includes(item.id))
+    })).filter(group => group.items.length > 0)
+  } else {
+    visibleMenu = MENU.map(group => ({
+      ...group,
+      items: group.items.filter(item => access >= item.minAccess)
+    })).filter(group => group.items.length > 0)
+  }
 
   function go(id) {
     setScreen(id)
@@ -210,11 +229,13 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
                 >
                   <i className={`fas ${item.icon}`} />
                   <span>{item.label}</span>
-                  {item.id === 'notifications' && unreadCount > 0 && (
+                  {item.id === 'notifications' && !isCompanyPhone && unreadCount > 0 && (
                     <span className="badge red">{unreadCount}</span>
                   )}
-                  {item.badge && item.id !== 'notifications' && (
-                    <span className={`badge ${item.badgeColor === 'red' ? 'red' : ''}`}>{item.badge}</span>
+                  {item.badge && item.id !== 'notifications' && !isCompanyPhone && (
+                    <span className={`badge ${item.badgeColor === 'red' ? 'red' : ''}`}>
+                      {item.badge}
+                    </span>
                   )}
                 </a>
               ))}
@@ -225,7 +246,7 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
         <div className="sidebar-footer">
           <span className="user-name">{user.name?.toUpperCase()}</span>
           <div className="user-role">
-            <span>{capitalize(user.role)}</span>
+            <span>{isCompanyPhone ? 'Company Phone' : capitalize(user.role)}</span>
             <span className="access-pill">{access}%</span>
           </div>
         </div>
@@ -247,18 +268,22 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
             </h2>
           </div>
           <div className="topbar-right">
+            {/* Notification bell — hidden for company phones */}
             {!isCompanyPhone && (
               <button className="notif-btn" onClick={() => go('notifications')}>
                 <i className="fas fa-bell" />
                 {unreadCount > 0 && <span className="dot" />}
               </button>
             )}
+
             <div className="role-switcher">
               <button onClick={e => { e.stopPropagation(); setRoleMenuOpen(v => !v) }}>
                 <div className="avatar">{initialsOf(user.name)}</div>
                 <div className="info">
                   <div className="name">{user.name}</div>
-                  <div className="role">{capitalize(user.role)} · {access}%</div>
+                  <div className="role">
+                    {isCompanyPhone ? 'Company Phone' : capitalize(user.role)} · {access}%
+                  </div>
                 </div>
                 <i className="fas fa-chevron-down chevron" />
               </button>
@@ -269,17 +294,24 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
                     <div className="avatar">{initialsOf(user.name)}</div>
                     <div className="info">
                       <div className="name">{user.name}</div>
-                      <div className="role">{capitalize(user.role)}</div>
+                      <div className="role">
+                        {isCompanyPhone ? 'Company Phone' : capitalize(user.role)}
+                      </div>
                     </div>
                     <div className="access">{access}%</div>
                   </div>
-                  <button
-                    className="signout-btn"
-                    style={{ color: '#0b1a2e' }}
-                    onClick={() => { setRoleMenuOpen(false); setScreen('account') }}
-                  >
-                    <i className="fas fa-user-circle" /> My account
-                  </button>
+
+                  {/* My account — hidden for company phones */}
+                  {!isCompanyPhone && (
+                    <button
+                      className="signout-btn"
+                      style={{ color: '#0b1a2e' }}
+                      onClick={() => { setRoleMenuOpen(false); setScreen('account') }}
+                    >
+                      <i className="fas fa-user-circle" /> My account
+                    </button>
+                  )}
+
                   <button className="signout-btn" onClick={() => supabase.auth.signOut()}>
                     <i className="fas fa-sign-out-alt" /> Sign out
                   </button>
@@ -292,41 +324,44 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
         {/* SCREEN CONTENT */}
         <div className="screen-wrap">
           {screen === 'home' && <Home profile={profile} onNavigate={go} />}
-          {screen === 'attendance' && <Attendance profile={profile} />}
+          {screen === 'attendance' && !isCompanyPhone && <Attendance profile={profile} />}
           {screen === 'drops' && <Drops profile={profile} onOpenCollect={() => {}} />}
-          {screen === 'timetable' && (
+          {screen === 'transactions' && <Transactions profile={profile} />}
+          {screen === 'timetable' && !isCompanyPhone && (
             <Shifts
               profile={profile}
               onOpenShift={(s) => { setActiveShift(s); setScreen('balance') }}
             />
           )}
-          {screen === 'balance' && (
+          {screen === 'balance' && !isCompanyPhone && (
             <Balance profile={profile} activeShift={activeShift} />
           )}
-          {screen === 'staff' && <Staff profile={profile} />}
-          {screen === 'notifications' && <Notifications profile={profile} />}
-          {screen === 'account' && <Account profile={profile} />}
-          {screen === 'fuel-cards' && <FuelCards profile={profile} />}
-          {screen === 'shortages' && <Shortages profile={profile} />}
-          {screen === 'customers' && <Customers profile={profile} />}
-          {screen === 'reports' && <Reports profile={profile} />}
-          {screen === 'transactions' && <Transactions profile={profile} />}
-          {screen === 'settings' && <Settings profile={profile} />}
-          {screen === 'company-phones' && <CompanyPhones profile={profile} />}
-          {screen === 'setup-guide' && <SetupGuide profile={profile} />}
-          {screen === 'incidents' && <Incidents profile={profile} />}
-          {screen === 'balancing' && <Balancing profile={profile} />}
+          {screen === 'balancing' && !isCompanyPhone && <Balancing profile={profile} />}
+          {screen === 'staff' && !isCompanyPhone && <Staff profile={profile} />}
+          {screen === 'notifications' && !isCompanyPhone && <Notifications profile={profile} />}
+          {screen === 'account' && !isCompanyPhone && <Account profile={profile} />}
+          {screen === 'account' && isCompanyPhone && (
+            <div className="drops-empty">
+              <i className="fas fa-lock" />
+              <h4>Not available</h4>
+              <p>Company phone accounts can't change their own password. Ask an admin.</p>
+            </div>
+          )}
+          {screen === 'fuel-cards' && !isCompanyPhone && <FuelCards profile={profile} />}
+          {screen === 'shortages' && !isCompanyPhone && <Shortages profile={profile} />}
+          {screen === 'customers' && !isCompanyPhone && <Customers profile={profile} />}
+          {screen === 'reports' && !isCompanyPhone && <Reports profile={profile} />}
+          {screen === 'settings' && !isCompanyPhone && <Settings profile={profile} />}
 
           {screen !== 'home' && screen !== 'attendance' && screen !== 'drops' &&
-          screen !== 'timetable' && screen !== 'balance' && screen !== 'staff' &&
-          screen !== 'notifications' && screen !== 'account' &&
-          screen !== 'fuel-cards' && screen !== 'shortages' &&
-          screen !== 'customers' && screen !== 'reports' &&
-          screen !== 'transactions' && screen !== 'incidents' &&
-          screen !== 'company-phones' && screen !== 'setup-guide' && 
-          screen !== 'balancing' && (
-        <Placeholder screenId={screen} onBack={() => go('home')} />
-)}
+           screen !== 'timetable' && screen !== 'balance' && screen !== 'staff' &&
+           screen !== 'notifications' && screen !== 'account' &&
+           screen !== 'fuel-cards' && screen !== 'shortages' &&
+           screen !== 'customers' && screen !== 'reports' &&
+           screen !== 'transactions' && screen !== 'balancing' &&
+           screen !== 'settings' && (
+            <Placeholder screenId={screen} onBack={() => go('home')} />
+          )}
         </div>
       </main>
 
