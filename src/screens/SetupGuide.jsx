@@ -1,137 +1,615 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import ExcelJS from 'exceljs'
+import { supabase } from '../supabase'
 
-export default function SetupGuide({ profile }) {
-  const [copied, setCopied] = useState(false)
+export default function Transactions({ profile }) {
+  const user = profile.user
+  const powers = profile.powers || {}
+  const isManager = ['admin','manager'].includes(user.role)
+  const isSupervisor = user.role === 'supervisor'
+  const isCompanyPhone = user.role === 'company_phone'
 
-  const ingestUrl = 'https://tofrboakpcmjvrixxxtl.supabase.co/functions/v1/ingest-sms'
+  const canViewAll = isManager || isSupervisor || powers.view_transactions
+  const canExport = isManager || isSupervisor || powers.export_transactions
+  const canReassign = isManager || isSupervisor              // reassign claimed txns
+  const canClaim = !canViewAll                                // attendant, ambassador, company phone
 
-  function copy(text) {
-    navigator.clipboard.writeText(text)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+  const [rows, setRows] = useState([])
+  const [staffCodes, setStaffCodes] = useState({})
+  const [loading, setLoading] = useState(true)
+  const [onShift, setOnShift] = useState(true)
+  const [errorMsg, setErrorMsg] = useState('')
+  const [openReassign, setOpenReassign] = useState(null)
+  const [openClaim, setOpenClaim] = useState(null)
+  const [myCode, setMyCode] = useState('')                    // for company phone / attendant display
+
+  const [filter, setFilter] = useState({
+    from: new Date().toISOString().slice(0,10),
+    to: new Date().toISOString().slice(0,10),
+    timeFrom: '',
+    timeTo: '',
+    provider: 'all',
+    attendant: 'all',
+    status: 'all',
+    search: '',
+  })
+
+  async function loadStaffCodes() {
+    try {
+      const { data: codes } = await supabase
+        .from('staff_codes')
+        .select('user_id, code, color')
+        .eq('station_id', user.station_id)
+
+      const { data: users } = await supabase
+        .from('users')
+        .select('id, name, role')
+        .eq('station_id', user.station_id)
+
+      const userMap = {}
+      ;(users || []).forEach(u => { userMap[u.id] = u })
+
+      const map = {}
+      ;(codes || []).forEach(sc => {
+        map[sc.user_id] = {
+          code: sc.code,
+          color: sc.color,
+          name: userMap[sc.user_id]?.name || '—',
+        }
+      })
+      setStaffCodes(map)
+
+      // Find own code if this user has one (attendant, ambassador, company phone)
+      if (map[user.id]) setMyCode(map[user.id].code)
+    } catch (e) {
+      console.error('loadStaffCodes:', e)
+    }
+  }
+
+  async function loadTransactions() {
+    setLoading(true)
+    setErrorMsg('')
+
+    try {
+      // Shift check — applies to attendants, ambassadors, company phones
+      if (!canViewAll) {
+        const { data: on } = await supabase.rpc('am_i_on_shift')
+        if (!on) {
+          setRows([])
+          setOnShift(false)
+          setLoading(false)
+          return
+        }
+      }
+      setOnShift(true)
+
+      const fromISO = filter.from + 'T00:00:00'
+      const toISO = filter.to + 'T23:59:59'
+
+      let q = supabase
+        .from('transactions')
+        .select('*')
+        .eq('station_id', user.station_id)
+        .gte('received_at', fromISO)
+        .lte('received_at', toISO)
+        .order('received_at', { ascending: false })
+        .limit(2000)
+
+      // Non-supervisors: see both unclaimed (to claim) and their own claimed
+      if (!canViewAll) {
+        // Supabase doesn't have OR easily; fetch all and filter client-side
+        // For safety we fetch all station rows and filter below
+      }
+
+      const { data, error } = await q
+      if (error) throw error
+
+      let result = data || []
+      // Non-supervisors: see unclaimed + their own claims only
+      if (!canViewAll) {
+        result = result.filter(t =>
+          t.status === 'unclaimed' ||
+          t.status === 'supervisor_notified' ||
+          t.claimed_by === user.id
+        )
+      }
+
+      if (filter.timeFrom) result = result.filter(t => String(t.received_at).slice(11,16) >= filter.timeFrom)
+      if (filter.timeTo) result = result.filter(t => String(t.received_at).slice(11,16) <= filter.timeTo)
+      if (filter.provider !== 'all') result = result.filter(t => t.provider === filter.provider)
+      if (filter.attendant !== 'all') result = result.filter(t => t.claimed_by === filter.attendant)
+      if (filter.status !== 'all') result = result.filter(t => t.status === filter.status)
+      if (filter.search) {
+        const s = filter.search.toLowerCase()
+        result = result.filter(t =>
+          String(t.txn_id).toLowerCase().includes(s) ||
+          String(t.amount).includes(s) ||
+          (t.customer_name || '').toLowerCase().includes(s)
+        )
+      }
+      setRows(result)
+    } catch (e) {
+      console.error('Load transactions error:', e)
+      setErrorMsg(e.message || 'Could not load transactions')
+    }
+    setLoading(false)
+  }
+
+  useEffect(() => { loadStaffCodes() }, [user.station_id])
+  useEffect(() => { loadTransactions() }, [user.station_id, filter])
+
+  const stats = useMemo(() => {
+    const total = rows.reduce((s, r) => s + Number(r.amount || 0), 0)
+    const claimed = rows.filter(r => r.status === 'claimed').length
+    const unclaimed = rows.filter(r => r.status === 'unclaimed' || r.status === 'supervisor_notified').length
+    return { total, claimed, unclaimed, count: rows.length }
+  }, [rows])
+
+  const byAttendant = useMemo(() => {
+    const map = {}
+    rows.forEach(r => {
+      if (!r.claimed_by) return
+      if (!map[r.claimed_by]) {
+        const sc = staffCodes[r.claimed_by]
+        map[r.claimed_by] = {
+          user_id: r.claimed_by,
+          name: sc?.name || '—',
+          code: sc?.code || '—',
+          color: sc?.color || '#64748B',
+          total: 0,
+          count: 0,
+        }
+      }
+      map[r.claimed_by].total += Number(r.amount || 0)
+      map[r.claimed_by].count++
+    })
+    return Object.values(map).sort((a,b) => b.total - a.total)
+  }, [rows, staffCodes])
+
+  const best = byAttendant[0] || null
+
+  async function exportExcel(provider) {
+    const list = rows.filter(r => r.provider === provider)
+    if (list.length === 0) {
+      alert('No ' + provider + ' transactions in this range')
+      return
+    }
+
+    const wb = new ExcelJS.Workbook()
+    wb.creator = 'TEXOL Legacy'
+    wb.created = new Date()
+
+    const sheet = wb.addWorksheet(
+      provider === 'airtel' ? 'Airtel Money' : 'MTN MoMo',
+      { views: [{ state: 'frozen', ySplit: 1 }] }
+    )
+
+    sheet.columns = [
+      { key: 'time',   width: 12 },
+      { key: 'txn',    width: 20 },
+      { key: 'amount', width: 14 },
+      { key: 'sp',     width: 3 },
+      { key: 'name',   width: 22 },
+      { key: 'total',  width: 16 },
+    ]
+
+    const header = sheet.getRow(1)
+    header.getCell('A').value = 'TIME'
+    header.getCell('B').value = 'TXN ID'
+    header.getCell('C').value = 'AMOUNT'
+    header.getCell('E').value = 'NAME'
+    header.getCell('F').value = 'TOTAL'
+    for (let i = 1; i <= 6; i++) {
+      const c = header.getCell(i)
+      c.font = { bold: true, color: { argb: 'FFFFFFFF' } }
+      c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0B1A2E' } }
+      c.alignment = { vertical: 'middle', horizontal: 'center' }
+    }
+    header.height = 22
+
+    list.slice().reverse().forEach((r, i) => {
+      const rowNum = i + 2
+      const row = sheet.getRow(rowNum)
+      const time = new Date(r.received_at)
+      const timeStr = String(time.getHours()).padStart(2,'0') + ':' +
+                      String(time.getMinutes()).padStart(2,'0') + ':' +
+                      String(time.getSeconds()).padStart(2,'0')
+      row.getCell(1).value = timeStr
+      row.getCell(2).value = String(r.txn_id)
+      row.getCell(2).numFmt = '@'
+      row.getCell(3).value = Number(r.amount || 0)
+      row.getCell(3).numFmt = '#,##0'
+
+      const sc = r.claimed_by ? staffCodes[r.claimed_by] : null
+      const colorHex = sc?.color ? sc.color.replace('#','').toUpperCase() : null
+      if (colorHex) {
+        row.getCell(3).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + colorHex } }
+      }
+      row.getCell(3).alignment = { horizontal: 'right' }
+    })
+
+    byAttendant.forEach((a, idx) => {
+      const rowNum = 3 + idx
+      const row = sheet.getRow(rowNum)
+      row.getCell(5).value = a.name
+      row.getCell(5).font = { bold: true, color: { argb: 'FFFFFFFF' } }
+      const colorHex = a.color.replace('#','').toUpperCase()
+      row.getCell(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + colorHex } }
+      row.getCell(6).value = a.total
+      row.getCell(6).numFmt = '#,##0'
+      row.getCell(6).font = { bold: true }
+      row.getCell(6).alignment = { horizontal: 'right' }
+    })
+
+    const totalRow = list.length + 2
+    sheet.getRow(totalRow).getCell(2).value = 'TOTAL'
+    sheet.getRow(totalRow).getCell(2).font = { bold: true }
+    sheet.getRow(totalRow).getCell(3).value = list.reduce((s,r) => s + Number(r.amount || 0), 0)
+    sheet.getRow(totalRow).getCell(3).numFmt = '#,##0'
+    sheet.getRow(totalRow).getCell(3).font = { bold: true }
+    sheet.getRow(totalRow).getCell(3).border = { top: { style: 'thin' } }
+
+    const buf = await wb.xlsx.writeBuffer()
+    const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `transactions-${provider}-${filter.from}_to_${filter.to}.xlsx`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const attendants = Object.entries(staffCodes)
+    .map(([id, v]) => ({ id, name: v.name, code: v.code, color: v.color }))
+    .sort((a,b) => a.name.localeCompare(b.name))
+
+  if (!user) return <div className="drops-empty">Loading…</div>
+  if (loading) return <div className="drops-empty">Loading…</div>
+
+  if (!onShift) {
+    return (
+      <div className="txns-screen">
+        <div className="drops-empty">
+          <i className="fas fa-clock" />
+          <h4>You are not on shift</h4>
+          <p>Transactions are only visible to staff currently on shift.</p>
+        </div>
+      </div>
+    )
   }
 
   return (
-    <div className="guide-screen">
-      <div className="guide-head">
-        <h3>SMS Forwarder Setup</h3>
-        <div className="sub">Connect the company phone to the portal — one-time setup</div>
-      </div>
-
-      <div className="card-panel" style={{ gridTemplateColumns: '1fr', paddingBottom: 20 }}>
-        <div className="card">
-          <h3><i className="fas fa-info-circle" /> What this does</h3>
-          <p style={{ fontSize: 14, lineHeight: 1.6, color: '#4b637c' }}>
-            The company phone receives Airtel Money and MTN MoMo merchant SMS.
-            An Android app on that phone watches for those messages and forwards them to your portal.
-            When they arrive, every whitelisted company phone gets a popup — attendants type a 2-digit code
-            to claim the transaction.
-          </p>
+    <div className="txns-screen">
+      <div className="txns-head">
+        <div>
+          <h3>Transactions</h3>
+          <div className="sub">
+            {stats.count} txn · UGX {stats.total.toLocaleString()} · {stats.claimed} claimed · {stats.unclaimed} unclaimed
+          </div>
+        </div>
+        <div className="txns-actions">
+          {canExport ? (
+            <>
+              <button className="btn-ghost" onClick={() => exportExcel('airtel')}>
+                <i className="fas fa-file-excel" style={{ color: '#dc2626' }} /> Download Airtel
+              </button>
+              <button className="btn-primary" onClick={() => exportExcel('mtn')}>
+                <i className="fas fa-file-excel" style={{ color: '#f59e0b' }} /> Download MTN
+              </button>
+            </>
+          ) : (
+            <div className="field-hint" style={{ padding: '10px 14px', background: '#fef3c7', color: '#92400e' }}>
+              <i className="fas fa-lock" /> Ask a supervisor to grant you the "Export transactions" power
+            </div>
+          )}
         </div>
       </div>
 
-      <div className="card-panel" style={{ gridTemplateColumns: '1fr', paddingBottom: 20 }}>
-        <div className="card">
-          <h3><i className="fas fa-link" /> Your ingest URL</h3>
-          <div className="field-hint">
-            <i className="fas fa-key" />
-            <div style={{ flex: 1 }}>
-              <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 13, wordBreak: 'break-all' }}>
-                {ingestUrl}
-              </div>
-            </div>
+      {/* COMPANY PHONE / ATTENDANT CODE REMINDER */}
+      {canClaim && myCode && (
+        <div className="info-banner">
+          <i className="fas fa-id-badge" />
+          <span>Your claim code is <strong>{myCode}</strong>. Tap ✅ on any unclaimed row to claim it.</span>
+        </div>
+      )}
+      {canClaim && !myCode && (
+        <div className="info-banner" style={{ background: '#fee2e2', color: '#991b1b' }}>
+          <i className="fas fa-exclamation-triangle" />
+          <span>You have no staff code assigned. Ask a supervisor to set one.</span>
+        </div>
+      )}
+
+      <div className="staff-filters">
+        <label style={{ alignSelf: 'center', fontSize: 13, color: '#6b85a0', fontWeight: 600 }}>From</label>
+        <input type="date" value={filter.from} onChange={e => setFilter(f => ({ ...f, from: e.target.value }))} />
+        <label style={{ alignSelf: 'center', fontSize: 13, color: '#6b85a0', fontWeight: 600 }}>To</label>
+        <input type="date" value={filter.to} onChange={e => setFilter(f => ({ ...f, to: e.target.value }))} />
+        <label style={{ alignSelf: 'center', fontSize: 13, color: '#6b85a0', fontWeight: 600 }}>Time</label>
+        <input type="time" value={filter.timeFrom} onChange={e => setFilter(f => ({ ...f, timeFrom: e.target.value }))} />
+        <input type="time" value={filter.timeTo} onChange={e => setFilter(f => ({ ...f, timeTo: e.target.value }))} />
+        <select value={filter.provider} onChange={e => setFilter(f => ({ ...f, provider: e.target.value }))}>
+          <option value="all">All providers</option>
+          <option value="airtel">Airtel Money</option>
+          <option value="mtn">MTN MoMo</option>
+        </select>
+        {canViewAll && (
+          <select value={filter.attendant} onChange={e => setFilter(f => ({ ...f, attendant: e.target.value }))}>
+            <option value="all">All attendants</option>
+            {attendants.map(a => (
+              <option key={a.id} value={a.id}>{a.code} · {a.name}</option>
+            ))}
+          </select>
+        )}
+        <select value={filter.status} onChange={e => setFilter(f => ({ ...f, status: e.target.value }))}>
+          <option value="all">All statuses</option>
+          <option value="claimed">Claimed</option>
+          <option value="unclaimed">Unclaimed</option>
+          <option value="supervisor_notified">Supervisor notified</option>
+        </select>
+        <input
+          placeholder="Search txn id or amount"
+          value={filter.search}
+          onChange={e => setFilter(f => ({ ...f, search: e.target.value }))}
+        />
+        <button className="btn-ghost btn-sm" onClick={() => setFilter({
+          from: new Date().toISOString().slice(0,10),
+          to: new Date().toISOString().slice(0,10),
+          timeFrom: '', timeTo: '',
+          provider: 'all', attendant: 'all', status: 'all', search: '',
+        })}>Today</button>
+      </div>
+
+      {errorMsg && (
+        <div className="auth-err" style={{ margin: '0 32px 20px' }}>{errorMsg}</div>
+      )}
+
+      {best && (
+        <div className="best-card">
+          <div className="best-label">🏆 Best attendant</div>
+          <div className="best-name" style={{ color: best.color }}>
+            {best.name}
           </div>
-          <button className="btn-primary" style={{ marginTop: 12 }} onClick={() => copy(ingestUrl)}>
-            <i className="fas fa-copy" /> {copied ? 'Copied!' : 'Copy URL'}
+          <div className="best-meta">
+            {best.count} transactions · UGX {best.total.toLocaleString()}
+          </div>
+        </div>
+      )}
+
+      {rows.length === 0 ? (
+        <div className="drops-empty">
+          <i className="fas fa-receipt" />
+          <h4>No transactions</h4>
+          <p>Adjust filters or check that SMS forwarder is running.</p>
+        </div>
+      ) : (
+        <div className="drops-table-wrap">
+          <table className="drops-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Txn ID</th>
+                <th>Amount</th>
+                <th>Provider</th>
+                <th>From</th>
+                <th>Claimed by</th>
+                <th>Status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.slice(0, 500).map(r => {
+                const sc = r.claimed_by ? staffCodes[r.claimed_by] : null
+                const t = new Date(r.received_at)
+                const timeStr = String(t.getHours()).padStart(2,'0') + ':' +
+                                String(t.getMinutes()).padStart(2,'0') + ':' +
+                                String(t.getSeconds()).padStart(2,'0')
+                const isUnclaimed = r.status === 'unclaimed' || r.status === 'supervisor_notified'
+
+                return (
+                  <tr key={r.id}>
+                    <td>{timeStr}</td>
+                    <td><span className="code-pill" style={{fontSize:11}}>{r.txn_id}</span></td>
+                    <td
+                      style={sc?.color ? {
+                        background: sc.color + '33',
+                        borderLeft: `4px solid ${sc.color}`,
+                        fontWeight: 700,
+                      } : { fontWeight: 700 }}
+                    >
+                      UGX {Number(r.amount).toLocaleString()}
+                    </td>
+                    <td>
+                      <span className={`pill ${r.provider === 'airtel' ? 'red' : 'amber'}`}>
+                        {r.provider}
+                      </span>
+                    </td>
+                    <td>{r.customer_name || r.customer_phone || '—'}</td>
+                    <td>
+                      {sc ? (
+                        <>
+                          <span style={{
+                            display: 'inline-block', width: 10, height: 10,
+                            borderRadius: '50%', background: sc.color,
+                            marginRight: 8, verticalAlign: 'middle',
+                          }} />
+                          {sc.name} <span style={{ color: '#8ba0b9', fontSize: 12 }}>({sc.code})</span>
+                        </>
+                      ) : '—'}
+                    </td>
+                    <td>
+                      <span className={`pill ${
+                        r.status === 'claimed' ? 'green' :
+                        r.status === 'unclaimed' ? 'amber' : 'red'
+                      }`}>{r.status}</span>
+                    </td>
+                    <td>
+                      {/* Claim button — attendant / ambassador / company phone, on unclaimed rows */}
+                      {canClaim && isUnclaimed && myCode && (
+                        <button
+                          className="btn-tiny success"
+                          title="Claim this transaction"
+                          onClick={() => setOpenClaim(r)}
+                        >
+                          <i className="fas fa-check" /> Claim
+                        </button>
+                      )}
+                      {/* Reassign button — supervisor / manager / admin only, on claimed rows */}
+                      {canReassign && r.status === 'claimed' && (
+                        <button
+                          className="btn-tiny"
+                          title="Reassign"
+                          onClick={() => setOpenReassign(r)}
+                        >
+                          <i class Name="fas fa-user-edit" />
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+          {rows.length > 500 && (
+            <div style={{ padding: 14, textAlign: 'center', color: '#6b85a0', fontSize: 13 }}>
+              Showing first 500 of {rows.length}. Use filters to narrow down or export to see all.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* CLAIM MODAL */}
+      {openClaim && (
+        <ClaimModal
+          transaction={openClaim}
+          myCode={myCode}
+          onClose={() => setOpenClaim(null)}
+          onSaved={async () => { setOpenClaim(null); await loadTransactions() }}
+        />
+      )}
+
+      {/* REASSIGN MODAL (supervisor only) */}
+      {openReassign && (
+        <ReassignModal
+          transaction={openReassign}
+          staffCodes={staffCodes}
+          onClose={() => setOpenReassign(null)}
+          onSaved={async () => { setOpenReassign(null); await loadTransactions() }}
+        />
+      )}
+    </div>
+  )
+}
+
+/* ============================================================
+   CLAIM MODAL (for attendants, ambassadors, company phones)
+   ============================================================ */
+function ClaimModal({ transaction, myCode, onClose, onSaved }) {
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+
+  async function claim() {
+    setBusy(true); setErr('')
+
+    const { data, error } = await supabase.rpc('claim_transaction', {
+      p_txn_id: transaction.txn_id,
+      p_code: myCode,
+    })
+
+    setBusy(false)
+    if (error) { setErr(error.message); return }
+    if (!data?.ok) { setErr(data?.error || 'Could not claim'); return }
+
+    onSaved()
+  }
+
+  return (
+    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal">
+        <h3>Claim transaction</h3>
+        <div className="modal-sub">
+          {transaction.txn_id} · UGX {Number(transaction.amount).toLocaleString()}
+        </div>
+
+        <div className="field-hint" style={{ marginBottom: 14 }}>
+          <i className="fas fa-id-badge" />
+          You are claiming as <strong>{myCode}</strong>
+        </div>
+
+        {err && <div className="auth-err">{err}</div>}
+
+        <div className="modal-actions">
+          <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
+          <button className="btn-primary-full" onClick={claim} disabled={busy}>
+            {busy ? 'Claiming…' : <><i className="fas fa-check" /> Confirm claim</>}
           </button>
         </div>
       </div>
+    </div>
+  )
+}
 
-      <div className="card-panel" style={{ gridTemplateColumns: '1fr', paddingBottom: 20 }}>
-        <div className="card">
-          <h3><i className="fas fa-list-ol" /> Setup steps</h3>
+/* ============================================================
+   REASSIGN MODAL (supervisor / manager / admin only)
+   ============================================================ */
+function ReassignModal({ transaction, staffCodes, onClose, onSaved }) {
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
 
-          <div className="step">
-            <div className="step-num">1</div>
-            <div className="step-body">
-              <strong>Install MacroDroid on the company phone</strong>
-              <p>Download from Google Play Store. Free version is enough. It's the easiest SMS forwarder for Uganda.</p>
-            </div>
-          </div>
+  async function save() {
+    if (!code.trim()) { setErr('Enter a 2-digit code'); return }
+    setBusy(true); setErr('')
 
-          <div className="step">
-            <div className="step-num">2</div>
-            <div className="step-body">
-              <strong>Open MacroDroid → Add Macro</strong>
-              <p>Choose trigger → SMS Received</p>
-            </div>
-          </div>
+    const { data, error } = await supabase.rpc('claim_transaction', {
+      p_txn_id: transaction.txn_id,
+      p_code: code.trim(),
+    })
 
-          <div className="step">
-            <div className="step-num">3</div>
-            <div className="step-body">
-              <strong>Configure the SMS trigger</strong>
-              <p>Senders: <code>AirtelMoney</code> and <code>MTNMoMo</code></p>
-              <p>You can also leave it as <em>Any sender</em> — the app will still only forward ones matching the patterns.</p>
-            </div>
-          </div>
+    setBusy(false)
+    if (error) { setErr(error.message); return }
+    if (!data?.ok) { setErr(data?.error || 'Could not reassign'); return }
 
-          <div className="step">
-            <div className="step-num">4</div>
-            <div className="step-body">
-              <strong>Add an HTTP Request action</strong>
-              <p>Set method to <code>POST</code></p>
-              <p>URL:</p>
-              <div className="mono-box">{ingestUrl}</div>
-              <p style={{ marginTop: 8 }}>Content-Type header: <code>application/json</code></p>
-            </div>
-          </div>
+    onSaved()
+  }
 
-          <div className="step">
-            <div className="step-num">5</div>
-            <div className="step-body">
-              <strong>Body (JSON)</strong>
-              <p>Paste this JSON body. MacroDroid variables will fill in the real values:</p>
-              <div className="mono-box">{`{
-  "sender": "[sms_sender]",
-  "body": "[sms_message]",
-  "station_code": "LEGACY",
-  "secret": "PASTE_YOUR_INGEST_SECRET_HERE"
-}`}</div>
-              <p style={{ marginTop: 8, fontSize: 13, color: '#6b85a0' }}>
-                Note: <code>[sms_sender]</code> and <code>[sms_message]</code> are MacroDroid magic variables.
-                Replace <code>PASTE_YOUR_INGEST_SECRET_HERE</code> with the same secret you set in Supabase
-                (Edge Functions → Secrets → INGEST_SECRET).
-              </p>
-            </div>
-          </div>
-
-          <div className="step">
-            <div className="step-num">6</div>
-            <div className="step-body">
-              <strong>Test</strong>
-              <p>Send any payment to the company Airtel or MTN number. In 1–2 seconds, your TEXOL portal phones should pop up the transaction.</p>
-            </div>
-          </div>
-
-          <div className="step">
-            <div className="step-num">7</div>
-            <div className="step-body">
-              <strong>Whitelist the phone</strong>
-              <p>On each phone that should show popups, open the portal → Admin → Company Phones → Add phone.</p>
-            </div>
-          </div>
+  return (
+    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal">
+        <h3>Reassign transaction</h3>
+        <div className="modal-sub">
+          {transaction.txn_id} · UGX {Number(transaction.amount).toLocaleString()}
         </div>
-      </div>
 
-      <div className="card-panel" style={{ gridTemplateColumns: '1fr', paddingBottom: 20 }}>
-        <div className="card">
-          <h3><i className="fas fa-shield-alt" /> Security note</h3>
-          <p style={{ fontSize: 14, lineHeight: 1.6, color: '#4b637c' }}>
-            The <code>secret</code> in the JSON body is a shared password. If someone knows your URL <em>and</em> the secret,
-            they could inject fake transactions. Keep them private. To rotate: change the secret in Supabase, then update it
-            in MacroDroid on each company phone.
-          </p>
+        <div className="field-hint" style={{ marginBottom: 12 }}>
+          <i className="fas fa-info-circle" />
+          Currently claimed by{' '}
+          <strong>
+            {staffCodes[transaction.claimed_by]?.name || 'unknown'}
+          </strong>
+        </div>
+
+        <label>New attendant code</label>
+        <input
+          type="text"
+          inputMode="numeric"
+          maxLength={2}
+          value={code}
+          onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 2))}
+          placeholder="01"
+          autoFocus
+        />
+
+        {err && <div className="auth-err">{err}</div>}
+
+        <div className="modal-actions">
+          <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
+          <button
+            className="btn-primary-full"
+            onClick={save}
+            disabled={busy || code.length !== 2}
+          >
+            {busy ? 'Saving…' : 'Reassign'}
+          </button>
         </div>
       </div>
     </div>
