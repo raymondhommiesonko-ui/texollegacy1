@@ -20,6 +20,7 @@ import Transactions from './screens/Transactions'
 import Settings from './screens/Settings'
 import TransactionPopup from './TransactionPopup'
 import { useRealtimeTransactions } from './useRealtimeTransactions'
+import AuditLogs from './screens/AuditLogs'
 import './App.css'
 
 export default function App() {
@@ -352,6 +353,7 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
           {screen === 'customers' && !isCompanyPhone && <Customers profile={profile} />}
           {screen === 'reports' && !isCompanyPhone && <Reports profile={profile} />}
           {screen === 'settings' && !isCompanyPhone && <Settings profile={profile} />}
+          {screen === 'audit' && !isCompanyPhone && <AuditLogs profile={profile} />}
 
           {screen !== 'home' && screen !== 'attendance' && screen !== 'drops' &&
            screen !== 'timetable' && screen !== 'balance' && screen !== 'staff' &&

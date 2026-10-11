@@ -21,7 +21,7 @@ export const MENU = [
     items: [
       { id: 'customers',   label: 'Customers',              icon: 'fa-users',            minAccess: 60 },
       { id: 'fuel-cards',  label: 'Fuel Cards',             icon: 'fa-credit-card',      minAccess: 40 },
-      { id: 'shortages',   label: 'Shortages & Credits',    icon: 'fa-balance-scale',    minAccess: 60 },
+      { id: 'shortages',   label: 'Shortages & Credits',    icon: 'fa-balance-scale',    minAccess: 30 },
     ]
   },
   {
