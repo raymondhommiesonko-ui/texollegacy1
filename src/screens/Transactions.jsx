@@ -11,6 +11,8 @@ export default function Transactions({ profile }) {
 
   const canViewAll = isManager || isSupervisor || powers.view_transactions
   const canExport = isManager || isSupervisor || powers.export_transactions
+  // Only staff roles (not company_phone) can reassign
+  const canReassign = isManager || isSupervisor
 
   const [rows, setRows] = useState([])
   const [staffCodes, setStaffCodes] = useState({})
@@ -18,6 +20,7 @@ export default function Transactions({ profile }) {
   const [onShift, setOnShift] = useState(true)
   const [errorMsg, setErrorMsg] = useState('')
   const [openReassign, setOpenReassign] = useState(null)
+  const [openClaim, setOpenClaim] = useState(null)  // { transaction }
 
   const [filter, setFilter] = useState({
     from: new Date().toISOString().slice(0,10),
@@ -64,8 +67,6 @@ export default function Transactions({ profile }) {
     setErrorMsg('')
 
     try {
-      // Shift check — applies to attendants, ambassadors, company phones
-      // Supervisors/managers/admins bypass this
       if (!canViewAll) {
         const { data: on } = await supabase.rpc('am_i_on_shift')
         if (!on) {
@@ -89,9 +90,11 @@ export default function Transactions({ profile }) {
         .order('received_at', { ascending: false })
         .limit(2000)
 
-      // Non-supervisors: only see their own claims (company phones included)
+      // Non-supervisors see:
+      //   - their own claims
+      //   - PLUS unclaimed transactions at their station (so they can claim from the list)
       if (!canViewAll) {
-        q = q.eq('claimed_by', user.id)
+        q = q.or(`claimed_by.eq.${user.id},status.eq.unclaimed,status.eq.supervisor_notified`)
       }
 
       const { data, error } = await q
@@ -373,8 +376,12 @@ export default function Transactions({ profile }) {
                 const timeStr = String(t.getHours()).padStart(2,'0') + ':' +
                                 String(t.getMinutes()).padStart(2,'0') + ':' +
                                 String(t.getSeconds()).padStart(2,'0')
+                const isUnclaimed = r.status === 'unclaimed' || r.status === 'supervisor_notified'
+                const canClaimThis = isUnclaimed && !isCompanyPhone
+                const canReassignThis = canReassign && r.status === 'claimed'
+
                 return (
-                  <tr key={r.id}>
+                  <tr key={r.id} className={canClaimThis ? 'row-clickable' : ''}>
                     <td>{timeStr}</td>
                     <td><span className="code-pill" style={{fontSize:11}}>{r.txn_id}</span></td>
                     <td
@@ -411,7 +418,16 @@ export default function Transactions({ profile }) {
                       }`}>{r.status}</span>
                     </td>
                     <td>
-                      {canViewAll && r.status === 'claimed' && (
+                      {canClaimThis && (
+                        <button
+                          className="btn-tiny success"
+                          title="Claim this transaction"
+                          onClick={() => setOpenClaim({ transaction: r })}
+                        >
+                          <i className="fas fa-hand-paper" /> Claim
+                        </button>
+                      )}
+                      {canReassignThis && (
                         <button
                           className="btn-tiny"
                           title="Reassign"
@@ -434,6 +450,14 @@ export default function Transactions({ profile }) {
         </div>
       )}
 
+      {openClaim && (
+        <ClaimFromListModal
+          transaction={openClaim.transaction}
+          onClose={() => setOpenClaim(null)}
+          onSaved={async () => { setOpenClaim(null); await loadTransactions() }}
+        />
+      )}
+
       {openReassign && (
         <ReassignModal
           transaction={openReassign}
@@ -442,6 +466,100 @@ export default function Transactions({ profile }) {
           onSaved={async () => { setOpenReassign(null); await loadTransactions() }}
         />
       )}
+    </div>
+  )
+}
+
+/* ============================================================
+   CLAIM FROM LIST MODAL
+   ============================================================ */
+function ClaimFromListModal({ transaction, onClose, onSaved }) {
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+
+  function press(d) {
+    if (busy) return
+    setErr('')
+    if (code.length >= 2) return
+    const next = code + d
+    setCode(next)
+    if (next.length === 2) setTimeout(() => submit(next), 150)
+  }
+
+  async function submit(finalCode) {
+    const c = finalCode || code
+    if (c.length !== 2) { setErr('Enter 2-digit code'); return }
+    setBusy(true); setErr('')
+
+    const { data, error } = await supabase.rpc('claim_transaction', {
+      p_txn_id: transaction.txn_id,
+      p_code: c,
+    })
+
+    setBusy(false)
+    if (error) { setErr(error.message); return }
+    if (!data?.ok) { setErr(data?.error || 'Could not claim'); setCode(''); return }
+
+    onSaved()
+  }
+
+  return (
+    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal">
+        <h3>Claim transaction</h3>
+        <div className="modal-sub">
+          {transaction.txn_id} · UGX {Number(transaction.amount).toLocaleString()}
+        </div>
+
+        <div className="field-hint" style={{ marginBottom: 12 }}>
+          <i className="fas fa-info-circle" />
+          Type your 2-digit attendant code
+        </div>
+
+        <div style={{ textAlign: 'center', marginBottom: 14 }}>
+          <input
+            type="text"
+            inputMode="numeric"
+            readOnly
+            value={code}
+            placeholder="••"
+            style={{
+              width: 140,
+              padding: 16,
+              fontSize: 28,
+              fontWeight: 800,
+              textAlign: 'center',
+              letterSpacing: 14,
+              fontFamily: 'ui-monospace, monospace',
+              background: '#f8fafc',
+              border: '2px solid #e2e8f0',
+              borderRadius: 12,
+              color: '#0b1a2e',
+              outline: 'none',
+            }}
+          />
+        </div>
+
+        <div className="txn-numpad">
+          {[1,2,3,4,5,6,7,8,9].map(n => (
+            <button key={n} className="numpad-key" onClick={() => press(String(n))}>{n}</button>
+          ))}
+          <button className="numpad-key back" onClick={() => { setCode(c => c.slice(0, -1)); setErr('') }}>
+            <i className="fas fa-backspace" />
+          </button>
+          <button className="numpad-key" onClick={() => press('0')}>0</button>
+          <button className="numpad-key check" onClick={() => submit()}>
+            <i className="fas fa-check" />
+          </button>
+        </div>
+
+        {err && <div className="auth-err" style={{ marginTop: 12 }}>{err}</div>}
+
+        <div className="modal-actions">
+          <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
     </div>
   )
 }
