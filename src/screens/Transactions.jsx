@@ -7,6 +7,7 @@ export default function Transactions({ profile }) {
   const powers = profile.powers || {}
   const isManager = ['admin','manager'].includes(user.role)
   const isSupervisor = user.role === 'supervisor'
+  const isCompanyPhone = user.role === 'company_phone'
 
   const canViewAll = isManager || isSupervisor || powers.view_transactions
   const canExport = isManager || isSupervisor || powers.export_transactions
@@ -16,6 +17,7 @@ export default function Transactions({ profile }) {
   const [loading, setLoading] = useState(true)
   const [onShift, setOnShift] = useState(true)
   const [errorMsg, setErrorMsg] = useState('')
+  const [openReassign, setOpenReassign] = useState(null)
 
   const [filter, setFilter] = useState({
     from: new Date().toISOString().slice(0,10),
@@ -62,7 +64,8 @@ export default function Transactions({ profile }) {
     setErrorMsg('')
 
     try {
-      // Check shift for staff without elevated access
+      // Shift check — applies to attendants, ambassadors, company phones
+      // Supervisors/managers/admins bypass this
       if (!canViewAll) {
         const { data: on } = await supabase.rpc('am_i_on_shift')
         if (!on) {
@@ -86,6 +89,7 @@ export default function Transactions({ profile }) {
         .order('received_at', { ascending: false })
         .limit(2000)
 
+      // Non-supervisors: only see their own claims (company phones included)
       if (!canViewAll) {
         q = q.eq('claimed_by', user.id)
       }
@@ -359,6 +363,7 @@ export default function Transactions({ profile }) {
                 <th>From</th>
                 <th>Claimed by</th>
                 <th>Status</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
@@ -405,6 +410,17 @@ export default function Transactions({ profile }) {
                         r.status === 'unclaimed' ? 'amber' : 'red'
                       }`}>{r.status}</span>
                     </td>
+                    <td>
+                      {canViewAll && r.status === 'claimed' && (
+                        <button
+                          className="btn-tiny"
+                          title="Reassign"
+                          onClick={() => setOpenReassign(r)}
+                        >
+                          <i className="fas fa-user-edit" />
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 )
               })}
@@ -417,6 +433,83 @@ export default function Transactions({ profile }) {
           )}
         </div>
       )}
+
+      {openReassign && (
+        <ReassignModal
+          transaction={openReassign}
+          staffCodes={staffCodes}
+          onClose={() => setOpenReassign(null)}
+          onSaved={async () => { setOpenReassign(null); await loadTransactions() }}
+        />
+      )}
+    </div>
+  )
+}
+
+/* ============================================================
+   REASSIGN MODAL
+   ============================================================ */
+function ReassignModal({ transaction, staffCodes, onClose, onSaved }) {
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+
+  async function save() {
+    if (!code.trim()) { setErr('Enter a 2-digit code'); return }
+    setBusy(true); setErr('')
+
+    const { data, error } = await supabase.rpc('claim_transaction', {
+      p_txn_id: transaction.txn_id,
+      p_code: code.trim(),
+    })
+
+    setBusy(false)
+    if (error) { setErr(error.message); return }
+    if (!data?.ok) { setErr(data?.error || 'Could not reassign'); return }
+
+    onSaved()
+  }
+
+  return (
+    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal">
+        <h3>Reassign transaction</h3>
+        <div className="modal-sub">
+          {transaction.txn_id} · UGX {Number(transaction.amount).toLocaleString()}
+        </div>
+
+        <div className="field-hint" style={{ marginBottom: 12 }}>
+          <i className="fas fa-info-circle" />
+          Currently claimed by{' '}
+          <strong>
+            {staffCodes[transaction.claimed_by]?.name || 'unknown'}
+          </strong>
+        </div>
+
+        <label>New attendant code</label>
+        <input
+          type="text"
+          inputMode="numeric"
+          maxLength={2}
+          value={code}
+          onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 2))}
+          placeholder="01"
+          autoFocus
+        />
+
+        {err && <div className="auth-err">{err}</div>}
+
+        <div className="modal-actions">
+          <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
+          <button
+            className="btn-primary-full"
+            onClick={save}
+            disabled={busy || code.length !== 2}
+          >
+            {busy ? 'Saving…' : 'Reassign'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
