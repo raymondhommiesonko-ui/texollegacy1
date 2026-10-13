@@ -1,36 +1,34 @@
 import { useEffect, useMemo, useState } from 'react'
 import ExcelJS from 'exceljs'
 import { supabase } from '../supabase'
+import { todayEAT, timeEAT, eatToISO } from '../lib/time'
 
 export default function Transactions({ profile }) {
   const user = profile.user
   const powers = profile.powers || {}
-  const isManager = ['admin','manager'].includes(user.role)
+  const isManager = ['admin', 'manager'].includes(user.role)
   const isSupervisor = user.role === 'supervisor'
   const isCompanyPhone = user.role === 'company_phone'
-  const isStaff = ['attendant','ambassador','company_phone'].includes(user.role)
+  const isStaff = ['attendant', 'ambassador', 'company_phone'].includes(user.role)
 
-  // Who can see ALL transactions?
   const canViewAll = isManager || isSupervisor || powers.view_transactions
-  // Who can export?
   const canExport = isManager || isSupervisor || powers.export_transactions
-  // Who can reassign a claimed transaction?
   const canReassign = isManager || isSupervisor
-  // Who can claim unclaimed transactions from the list?
   const canClaim = isStaff || isManager || isSupervisor
 
   const [rows, setRows] = useState([])
   const [staffCodes, setStaffCodes] = useState({})
   const [myCode, setMyCode] = useState('')
   const [loading, setLoading] = useState(true)
+  const [firstLoad, setFirstLoad] = useState(true)
   const [onShift, setOnShift] = useState(true)
   const [errorMsg, setErrorMsg] = useState('')
   const [openReassign, setOpenReassign] = useState(null)
   const [openClaim, setOpenClaim] = useState(null)
 
   const [filter, setFilter] = useState({
-    from: new Date().toISOString().slice(0,10),
-    to: new Date().toISOString().slice(0,10),
+    from: todayEAT(),
+    to: todayEAT(),
     timeFrom: '',
     timeTo: '',
     provider: 'all',
@@ -38,6 +36,13 @@ export default function Transactions({ profile }) {
     status: 'all',
     search: '',
   })
+
+  // Debounced filter — prevents a query on every keystroke
+  const [debouncedFilter, setDebouncedFilter] = useState(filter)
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedFilter(filter), 400)
+    return () => clearTimeout(t)
+  }, [filter])
 
   async function loadStaffCodes() {
     try {
@@ -63,7 +68,6 @@ export default function Transactions({ profile }) {
         }
       })
       setStaffCodes(map)
-      // My own code (for company phone / attendant)
       setMyCode(map[user.id]?.code || '')
     } catch (e) {
       console.error('loadStaffCodes:', e)
@@ -75,8 +79,6 @@ export default function Transactions({ profile }) {
     setErrorMsg('')
 
     try {
-      // Shift check — applies to attendants, ambassadors, company phones
-      // Supervisors/managers/admins bypass this
       if (!canViewAll) {
         const { data: on } = await supabase.rpc('am_i_on_shift')
         if (!on) {
@@ -88,8 +90,8 @@ export default function Transactions({ profile }) {
       }
       setOnShift(true)
 
-      const fromISO = filter.from + 'T00:00:00'
-      const toISO = filter.to + 'T23:59:59'
+      const fromISO = eatToISO(debouncedFilter.from, '00:00')
+      const toISO = eatToISO(debouncedFilter.to, '23:59')
 
       let q = supabase
         .from('transactions')
@@ -100,10 +102,7 @@ export default function Transactions({ profile }) {
         .order('received_at', { ascending: false })
         .limit(2000)
 
-      // Non-supervisors only see their own claims
-      // Note: unclaimed transactions are visible to everyone at the station
       if (!canViewAll) {
-        // show unclaimed OR claimed by me
         q = q.or(`claimed_by.eq.${user.id},claimed_by.is.null`)
       }
 
@@ -111,29 +110,52 @@ export default function Transactions({ profile }) {
       if (error) throw error
 
       let result = data || []
-      if (filter.timeFrom) result = result.filter(t => String(t.received_at).slice(11,16) >= filter.timeFrom)
-      if (filter.timeTo) result = result.filter(t => String(t.received_at).slice(11,16) <= filter.timeTo)
-      if (filter.provider !== 'all') result = result.filter(t => t.provider === filter.provider)
-      if (filter.attendant !== 'all') result = result.filter(t => t.claimed_by === filter.attendant)
-      if (filter.status !== 'all') result = result.filter(t => t.status === filter.status)
-      if (filter.search) {
-        const s = filter.search.toLowerCase()
+
+      // Helper to get HH:mm as integer minutes since midnight (Uganda time)
+      const minutesEAT = iso => {
+        const s = new Date(iso).toLocaleTimeString('en-GB', {
+          timeZone: 'Africa/Kampala', hour12: false,
+          hour: '2-digit', minute: '2-digit',
+        })
+        const [h, m] = s.split(':').map(Number)
+        return h * 60 + m
+      }
+
+      if (debouncedFilter.timeFrom) {
+        const [fh, fm] = debouncedFilter.timeFrom.split(':').map(Number)
+        const fromMin = fh * 60 + fm
+        result = result.filter(t => minutesEAT(t.received_at) >= fromMin)
+      }
+      if (debouncedFilter.timeTo) {
+        const [th, tm] = debouncedFilter.timeTo.split(':').map(Number)
+        const toMin = th * 60 + tm
+        result = result.filter(t => minutesEAT(t.received_at) <= toMin)
+      }
+
+      if (debouncedFilter.provider !== 'all') result = result.filter(t => t.provider === debouncedFilter.provider)
+      if (debouncedFilter.attendant !== 'all') result = result.filter(t => t.claimed_by === debouncedFilter.attendant)
+      if (debouncedFilter.status !== 'all') result = result.filter(t => t.status === debouncedFilter.status)
+
+      if (debouncedFilter.search) {
+        const s = debouncedFilter.search.toLowerCase()
         result = result.filter(t =>
           String(t.txn_id).toLowerCase().includes(s) ||
           String(t.amount).includes(s) ||
           (t.customer_name || '').toLowerCase().includes(s)
         )
       }
+
       setRows(result)
     } catch (e) {
       console.error('Load transactions error:', e)
       setErrorMsg(e.message || 'Could not load transactions')
     }
     setLoading(false)
+    setFirstLoad(false)
   }
 
   useEffect(() => { loadStaffCodes() }, [user.station_id])
-  useEffect(() => { loadTransactions() }, [user.station_id, filter])
+  useEffect(() => { loadTransactions() }, [user.station_id, debouncedFilter])
 
   const stats = useMemo(() => {
     const total = rows.reduce((s, r) => s + Number(r.amount || 0), 0)
@@ -160,7 +182,7 @@ export default function Transactions({ profile }) {
       map[r.claimed_by].total += Number(r.amount || 0)
       map[r.claimed_by].count++
     })
-    return Object.values(map).sort((a,b) => b.total - a.total)
+    return Object.values(map).sort((a, b) => b.total - a.total)
   }, [rows, staffCodes])
 
   const best = byAttendant[0] || null
@@ -182,12 +204,12 @@ export default function Transactions({ profile }) {
     )
 
     sheet.columns = [
-      { key: 'time',   width: 12 },
-      { key: 'txn',    width: 20 },
+      { key: 'time', width: 12 },
+      { key: 'txn', width: 20 },
       { key: 'amount', width: 14 },
-      { key: 'sp',     width: 3 },
-      { key: 'name',   width: 22 },
-      { key: 'total',  width: 16 },
+      { key: 'sp', width: 3 },
+      { key: 'name', width: 22 },
+      { key: 'total', width: 16 },
     ]
 
     const header = sheet.getRow(1)
@@ -205,20 +227,15 @@ export default function Transactions({ profile }) {
     header.height = 22
 
     list.slice().reverse().forEach((r, i) => {
-      const rowNum = i + 2
-      const row = sheet.getRow(rowNum)
-      const time = new Date(r.received_at)
-      const timeStr = String(time.getHours()).padStart(2,'0') + ':' +
-                      String(time.getMinutes()).padStart(2,'0') + ':' +
-                      String(time.getSeconds()).padStart(2,'0')
-      row.getCell(1).value = timeStr
+      const row = sheet.getRow(i + 2)
+      row.getCell(1).value = timeEAT(r.received_at)
       row.getCell(2).value = String(r.txn_id)
       row.getCell(2).numFmt = '@'
       row.getCell(3).value = Number(r.amount || 0)
       row.getCell(3).numFmt = '#,##0'
 
       const sc = r.claimed_by ? staffCodes[r.claimed_by] : null
-      const colorHex = sc?.color ? sc.color.replace('#','').toUpperCase() : null
+      const colorHex = sc?.color ? sc.color.replace('#', '').toUpperCase() : null
       if (colorHex) {
         row.getCell(3).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + colorHex } }
       }
@@ -226,11 +243,10 @@ export default function Transactions({ profile }) {
     })
 
     byAttendant.forEach((a, idx) => {
-      const rowNum = 3 + idx
-      const row = sheet.getRow(rowNum)
+      const row = sheet.getRow(3 + idx)
       row.getCell(5).value = a.name
       row.getCell(5).font = { bold: true, color: { argb: 'FFFFFFFF' } }
-      const colorHex = a.color.replace('#','').toUpperCase()
+      const colorHex = a.color.replace('#', '').toUpperCase()
       row.getCell(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + colorHex } }
       row.getCell(6).value = a.total
       row.getCell(6).numFmt = '#,##0'
@@ -241,7 +257,7 @@ export default function Transactions({ profile }) {
     const totalRow = list.length + 2
     sheet.getRow(totalRow).getCell(2).value = 'TOTAL'
     sheet.getRow(totalRow).getCell(2).font = { bold: true }
-    sheet.getRow(totalRow).getCell(3).value = list.reduce((s,r) => s + Number(r.amount || 0), 0)
+    sheet.getRow(totalRow).getCell(3).value = list.reduce((s, r) => s + Number(r.amount || 0), 0)
     sheet.getRow(totalRow).getCell(3).numFmt = '#,##0'
     sheet.getRow(totalRow).getCell(3).font = { bold: true }
     sheet.getRow(totalRow).getCell(3).border = { top: { style: 'thin' } }
@@ -258,10 +274,10 @@ export default function Transactions({ profile }) {
 
   const attendants = Object.entries(staffCodes)
     .map(([id, v]) => ({ id, name: v.name, code: v.code, color: v.color }))
-    .sort((a,b) => a.name.localeCompare(b.name))
+    .sort((a, b) => a.name.localeCompare(b.name))
 
   if (!user) return <div className="drops-empty">Loading…</div>
-  if (loading) return <div className="drops-empty">Loading…</div>
+  if (firstLoad && loading) return <div className="drops-empty">Loading…</div>
 
   if (!onShift) {
     return (
@@ -279,7 +295,14 @@ export default function Transactions({ profile }) {
     <div className="txns-screen">
       <div className="txns-head">
         <div>
-          <h3>Transactions</h3>
+          <h3>
+            Transactions
+            {loading && !firstLoad && (
+              <span style={{ marginLeft: 12, fontSize: 12, color: '#8ba0b9', fontWeight: 400 }}>
+                <i className="fas fa-sync fa-spin" /> refreshing…
+              </span>
+            )}
+          </h3>
           <div className="sub">
             {stats.count} txn · UGX {stats.total.toLocaleString()} · {stats.claimed} claimed · {stats.unclaimed} unclaimed
           </div>
@@ -335,26 +358,24 @@ export default function Transactions({ profile }) {
           onChange={e => setFilter(f => ({ ...f, search: e.target.value }))}
         />
         <button className="btn-ghost btn-sm" onClick={() => setFilter({
-          from: new Date().toISOString().slice(0,10),
-          to: new Date().toISOString().slice(0,10),
-          timeFrom: '', timeTo: '',
-          provider: 'all', attendant: 'all', status: 'all', search: '',
+          from: todayEAT(),
+          to: todayEAT(),
+          timeFrom: '',
+          timeTo: '',
+          provider: 'all',
+          attendant: 'all',
+          status: 'all',
+          search: '',
         })}>Today</button>
       </div>
 
-      {errorMsg && (
-        <div className="auth-err" style={{ margin: '0 32px 20px' }}>{errorMsg}</div>
-      )}
+      {errorMsg && <div className="auth-err" style={{ margin: '0 32px 20px' }}>{errorMsg}</div>}
 
       {best && (
         <div className="best-card">
           <div className="best-label">🏆 Best attendant</div>
-          <div className="best-name" style={{ color: best.color }}>
-            {best.name}
-          </div>
-          <div className="best-meta">
-            {best.count} transactions · UGX {best.total.toLocaleString()}
-          </div>
+          <div className="best-name" style={{ color: best.color }}>{best.name}</div>
+          <div className="best-meta">{best.count} transactions · UGX {best.total.toLocaleString()}</div>
         </div>
       )}
 
@@ -382,17 +403,14 @@ export default function Transactions({ profile }) {
             <tbody>
               {rows.slice(0, 500).map(r => {
                 const sc = r.claimed_by ? staffCodes[r.claimed_by] : null
-                const t = new Date(r.received_at)
-                const timeStr = String(t.getHours()).padStart(2,'0') + ':' +
-                                String(t.getMinutes()).padStart(2,'0') + ':' +
-                                String(t.getSeconds()).padStart(2,'0')
+                const timeStr = timeEAT(r.received_at)
                 const isUnclaimed = !r.claimed_by || r.status === 'unclaimed' || r.status === 'supervisor_notified'
                 const isClaimedByMe = r.claimed_by === user.id
 
                 return (
                   <tr key={r.id}>
                     <td>{timeStr}</td>
-                    <td><span className="code-pill" style={{fontSize:11}}>{r.txn_id}</span></td>
+                    <td><span className="code-pill" style={{ fontSize: 11 }}>{r.txn_id}</span></td>
                     <td
                       style={sc?.color ? {
                         background: sc.color + '33',
@@ -403,9 +421,7 @@ export default function Transactions({ profile }) {
                       UGX {Number(r.amount).toLocaleString()}
                     </td>
                     <td>
-                      <span className={`pill ${r.provider === 'airtel' ? 'red' : 'amber'}`}>
-                        {r.provider}
-                      </span>
+                      <span className={`pill ${r.provider === 'airtel' ? 'red' : 'amber'}`}>{r.provider}</span>
                     </td>
                     <td>{r.customer_name || r.customer_phone || '—'}</td>
                     <td>
@@ -427,24 +443,14 @@ export default function Transactions({ profile }) {
                       }`}>{r.status}</span>
                     </td>
                     <td>
-                      {/* Claim button — any staff can claim an unclaimed transaction */}
                       {canClaim && isUnclaimed && !isClaimedByMe && (
-                        <button
-                          className="btn-tiny success"
-                          title="Claim this transaction"
-                          onClick={() => setOpenClaim(r)}
-                        >
+                        <button className="btn-tiny success" onClick={() => setOpenClaim(r)}>
                           <i className="fas fa-hand-paper" /> Claim
                         </button>
                       )}
-                      {/* Reassign button — only supervisor/manager/admin */}
                       {canReassign && r.status === 'claimed' && (
-                        <button
-                          className="btn-tiny"
-                          title="Reassign"
-                          onClick={() => setOpenReassign(r)}
-                        >
-                          <i classナs="fas fa-user-edit" />
+                        <button className="btn-tiny" onClick={() => setOpenReassign(r)}>
+                          <i className="fas fa-user-edit" />
                         </button>
                       )}
                     </td>
@@ -482,9 +488,6 @@ export default function Transactions({ profile }) {
   )
 }
 
-/* ============================================================
-   REASSIGN MODAL (supervisor+ only)
-   ============================================================ */
 function ReassignModal({ transaction, staffCodes, onClose, onSaved }) {
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(false)
@@ -493,16 +496,13 @@ function ReassignModal({ transaction, staffCodes, onClose, onSaved }) {
   async function save() {
     if (!code.trim()) { setErr('Enter a 2-digit code'); return }
     setBusy(true); setErr('')
-
     const { data, error } = await supabase.rpc('claim_transaction', {
       p_txn_id: transaction.txn_id,
       p_code: code.trim(),
     })
-
     setBusy(false)
     if (error) { setErr(error.message); return }
     if (!data?.ok) { setErr(data?.error || 'Could not reassign'); return }
-
     onSaved()
   }
 
@@ -513,33 +513,21 @@ function ReassignModal({ transaction, staffCodes, onClose, onSaved }) {
         <div className="modal-sub">
           {transaction.txn_id} · UGX {Number(transaction.amount).toLocaleString()}
         </div>
-
         <div className="field-hint" style={{ marginBottom: 12 }}>
-          <i className="fas fa-info-circle" />
-          Currently claimed by{' '}
+          <i className="fas fa-info-circle" /> Currently claimed by{' '}
           <strong>{staffCodes[transaction.claimed_by]?.name || 'unknown'}</strong>
         </div>
-
         <label>New attendant code</label>
         <input
-          type="text"
-          inputMode="numeric"
-          maxLength={2}
+          type="text" inputMode="numeric" maxLength={2}
           value={code}
           onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 2))}
-          placeholder="01"
-          autoFocus
+          placeholder="01" autoFocus
         />
-
         {err && <div className="auth-err">{err}</div>}
-
         <div className="modal-actions">
           <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
-          <button
-            className="btn-primary-full"
-            onClick={save}
-            disabled={busy || code.length !== 2}
-          >
+          <button className="btn-primary-full" onClick={save} disabled={busy || code.length !== 2}>
             {busy ? 'Saving…' : 'Reassign'}
           </button>
         </div>
@@ -548,9 +536,6 @@ function ReassignModal({ transaction, staffCodes, onClose, onSaved }) {
   )
 }
 
-/* ============================================================
-   CLAIM MODAL (for staff claiming an unclaimed transaction from the list)
-   ============================================================ */
 function ClaimModal({ transaction, myCode, onClose, onSaved }) {
   const [code, setCode] = useState(myCode || '')
   const [busy, setBusy] = useState(false)
@@ -559,16 +544,13 @@ function ClaimModal({ transaction, myCode, onClose, onSaved }) {
   async function save() {
     if (!code.trim()) { setErr('Enter your 2-digit code'); return }
     setBusy(true); setErr('')
-
     const { data, error } = await supabase.rpc('claim_transaction', {
       p_txn_id: transaction.txn_id,
       p_code: code.trim(),
     })
-
     setBusy(false)
     if (error) { setErr(error.message); return }
     if (!data?.ok) { setErr(data?.error || 'Could not claim'); return }
-
     onSaved()
   }
 
@@ -579,32 +561,20 @@ function ClaimModal({ transaction, myCode, onClose, onSaved }) {
         <div className="modal-sub">
           {transaction.txn_id} · UGX {Number(transaction.amount).toLocaleString()}
         </div>
-
         <div className="field-hint" style={{ marginBottom: 12 }}>
-          <i className="fas fa-info-circle" />
-          Type your 2-digit code to claim this transaction.
+          <i className="fas fa-info-circle" /> Type your 2-digit code to claim this transaction.
         </div>
-
         <label>Your code</label>
         <input
-          type="text"
-          inputMode="numeric"
-          maxLength={2}
+          type="text" inputMode="numeric" maxLength={2}
           value={code}
           onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 2))}
-          placeholder="01"
-          autoFocus
+          placeholder="01" autoFocus
         />
-
         {err && <div className="auth-err">{err}</div>}
-
         <div className="modal-actions">
           <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
-          <button
-            className="btn-primary-full"
-            onClick={save}
-            disabled={busy || code.length !== 2}
-          >
+          <button className="btn-primary-full" onClick={save} disabled={busy || code.length !== 2}>
             {busy ? 'Claiming…' : 'Claim'}
           </button>
         </div>

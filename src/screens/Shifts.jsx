@@ -1,15 +1,19 @@
 import { useEffect, useMemo, useState } from 'react'
 import { supabase } from '../supabase'
+import { todayEAT, eatToISO } from '../lib/time'
 
 export default function Shifts({ profile, onOpenShift }) {
   const user = profile.user
   const powers = profile.powers || {}
-  const isAdminManager = ['admin','manager'].includes(user.role)
+  const isAdmin = user.role === 'admin'
+  const isManager = user.role === 'manager'
   const isSupervisor = user.role === 'supervisor'
-  const canOpenShift = isAdminManager || (isSupervisor && powers.open_shift)
-  const canEdit = isAdminManager || isSupervisor
-  const canViewAll = isAdminManager || isSupervisor
-  const canManageShift = canEdit   // edit existing
+
+  // Manager + Admin always can. Supervisor only when explicitly granted.
+  const canOpenShift = isAdmin || isManager || (isSupervisor && powers.open_shift === true)
+  const canCloseShift = isAdmin || isManager || (isSupervisor && powers.close_shift === true)
+  const canEdit = isAdmin || isManager || isSupervisor
+  const canViewAll = isAdmin || isManager || isSupervisor
 
   const [shifts, setShifts] = useState([])
   const [usersById, setUsersById] = useState({})
@@ -128,10 +132,12 @@ export default function Shifts({ profile, onOpenShift }) {
               <button className="btn-ghost" onClick={() => setOpenRecurring(true)}>
                 <i className="fas fa-redo" /> Recurring
               </button>
-              <button className="btn-primary" onClick={() => setOpenNew(true)}>
-                <i className="fas fa-plus" /> New shift
-              </button>
             </>
+          )}
+          {canOpenShift && (
+            <button className="btn-primary" onClick={() => setOpenNew(true)}>
+              <i className="fas fa-plus" /> New shift
+            </button>
           )}
         </div>
       </div>
@@ -170,7 +176,8 @@ export default function Shifts({ profile, onOpenShift }) {
               shift={s}
               roster={roster[s.id] || []}
               usersById={usersById}
-              canManageShift={canManageShift}
+              canOpenShift={canOpenShift}
+              canCloseShift={canCloseShift}
               canEdit={canEdit}
               expanded={expanded === s.id}
               onToggle={() => setExpanded(expanded === s.id ? null : s.id)}
@@ -186,8 +193,13 @@ export default function Shifts({ profile, onOpenShift }) {
         <NewShiftModal
           profile={profile}
           users={allUsers}
+          canOpenDirectly={canOpenShift}
           onClose={() => setOpenNew(false)}
-          onSaved={async () => { setOpenNew(false); await loadAll() }}
+          onSaved={async (newId) => {
+            setOpenNew(false)
+            await loadAll()
+            if (newId) setExpanded(newId)
+          }}
         />
       )}
 
@@ -226,7 +238,7 @@ export default function Shifts({ profile, onOpenShift }) {
 /* ============================================================
    SHIFT ROW
    ============================================================ */
-function ShiftRow({ shift, roster, usersById, canManageShift, canEdit, expanded, onToggle, onChanged, onOpenBalance, onEdit }) {
+function ShiftRow({ shift, roster, usersById, canOpenShift, canCloseShift, canEdit, expanded, onToggle, onChanged, onOpenBalance, onEdit }) {
   const [busy, setBusy] = useState(false)
   const supervisorEntry = roster.find(r => r.role_on_shift === 'supervisor')
   const managerEntry = roster.find(r => r.role_on_shift === 'manager')
@@ -246,6 +258,8 @@ function ShiftRow({ shift, roster, usersById, canManageShift, canEdit, expanded,
     await supabase.from('shifts').update({
       status: 'open',
       opened_at: new Date().toISOString(),
+      open_approved_by: (await supabase.auth.getUser()).data.user.id,
+      open_approved_at: new Date().toISOString(),
     }).eq('id', shift.id)
     setBusy(false)
     onChanged()
@@ -254,7 +268,14 @@ function ShiftRow({ shift, roster, usersById, canManageShift, canEdit, expanded,
   async function closeShift() {
     if (!confirm('Close this shift now?')) return
     setBusy(true)
-    await supabase.from('shifts').update({ status: 'closed' }).eq('id', shift.id)
+    const u = (await supabase.auth.getUser()).data.user
+    await supabase.from('shifts').update({
+      status: 'closed',
+      closed_at: new Date().toISOString(),
+      closed_by: u.id,
+      close_approved_by: u.id,
+      close_approved_at: new Date().toISOString(),
+    }).eq('id', shift.id)
     setBusy(false)
     onChanged()
   }
@@ -283,23 +304,23 @@ function ShiftRow({ shift, roster, usersById, canManageShift, canEdit, expanded,
           <div className="roster-section">
             <div className="roster-title">Supervisor</div>
             <div className="roster-chips">
-              {supervisorEntry ? (
-                <span className="chip supervisor">{usersById[supervisorEntry.user_id]?.name || '—'}</span>
-              ) : <span className="empty-chip">Not assigned</span>}
+              {supervisorEntry
+                ? <span className="chip supervisor">{usersById[supervisorEntry.user_id]?.name || '—'}</span>
+                : <span className="empty-chip">Not assigned</span>}
             </div>
 
             <div className="roster-title">Manager</div>
             <div className="roster-chips">
-              {managerEntry ? (
-                <span className="chip manager">{usersById[managerEntry.user_id]?.name || '—'}</span>
-              ) : <span className="empty-chip">Not assigned</span>}
+              {managerEntry
+                ? <span className="chip manager">{usersById[managerEntry.user_id]?.name || '—'}</span>
+                : <span className="empty-chip">Not assigned</span>}
             </div>
 
             <div className="roster-title">Ambassador</div>
             <div className="roster-chips">
-              {ambassadorEntry ? (
-                <span className="chip ambassador">{usersById[ambassadorEntry.user_id]?.name || '—'}</span>
-              ) : <span className="empty-chip">Not assigned</span>}
+              {ambassadorEntry
+                ? <span className="chip ambassador">{usersById[ambassadorEntry.user_id]?.name || '—'}</span>
+                : <span className="empty-chip">Not assigned</span>}
             </div>
 
             <div className="roster-title">Attendants ({attendants.length})</div>
@@ -325,22 +346,19 @@ function ShiftRow({ shift, roster, usersById, canManageShift, canEdit, expanded,
               </button>
             )}
 
-            {/* Open a pending_open shift */}
-            {canManageShift && shift.status === 'pending_open' && (
+            {canOpenShift && shift.status === 'pending_open' && (
               <button className="btn-tiny success" onClick={openShift} disabled={busy}>
                 <i className="fas fa-play" /> Open shift
               </button>
             )}
 
-            {/* Close an open shift directly */}
-            {canManageShift && shift.status === 'open' && (
+            {canCloseShift && shift.status === 'open' && (
               <button className="btn-tiny danger" onClick={closeShift} disabled={busy}>
                 <i className="fas fa-lock" /> Close shift
               </button>
             )}
 
-            {/* Close a pending_close shift (rare path) */}
-            {canManageShift && shift.status === 'pending_close' && (
+            {canCloseShift && shift.status === 'pending_close' && (
               <button className="btn-tiny success" onClick={closeShift} disabled={busy}>
                 <i className="fas fa-check" /> Close shift
               </button>
@@ -353,14 +371,12 @@ function ShiftRow({ shift, roster, usersById, canManageShift, canEdit, expanded,
 }
 
 /* ============================================================
-   NEW SHIFT MODAL
+   NEW SHIFT MODAL — uses real columns from your shifts table
    ============================================================ */
-function NewShiftModal({ profile, users, onClose, onSaved }) {
+function NewShiftModal({ profile, users, canOpenDirectly, onClose, onSaved }) {
   const user = profile.user
-  // Anyone who can reach this modal can open directly
-  const canOpenDirectly = ['manager','admin','supervisor'].includes(user.role)
 
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10))
+  const [date, setDate] = useState(todayEAT())
   const [type, setType] = useState('day')
   const [supervisorId, setSupervisorId] = useState('')
   const [managerId, setManagerId] = useState('')
@@ -386,7 +402,8 @@ function NewShiftModal({ profile, users, onClose, onSaved }) {
     setBusy(true); setErr('')
 
     try {
-      const initialStatus = canOpenDirectly ? 'open' : 'pending_open'
+      const now = new Date().toISOString()
+      const status = canOpenDirectly ? 'open' : 'pending_open'
 
       const { data: shiftData, error: sErr } = await supabase
         .from('shifts')
@@ -397,13 +414,12 @@ function NewShiftModal({ profile, users, onClose, onSaved }) {
           supervisor_id: supervisorId,
           manager_id: managerId || null,
           ambassador_id: ambassadorId || null,
-          status: initialStatus,
-          open_requested_by: user.id,
-          open_requested_at: new Date().toISOString(),
-          opened_at: canOpenDirectly ? new Date().toISOString() : null,
+          status,
+          open_requested_by: canOpenDirectly ? null : user.id,
+          open_requested_at: canOpenDirectly ? null : now,
           open_approved_by: canOpenDirectly ? user.id : null,
-          open_approved_at: canOpenDirectly ? new Date().toISOString() : null,
-          notes,
+          open_approved_at: canOpenDirectly ? now : null,
+          notes: notes || null,
         })
         .select('id')
         .single()
@@ -420,7 +436,7 @@ function NewShiftModal({ profile, users, onClose, onSaved }) {
         if (rErr) throw rErr
       }
 
-      onSaved()
+      onSaved(shiftData.id)
     } catch (e) {
       setErr(e.message || 'Save failed')
       setBusy(false)
@@ -540,7 +556,7 @@ function EditShiftModal({ profile, users, shift, roster, onClose, onSaved }) {
           supervisor_id: supervisorId,
           manager_id: managerId || null,
           ambassador_id: ambassadorId || null,
-          notes,
+          notes: notes || null,
         })
         .eq('id', shift.id)
       if (sErr) throw sErr
@@ -635,7 +651,7 @@ function EditShiftModal({ profile, users, shift, roster, onClose, onSaved }) {
 }
 
 /* ============================================================
-   IMPORT MODAL
+   IMPORT MODAL (CSV only — no .xlsx parser yet)
    ============================================================ */
 function ImportModal({ profile, users, onClose, onSaved }) {
   const user = profile.user
@@ -645,7 +661,7 @@ function ImportModal({ profile, users, onClose, onSaved }) {
 
   function downloadTemplate() {
     const tpl = `date,shift_type,supervisor_email,manager_email,ambassador_email,attendant_emails,notes
-2026-09-22,day,supervisor@texol.ug,manager@texol.ug,ambassador@texol.ug,"attendant1@texol.ug;attendant2@texol.ug",
+${todayEAT()},day,supervisor@texol.ug,manager@texol.ug,ambassador@texol.ug,"attendant1@texol.ug;attendant2@texol.ug",
 `
     downloadFile('texol-timetable-template.csv', tpl, 'text/csv')
   }
@@ -657,7 +673,7 @@ function ImportModal({ profile, users, onClose, onSaved }) {
     const rows = text.split('\n').map(r => r.trim()).filter(r => r && !r.startsWith('date,'))
     const parsed = rows.map(r => {
       const matches = r.match(/("([^"]*)"|[^,]+)(,|$)/g) || []
-      const cells = matches.map(m => m.replace(/,$/,'').replace(/^"|"$/g,'').trim())
+      const cells = matches.map(m => m.replace(/,$/, '').replace(/^"|"$/g, '').trim())
       return {
         date: cells[0] || '',
         shift_type: cells[1] || 'day',
@@ -696,7 +712,7 @@ function ImportModal({ profile, users, onClose, onSaved }) {
             status: 'pending_open',
             open_requested_by: user.id,
             open_requested_at: new Date().toISOString(),
-            notes: row.notes,
+            notes: row.notes || null,
           })
           .select('id')
           .single()
@@ -724,7 +740,7 @@ function ImportModal({ profile, users, onClose, onSaved }) {
     <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="modal modal-wide">
         <h3>Import Timetable</h3>
-        <div className="modal-sub">Upload a CSV file (opens in Excel and Word)</div>
+        <div className="modal-sub">Upload a CSV file (save as CSV from Excel)</div>
 
         <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
           <button className="btn-ghost" onClick={downloadTemplate}>
@@ -735,7 +751,7 @@ function ImportModal({ profile, users, onClose, onSaved }) {
         <label>Upload file</label>
         <input
           type="file"
-          accept=".csv,.txt,.xlsx,.xls,.doc,.docx"
+          accept=".csv,.txt"
           onChange={e => handleFile(e.target.files?.[0])}
         />
 
