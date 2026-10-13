@@ -1,5 +1,9 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '../supabase'
+import { todayEAT } from '../lib/time'
+
+const DROP_UNIT = 300000
+const unitsOf = amount => Math.floor((Number(amount) || 0) / DROP_UNIT)
 
 export default function Home({ profile, onNavigate }) {
   const user = profile.user
@@ -17,7 +21,7 @@ export default function Home({ profile, onNavigate }) {
 }
 
 /* ============================================================
-   MOTIVATION BANNER
+   MOTIVATION BANNER — unchanged
    ============================================================ */
 function MotivationBanner({ stationId, canEdit }) {
   const [messages, setMessages] = useState([])
@@ -171,7 +175,7 @@ function MotivationEditor({ stationId, messages, onClose, onSaved }) {
 }
 
 /* ============================================================
-   WINNER STRIP — now includes Transactions
+   WINNER STRIP — now uses CURRENT OPEN SHIFT
    ============================================================ */
 function WinnerStrip({ profile }) {
   const user = profile.user
@@ -182,27 +186,19 @@ function WinnerStrip({ profile }) {
   useEffect(() => {
     async function load() {
       setLoading(true)
-      const today = new Date().toISOString().slice(0, 10)
       const computed = []
 
-      // Today's drops
-      const { data: shifts } = await supabase
+      // Find the current OPEN shift
+      const { data: openShifts } = await supabase
         .from('shifts')
-        .select('id')
+        .select('id, opened_at, shift_date, shift_type')
         .eq('station_id', user.station_id)
-        .eq('shift_date', today)
-      const shiftIds = (shifts || []).map(s => s.id)
+        .eq('status', 'open')
+        .order('opened_at', { ascending: false })
+        .limit(1)
+      const openShift = openShifts?.[0] || null
 
-      let todayDrops = []
-      if (shiftIds.length > 0) {
-        const { data } = await supabase
-          .from('money_drops')
-          .select('attendant_id, amount')
-          .in('shift_id', shiftIds)
-          .eq('status', 'active')
-        todayDrops = data || []
-      }
-
+      // Load names
       const { data: users } = await supabase
         .from('users')
         .select('id, name')
@@ -210,30 +206,43 @@ function WinnerStrip({ profile }) {
       const nameById = {}
       ;(users || []).forEach(u => { nameById[u.id] = u.name })
 
+      // If there's an open shift, use its drops; otherwise nothing
+      let shiftDrops = []
+      if (openShift) {
+        const { data } = await supabase
+          .from('money_drops')
+          .select('attendant_id, amount')
+          .eq('shift_id', openShift.id)
+          .eq('status', 'active')
+        shiftDrops = data || []
+      }
+
       const totals = {}
-      todayDrops.forEach(d => {
+      shiftDrops.forEach(d => {
         totals[d.attendant_id] = (totals[d.attendant_id] || 0) + Number(d.amount)
       })
       const sorted = Object.entries(totals).sort((a, b) => b[1] - a[1])
 
       if (sorted[0]) {
+        const u = unitsOf(sorted[0][1])
         computed.push({
-          type: 'liters', icon: 'fa-money-bill-wave', label: 'Top collector · today',
+          type: 'liters', icon: 'fa-money-bill-wave', label: 'Top collector · current shift',
           name: nameById[sorted[0][0]] || '—',
-          reason: `UGX ${sorted[0][1].toLocaleString()} collected`,
+          reason: `UGX ${sorted[0][1].toLocaleString()} · ${u} drop${u === 1 ? '' : 's'}`,
           crown: '👑',
         })
       }
       if (sorted[1]) {
+        const u = unitsOf(sorted[1][1])
         computed.push({
-          type: 'cards', icon: 'fa-credit-card', label: 'Runner-up · today',
+          type: 'cards', icon: 'fa-credit-card', label: 'Runner-up · current shift',
           name: nameById[sorted[1][0]] || '—',
-          reason: `UGX ${sorted[1][1].toLocaleString()} collected`,
+          reason: `UGX ${sorted[1][1].toLocaleString()} · ${u} drop${u === 1 ? '' : 's'}`,
           crown: '🏆',
         })
       }
 
-      // Fuel card champions
+      // Fuel card champions this week (unchanged — weekly, not shift-based)
       const weekStart = getMondayISO()
       const { data: champs } = await supabase
         .from('card_champions')
@@ -257,53 +266,57 @@ function WinnerStrip({ profile }) {
         })
       })
 
-      // Top card worker today
-      const { data: staffCards } = await supabase
-        .from('v_staff_daily_cards')
-        .select('*')
-        .eq('station_id', user.station_id)
-        .eq('day', today)
-        .order('cards_worked', { ascending: false })
-        .limit(1)
-      if (staffCards && staffCards[0]) {
-        const top = staffCards[0]
-        computed.push({
-          type: 'cards', icon: 'fa-id-card', label: 'Top card worker · today',
-          name: top.staff_name || '—',
-          reason: `${top.cards_worked} cards worked · ${Number(top.card_sales_liters || 0).toLocaleString()} L`,
-          crown: '🎖',
-        })
+      // Top card worker — current open shift window (only if open shift exists)
+      if (openShift) {
+        const { data: staffCards } = await supabase
+          .from('v_staff_daily_cards')
+          .select('*')
+          .eq('station_id', user.station_id)
+          .eq('day', todayEAT())
+          .order('cards_worked', { ascending: false })
+          .limit(1)
+        if (staffCards && staffCards[0]) {
+          const top = staffCards[0]
+          computed.push({
+            type: 'cards', icon: 'fa-id-card', label: 'Top card worker · today',
+            name: top.staff_name || '—',
+            reason: `${top.cards_worked} cards · ${Number(top.card_sales_liters || 0).toLocaleString()} L`,
+            crown: '🎖',
+          })
+        }
       }
 
-      // Top transaction claimant today
-      const { data: txns } = await supabase
-        .from('transactions')
-        .select('claimed_by, amount')
-        .eq('station_id', user.station_id)
-        .eq('status', 'claimed')
-        .gte('received_at', today + 'T00:00:00')
-        .lte('received_at', today + 'T23:59:59')
-      const txnTotals = {}
-      ;(txns || []).forEach(t => {
-        if (!t.claimed_by) return
-        txnTotals[t.claimed_by] = (txnTotals[t.claimed_by] || 0) + Number(t.amount || 0)
-      })
-      const txnSorted = Object.entries(txnTotals).sort((a,b) => b[1] - a[1])
-      if (txnSorted[0]) {
-        computed.push({
-          type: 'cards', icon: 'fa-receipt', label: 'Top transactions · today',
-          name: nameById[txnSorted[0][0]] || '—',
-          reason: `UGX ${txnSorted[0][1].toLocaleString()} claimed`,
-          crown: '💎',
+      // Top transaction claimant — current open shift window only
+      if (openShift) {
+        const fromISO = openShift.opened_at || (openShift.shift_date + 'T00:00:00')
+        const { data: txns } = await supabase
+          .from('transactions')
+          .select('claimed_by, amount')
+          .eq('station_id', user.station_id)
+          .eq('status', 'claimed')
+          .gte('received_at', fromISO)
+        const txnTotals = {}
+        ;(txns || []).forEach(t => {
+          if (!t.claimed_by) return
+          txnTotals[t.claimed_by] = (txnTotals[t.claimed_by] || 0) + Number(t.amount || 0)
         })
+        const txnSorted = Object.entries(txnTotals).sort((a,b) => b[1] - a[1])
+        if (txnSorted[0]) {
+          computed.push({
+            type: 'cards', icon: 'fa-receipt', label: 'Top transactions · current shift',
+            name: nameById[txnSorted[0][0]] || '—',
+            reason: `UGX ${txnSorted[0][1].toLocaleString()} claimed`,
+            crown: '💎',
+          })
+        }
       }
 
       if (computed.length === 0) {
         computed.push({
-          type: 'liters', icon: 'fa-gas-pump', label: 'Waiting for first activity',
-          name: 'No data yet',
-          reason: 'Winners will appear here once the team starts working',
-          crown: '👑',
+          type: 'liters', icon: 'fa-clock', label: openShift ? 'Waiting for first drop' : 'No open shift',
+          name: '—',
+          reason: openShift ? 'Drop records will appear here as attendants hand cash in' : 'Winners appear once a shift is opened',
+          crown: '⏳',
         })
       }
 
@@ -332,7 +345,7 @@ function WinnerStrip({ profile }) {
   return (
     <div className="winner-strip">
       <div className="title">
-        <i className="fas fa-trophy" /> Top performers · rotating
+        <i className="fas fa-trophy" /> Top performers · current shift
       </div>
       <div className="winner-slides">
         {tiles.map((w, i) => (
@@ -362,7 +375,7 @@ function WinnerStrip({ profile }) {
 }
 
 /* ============================================================
-   WINNER CARDS — 3 cards now
+   WINNER CARDS — top attendant is now per OPEN SHIFT
    ============================================================ */
 function WinnerCards({ profile }) {
   const user = profile.user
@@ -374,26 +387,17 @@ function WinnerCards({ profile }) {
   const [openPicker, setOpenPicker] = useState(false)
 
   async function load() {
-    const today_iso = new Date().toISOString().slice(0, 10)
-
-    // Today's drops
-    const { data: todayShifts } = await supabase
+    // Find OPEN shift
+    const { data: openShifts } = await supabase
       .from('shifts')
-      .select('id')
+      .select('id, opened_at, shift_date, shift_type')
       .eq('station_id', user.station_id)
-      .eq('shift_date', today_iso)
-    const tIds = (todayShifts || []).map(s => s.id)
+      .eq('status', 'open')
+      .order('opened_at', { ascending: false })
+      .limit(1)
+    const openShift = openShifts?.[0] || null
 
-    let todayDrops = []
-    if (tIds.length > 0) {
-      const { data } = await supabase
-        .from('money_drops')
-        .select('attendant_id, amount')
-        .in('shift_id', tIds)
-        .eq('status', 'active')
-      todayDrops = data || []
-    }
-
+    // Names
     const { data: users } = await supabase
       .from('users')
       .select('id, name, initials')
@@ -401,18 +405,33 @@ function WinnerCards({ profile }) {
     const nameById = {}
     ;(users || []).forEach(u => { nameById[u.id] = u.name })
 
+    // Top drop collector THIS SHIFT
+    let shiftDrops = []
+    if (openShift) {
+      const { data } = await supabase
+        .from('money_drops')
+        .select('attendant_id, amount')
+        .eq('shift_id', openShift.id)
+        .eq('status', 'active')
+      shiftDrops = data || []
+    }
     const totals = {}
-    todayDrops.forEach(d => {
+    shiftDrops.forEach(d => {
       totals[d.attendant_id] = (totals[d.attendant_id] || 0) + Number(d.amount)
     })
     const sorted = Object.entries(totals).sort((a,b) => b[1] - a[1])
     if (sorted[0]) {
-      setToday({ name: nameById[sorted[0][0]] || '—', total: sorted[0][1] })
+      setToday({
+        name: nameById[sorted[0][0]] || '—',
+        total: sorted[0][1],
+        units: unitsOf(sorted[0][1]),
+        openShift,
+      })
     } else {
       setToday(null)
     }
 
-    // Week champion (manual)
+    // Week champion (manual, unchanged)
     const weekStart = getMondayISO()
     const { data: champ } = await supabase
       .from('champion_selections')
@@ -431,23 +450,26 @@ function WinnerCards({ profile }) {
       setWeek(null)
     }
 
-    // Today's transaction top claimant
-    const { data: txns } = await supabase
-      .from('transactions')
-      .select('claimed_by, amount')
-      .eq('station_id', user.station_id)
-      .eq('status', 'claimed')
-      .gte('received_at', today_iso + 'T00:00:00')
-      .lte('received_at', today_iso + 'T23:59:59')
-
-    const txnTotals = {}
-    ;(txns || []).forEach(t => {
-      if (!t.claimed_by) return
-      txnTotals[t.claimed_by] = (txnTotals[t.claimed_by] || 0) + Number(t.amount || 0)
-    })
-    const txnSorted = Object.entries(txnTotals).sort((a,b) => b[1] - a[1])
-    if (txnSorted[0]) {
-      setTxnTop({ name: nameById[txnSorted[0][0]] || '—', total: txnSorted[0][1] })
+    // Top txn claimant THIS SHIFT
+    if (openShift) {
+      const fromISO = openShift.opened_at || (openShift.shift_date + 'T00:00:00')
+      const { data: txns } = await supabase
+        .from('transactions')
+        .select('claimed_by, amount')
+        .eq('station_id', user.station_id)
+        .eq('status', 'claimed')
+        .gte('received_at', fromISO)
+      const txnTotals = {}
+      ;(txns || []).forEach(t => {
+        if (!t.claimed_by) return
+        txnTotals[t.claimed_by] = (txnTotals[t.claimed_by] || 0) + Number(t.amount || 0)
+      })
+      const txnSorted = Object.entries(txnTotals).sort((a,b) => b[1] - a[1])
+      if (txnSorted[0]) {
+        setTxnTop({ name: nameById[txnSorted[0][0]] || '—', total: txnSorted[0][1] })
+      } else {
+        setTxnTop(null)
+      }
     } else {
       setTxnTop(null)
     }
@@ -458,13 +480,19 @@ function WinnerCards({ profile }) {
   return (
     <div className="winners">
       <div className="winner-card">
-        <div className="label"><i className="fas fa-sun" /> Today's Top Attendant</div>
+        <div className="label"><i className="fas fa-sun" /> Top Attendant · Current Shift</div>
         <div className="crown">👑</div>
         <div className="name">{today?.name || '—'}</div>
-        <div className="role">Attendant · Day shift</div>
+        <div className="role">
+          {today?.openShift
+            ? `${today.openShift.shift_type} shift · ${today.openShift.shift_date}`
+            : 'No open shift'}
+        </div>
         <div className="metric">
           <i className="fas fa-money-bill-wave" />
-          {today ? `UGX ${today.total.toLocaleString()} collected today` : 'No drops yet today'}
+          {today
+            ? `UGX ${today.total.toLocaleString()} · ${today.units} drop${today.units === 1 ? '' : 's'}`
+            : 'No drops on this shift yet'}
         </div>
       </div>
 
@@ -488,7 +516,7 @@ function WinnerCards({ profile }) {
         <div className="label"><i className="fas fa-receipt" /> Top Transaction Attendant</div>
         <div className="crown">💎</div>
         <div className="name">{txnTop?.name || '—'}</div>
-        <div className="role">Most confirmed transactions today</div>
+        <div className="role">Most confirmed transactions · current shift</div>
         <div className="metric">
           <i className="fas fa-money-bill-wave" />
           {txnTop ? `UGX ${txnTop.total.toLocaleString()} claimed` : 'No transactions claimed yet'}
@@ -507,7 +535,7 @@ function WinnerCards({ profile }) {
 }
 
 /* ============================================================
-   CHAMPION PICKER
+   CHAMPION PICKER — unchanged
    ============================================================ */
 function ChampionPicker({ profile, onClose, onSaved }) {
   const user = profile.user
@@ -590,7 +618,7 @@ function ChampionPicker({ profile, onClose, onSaved }) {
 }
 
 /* ============================================================
-   THANKS LIST
+   THANKS LIST — now current open shift
    ============================================================ */
 function ThanksList({ profile }) {
   const user = profile.user
@@ -598,20 +626,22 @@ function ThanksList({ profile }) {
 
   useEffect(() => {
     async function load() {
-      const today = new Date().toISOString().slice(0, 10)
-      const { data: shifts } = await supabase
+      // Find current OPEN shift
+      const { data: openShifts } = await supabase
         .from('shifts')
         .select('id')
         .eq('station_id', user.station_id)
-        .eq('shift_date', today)
-      const ids = (shifts || []).map(s => s.id)
+        .eq('status', 'open')
+        .order('opened_at', { ascending: false })
+        .limit(1)
+      const openShift = openShifts?.[0] || null
 
       let drops = []
-      if (ids.length > 0) {
+      if (openShift) {
         const { data } = await supabase
           .from('money_drops')
           .select('attendant_id, amount')
-          .in('shift_id', ids)
+          .eq('shift_id', openShift.id)
           .eq('status', 'active')
         drops = data || []
       }
@@ -629,14 +659,21 @@ function ThanksList({ profile }) {
       })
       const top = Object.entries(totals).sort((a,b) => b[1] - a[1]).slice(0, 3)
 
-      const built = top.map(([id, total]) => ({
-        initials: map[id]?.initials || '??',
-        name: `Thanks ${map[id]?.name || '—'} 🙏`,
-        reason: `UGX ${total.toLocaleString()} collected today`,
-      }))
+      const built = top.map(([id, total]) => {
+        const u = unitsOf(total)
+        return {
+          initials: map[id]?.initials || '??',
+          name: `Thanks ${map[id]?.name || '—'} 🙏`,
+          reason: `UGX ${total.toLocaleString()} · ${u} drop${u === 1 ? '' : 's'} this shift`,
+        }
+      })
 
       if (built.length === 0) {
-        built.push({ initials: 'TX', name: 'TEXOL LEGACY team', reason: 'Ready for another great shift' })
+        built.push({
+          initials: 'TX',
+          name: openShift ? 'TEXOL LEGACY team' : 'No open shift',
+          reason: openShift ? 'Ready for the first drop of the shift' : 'Thanks list appears once a shift opens',
+        })
       }
 
       setItems(built)
@@ -663,13 +700,13 @@ function ThanksList({ profile }) {
 }
 
 /* ============================================================
-   LIVE STATS
+   LIVE STATS — drops now for current open shift
    ============================================================ */
 function LiveStats({ profile, onNavigate }) {
   const user = profile.user
   const station = profile.station
   const [stats, setStats] = useState({
-    staffCount: null, dropTotal: null, dropCount: null,
+    staffCount: null, dropTotal: null, dropCount: null, dropUnits: null,
     openShifts: null, pendingAttendance: null, txnCount: null,
   })
   const [loading, setLoading] = useState(true)
@@ -679,36 +716,55 @@ function LiveStats({ profile, onNavigate }) {
     async function load() {
       setLoading(true)
       const stationId = user.station_id
-      const today = new Date().toISOString().slice(0, 10)
+      const today = todayEAT()
 
-      const [staffRes, shiftsRes, attRes, txnRes] = await Promise.all([
+      const [staffRes, openShiftRes, attRes] = await Promise.all([
         supabase.from('users').select('id', { count: 'exact', head: true })
           .eq('station_id', stationId).eq('is_active', true),
-        supabase.from('shifts').select('id, status')
-          .eq('station_id', stationId).eq('shift_date', today),
+        supabase.from('shifts').select('id, status, opened_at')
+          .eq('station_id', stationId).eq('status', 'open')
+          .order('opened_at', { ascending: false }).limit(1),
         supabase.from('attendance').select('id', { count: 'exact', head: true })
           .eq('status', 'pending'),
-        supabase.from('transactions').select('id', { count: 'exact', head: true })
-          .eq('station_id', stationId).eq('status', 'claimed')
-          .gte('received_at', today + 'T00:00:00'),
       ])
 
       if (cancelled) return
 
-      const shiftIds = (shiftsRes.data || []).map(s => s.id)
+      const openShift = openShiftRes.data?.[0] || null
       let drops = []
-      if (shiftIds.length > 0) {
-        const { data } = await supabase.from('money_drops').select('amount').in('shift_id', shiftIds)
+      if (openShift) {
+        const { data } = await supabase
+          .from('money_drops')
+          .select('amount')
+          .eq('shift_id', openShift.id)
+          .eq('status', 'active')
         drops = data || []
       }
 
+      // Transactions on the current shift only
+      let txnCount = 0
+      if (openShift) {
+        const fromISO = openShift.opened_at || (today + 'T00:00:00')
+        const { count } = await supabase
+          .from('transactions')
+          .select('id', { count: 'exact', head: true })
+          .eq('station_id', stationId)
+          .eq('status', 'claimed')
+          .gte('received_at', fromISO)
+        txnCount = count ?? 0
+      }
+
+      const dropTotal = drops.reduce((s, d) => s + Number(d.amount), 0)
+      const dropUnits = drops.reduce((s, d) => s + unitsOf(d.amount), 0)
+
       setStats({
         staffCount: staffRes.count ?? 0,
-        openShifts: (shiftsRes.data || []).filter(s => s.status === 'open').length,
-        dropTotal: drops.reduce((s, d) => s + Number(d.amount), 0),
+        openShifts: openShift ? 1 : 0,
+        dropTotal,
         dropCount: drops.length,
+        dropUnits,
         pendingAttendance: attRes.count ?? 0,
-        txnCount: txnRes.count ?? 0,
+        txnCount,
       })
       setLoading(false)
     }
@@ -758,9 +814,17 @@ function LiveStats({ profile, onNavigate }) {
 
       <div className="dashboard-grid">
         <StatCard title="👥 Staff on register" value={loading ? '—' : `${stats.staffCount}`} sub="Active at your station" />
-        <StatCard title="🟢 Open shifts today" value={loading ? '—' : `${stats.openShifts}`} sub={new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })} />
-        <StatCard title="💰 Drops today" value={loading ? '—' : `UGX ${stats.dropTotal.toLocaleString()}`} sub={loading ? '' : `${stats.dropCount} drops`} />
-        <StatCard title="📱 Transactions claimed" value={loading ? '—' : `${stats.txnCount}`} sub="Today" />
+        <StatCard
+          title="🟢 Open shifts today"
+          value={loading ? '—' : `${stats.openShifts}`}
+          sub={stats.openShifts ? 'Current shift running' : 'No shift open'}
+        />
+        <StatCard
+          title="💰 Drops this shift"
+          value={loading ? '—' : `UGX ${stats.dropTotal.toLocaleString()}`}
+          sub={loading ? '' : `${stats.dropUnits} drop${stats.dropUnits === 1 ? '' : 's'} · 1 = UGX ${DROP_UNIT.toLocaleString()}`}
+        />
+        <StatCard title="📱 Transactions claimed" value={loading ? '—' : `${stats.txnCount}`} sub="This shift" />
       </div>
 
       <div className="card-panel">
@@ -807,16 +871,22 @@ function StatCard({ title, value, sub }) {
    HELPERS
    ============================================================ */
 function getMondayISO() {
-  const d = new Date()
-  const day = d.getDay()
-  const diff = (day + 6) % 7
-  d.setDate(d.getDate() - diff)
-  return d.toISOString().slice(0, 10)
+  // Uganda time — Monday of current week
+  const now = new Date()
+  const eat = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Kampala' }))
+  const day = eat.getDay()               // 0=Sun, 1=Mon
+  const diff = (day + 6) % 7             // days since Monday
+  eat.setDate(eat.getDate() - diff)
+  const y = eat.getFullYear()
+  const m = String(eat.getMonth() + 1).padStart(2, '0')
+  const d = String(eat.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
 }
 
 function formatWeekStart() {
-  const d = new Date(getMondayISO())
-  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+  const iso = getMondayISO()
+  const [y, m, d] = iso.split('-')
+  return `${d}/${m}/${y}`
 }
 
 function capitalize(s = '') {

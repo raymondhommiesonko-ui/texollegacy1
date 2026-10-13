@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { supabase } from '../supabase'
+import { timeEAT, dateShortEAT, todayEAT } from '../lib/time'
+
+// Business rule: 300,000 UGX = 1 drop unit
+const DROP_UNIT = 300000
+const unitsOf = amount => Math.floor((Number(amount) || 0) / DROP_UNIT)
 
 export default function Collect({ profile, onExit }) {
   const user = profile.user
@@ -13,6 +18,7 @@ export default function Collect({ profile, onExit }) {
   const [openRecord, setOpenRecord] = useState(false)
   const [openSearch, setOpenSearch] = useState(false)
   const [successDrop, setSuccessDrop] = useState(null)
+  const [openShift, setOpenShift] = useState(null)
   const [from, setFrom] = useState('')
   const [to, setTo] = useState('')
 
@@ -29,20 +35,24 @@ export default function Collect({ profile, onExit }) {
     ;(users || []).forEach(u => { map[u.id] = u.name })
     setNameById(map)
 
-    const today = new Date().toISOString().slice(0, 10)
+    // Find the CURRENT OPEN shift — no date restriction
     const { data: shifts } = await supabase
       .from('shifts')
-      .select('id')
+      .select('id, shift_date, shift_type, opened_at')
       .eq('station_id', user.station_id)
-      .eq('shift_date', today)
-    const shiftIds = (shifts || []).map(s => s.id)
+      .eq('status', 'open')
+      .order('opened_at', { ascending: false })
+      .limit(1)
+
+    const current = shifts?.[0] || null
+    setOpenShift(current)
 
     let rows = []
-    if (shiftIds.length > 0) {
+    if (current) {
       const { data } = await supabase
         .from('money_drops')
         .select('*')
-        .in('shift_id', shiftIds)
+        .eq('shift_id', current.id)
         .order('created_at', { ascending: false })
         .limit(200)
       rows = data || []
@@ -53,10 +63,13 @@ export default function Collect({ profile, onExit }) {
 
   useEffect(() => { loadAll() }, [user.id])
 
-  const todayStats = useMemo(() => {
+  const shiftStats = useMemo(() => {
     const active = drops.filter(d => d.status !== 'undone')
+    const total = active.reduce((s, d) => s + Number(d.amount), 0)
+    const units = active.reduce((s, d) => s + unitsOf(d.amount), 0)
     return {
-      total: active.reduce((s, d) => s + Number(d.amount), 0),
+      total,
+      units,
       count: active.length,
       attendants: new Set(active.map(d => d.attendant_id)).size,
     }
@@ -76,8 +89,8 @@ export default function Collect({ profile, onExit }) {
 
   const history = useMemo(() => {
     let rows = drops.slice()
-    if (from) rows = rows.filter(d => d.created_at.slice(0, 10) >= from)
-    if (to) rows = rows.filter(d => d.created_at.slice(0, 10) <= to)
+    if (from) rows = rows.filter(d => String(d.created_at).slice(0, 10) >= from)
+    if (to) rows = rows.filter(d => String(d.created_at).slice(0, 10) <= to)
     return rows
   }, [drops, from, to])
 
@@ -103,9 +116,23 @@ export default function Collect({ profile, onExit }) {
       <div className="collect-content">
         {tab === 'record' && (
           <>
-            <div className="collect-title">Today · {station?.name || 'STATION'}</div>
+            <div className="collect-title">
+              {openShift
+                ? <>Open shift · {dateShortEAT(openShift.opened_at)} · {String(openShift.shift_type).toUpperCase()}</>
+                : <>No open shift · {station?.name || 'STATION'}</>}
+            </div>
 
-            {canRecord && (
+            {!openShift && (
+              <div className="field-hint" style={{
+                margin: '0 0 16px', background: '#fee2e2', color: '#991b1b',
+                padding: '12px 16px', borderRadius: 12,
+              }}>
+                <i className="fas fa-lock" /> No shift is currently open.
+                Ask a manager to open one before recording drops.
+              </div>
+            )}
+
+            {canRecord && openShift && (
               <button className="collect-record-btn" onClick={() => setOpenRecord(true)}>
                 <i className="fas fa-plus-circle" />
                 RECORD MONEY DROP
@@ -114,13 +141,15 @@ export default function Collect({ profile, onExit }) {
 
             <div className="collect-stats">
               <div className="collect-stat">
-                <div className="label">Collected today</div>
-                <div className="value">UGX {todayStats.total.toLocaleString()}</div>
-                <div className="sub">{todayStats.count} drops</div>
+                <div className="label">Collected this shift</div>
+                <div className="value">UGX {shiftStats.total.toLocaleString()}</div>
+                <div className="sub">
+                  {shiftStats.units} drop{shiftStats.units === 1 ? '' : 's'} · 1 = UGX {DROP_UNIT.toLocaleString()}
+                </div>
               </div>
               <div className="collect-stat">
-                <div className="label">Attendants today</div>
-                <div className="value">{todayStats.attendants}</div>
+                <div className="label">Attendants on shift</div>
+                <div className="value">{shiftStats.attendants}</div>
                 <div className="sub">Unique</div>
               </div>
               <div className="collect-stat">
@@ -137,14 +166,14 @@ export default function Collect({ profile, onExit }) {
               </div>
             </div>
 
-            <div className="collect-section-title">Recent drops today</div>
+            <div className="collect-section-title">Recent drops this shift</div>
             {loading ? (
               <div className="collect-empty">Loading…</div>
             ) : drops.length === 0 ? (
               <div className="collect-empty">
                 <i className="fas fa-inbox" />
-                <h4>No drops yet today</h4>
-                <p>Tap the button above to record one</p>
+                <h4>{openShift ? 'No drops yet this shift' : 'No open shift'}</h4>
+                <p>{openShift ? 'Tap the button above to record one' : 'Drops will appear once a manager opens a shift'}</p>
               </div>
             ) : (
               drops.slice(0, 8).map(d => (
@@ -191,6 +220,7 @@ export default function Collect({ profile, onExit }) {
         <RecordDropModal
           profile={profile}
           attendants={attendants}
+          openShift={openShift}
           onClose={() => setOpenRecord(false)}
           onSaved={async (newDrop) => {
             setOpenRecord(false)
@@ -211,17 +241,24 @@ export default function Collect({ profile, onExit }) {
   )
 }
 
+/* ============================================================
+   DROP ITEM
+   ============================================================ */
 function CollectDropItem({ drop, attendantName }) {
-  const c = new Date(drop.created_at)
-  const time = String(c.getHours()).padStart(2, '0') + ':' + String(c.getMinutes()).padStart(2, '0')
+  const units = unitsOf(drop.amount)
   return (
     <div className={`collect-drop-item ${drop.status === 'undone' ? 'undone' : ''}`}>
       <div className="left">
         <span className="code">{drop.code}</span>
-        <span className="meta">{time} · {attendantName} · drop #{drop.drop_number}</span>
+        <span className="meta">
+          {timeEAT(drop.created_at).slice(0, 5)} · {attendantName} · drop #{drop.drop_number}
+        </span>
       </div>
       <div className="right">
         <div className="amount">UGX {Number(drop.amount).toLocaleString()}</div>
+        <div style={{ fontSize: 11, color: '#8ba0b9', marginTop: 2 }}>
+          {units} drop{units === 1 ? '' : 's'}
+        </div>
         {drop.is_final && <div className="final">🏁 final</div>}
         {drop.status === 'pending_undo' && <div className="badge-warn">undo pending</div>}
         {drop.status === 'undone' && <div className="badge-red">undone</div>}
@@ -230,9 +267,11 @@ function CollectDropItem({ drop, attendantName }) {
   )
 }
 
+/* ============================================================
+   SUCCESS MODAL
+   ============================================================ */
 function SuccessDropModal({ drop, onClose }) {
-  const created = new Date(drop.created_at)
-  const time = String(created.getHours()).padStart(2, '0') + ':' + String(created.getMinutes()).padStart(2, '0')
+  const units = unitsOf(drop.amount)
   const [copied, setCopied] = useState(false)
 
   function copy() {
@@ -261,12 +300,19 @@ function SuccessDropModal({ drop, onClose }) {
             <span className="val">UGX {Number(drop.amount).toLocaleString()}</span>
           </div>
           <div className="result-row">
+            <span className="lbl">Drops</span>
+            <span className="val">
+              {units} drop{units === 1 ? '' : 's'}
+              <span style={{ color: '#8ba0b9', fontSize: 12 }}> (1 drop = UGX {DROP_UNIT.toLocaleString()})</span>
+            </span>
+          </div>
+          <div className="result-row">
             <span className="lbl">Drop #</span>
             <span className="val">#{drop.drop_number}{drop.is_final ? ' (final)' : ''}</span>
           </div>
           <div className="result-row">
             <span className="lbl">Time</span>
-            <span className="val">{time}</span>
+            <span className="val">{timeEAT(drop.created_at)}</span>
           </div>
         </div>
 
@@ -283,7 +329,10 @@ function SuccessDropModal({ drop, onClose }) {
   )
 }
 
-function RecordDropModal({ profile, attendants, onClose, onSaved }) {
+/* ============================================================
+   RECORD MODAL — uses the open shift passed from parent
+   ============================================================ */
+function RecordDropModal({ profile, attendants, openShift, onClose, onSaved }) {
   const user = profile.user
   const list = attendants.filter(u => u.role === 'attendant')
   const [attendantId, setAttendantId] = useState(list[0]?.id || '')
@@ -291,30 +340,17 @@ function RecordDropModal({ profile, attendants, onClose, onSaved }) {
   const [isFinal, setIsFinal] = useState(false)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
-  const [shiftId, setShiftId] = useState(null)
 
-  useEffect(() => {
-    async function getShift() {
-      const today = new Date().toISOString().slice(0, 10)
-      const { data } = await supabase
-        .from('shifts')
-        .select('id')
-        .eq('station_id', user.station_id)
-        .eq('shift_date', today)
-        .eq('status', 'open')
-        .limit(1)
-      if (data?.[0]) setShiftId(data[0].id)
-    }
-    getShift()
-  }, [user.station_id])
+  const units = unitsOf(amount)
 
   async function save() {
-    if (!shiftId) { setErr('No open shift. Ask a manager to start one.'); return }
+    if (!openShift) { setErr('No open shift. Ask a manager to open one.'); return }
+    if (Number(amount) <= 0) { setErr('Enter an amount'); return }
     setBusy(true); setErr('')
     const { data, error } = await supabase
       .from('money_drops')
       .insert({
-        shift_id: shiftId,
+        shift_id: openShift.id,
         attendant_id: attendantId,
         amount: Number(amount),
         is_final: isFinal,
@@ -334,6 +370,15 @@ function RecordDropModal({ profile, attendants, onClose, onSaved }) {
         <h3>Record Money Drop</h3>
         <div className="modal-sub">Cash handed to supervisor</div>
 
+        {openShift && (
+          <div className="field-hint" style={{
+            marginBottom: 12, background: '#d1fae5', color: '#065f46',
+          }}>
+            <i className="fas fa-check-circle" /> Recording on open shift ·{' '}
+            {openShift.shift_date} · {openShift.shift_type}
+          </div>
+        )}
+
         <label>Attendant</label>
         <select value={attendantId} onChange={e => setAttendantId(e.target.value)}>
           {list.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
@@ -342,10 +387,15 @@ function RecordDropModal({ profile, attendants, onClose, onSaved }) {
         <label>Amount (UGX)</label>
         <input type="number" value={amount} onChange={e => setAmount(e.target.value)} />
 
+        <div className="field-hint" style={{ marginTop: 8 }}>
+          <i className="fas fa-coins" /> {units} drop{units === 1 ? '' : 's'}{' '}
+          <span style={{ color: '#8ba0b9' }}>(1 drop = UGX {DROP_UNIT.toLocaleString()})</span>
+        </div>
+
         <div className="quick-amounts">
-          <button onClick={() => setAmount(300000)}>300k</button>
-          <button onClick={() => setAmount(200000)}>200k</button>
-          <button onClick={() => setAmount(100000)}>100k</button>
+          <button onClick={() => setAmount(300000)}>300k · 1</button>
+          <button onClick={() => setAmount(600000)}>600k · 2</button>
+          <button onClick={() => setAmount(900000)}>900k · 3</button>
         </div>
 
         <label className="check-row">
@@ -357,7 +407,7 @@ function RecordDropModal({ profile, attendants, onClose, onSaved }) {
 
         <div className="modal-actions">
           <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
-          <button className="btn-primary-full" onClick={save} disabled={busy}>
+          <button className="btn-primary-full" onClick={save} disabled={busy || !openShift}>
             {busy ? 'Saving…' : <><i className="fas fa-check" /> Record</>}
           </button>
         </div>
@@ -366,6 +416,9 @@ function RecordDropModal({ profile, attendants, onClose, onSaved }) {
   )
 }
 
+/* ============================================================
+   SEARCH MODAL
+   ============================================================ */
 function CollectSearchModal({ onClose, nameById }) {
   const [code, setCode] = useState('')
   const [result, setResult] = useState(null)
@@ -393,6 +446,8 @@ function CollectSearchModal({ onClose, nameById }) {
     setResult(data)
   }
 
+  const units = result ? unitsOf(result.amount) : 0
+
   return (
     <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="modal">
@@ -417,8 +472,13 @@ function CollectSearchModal({ onClose, nameById }) {
               <span className="code-pill big">{result.code}</span>
               <span className={`pill ${result.status === 'active' ? 'green' : result.status === 'pending_undo' ? 'amber' : 'red'}`}>{result.status}</span>
             </div>
-            <div className="result-row"><span className="lbl">Date</span><span className="val">{new Date(result.created_at).toLocaleDateString('en-GB')}</span></div>
+            <div className="result-row"><span className="lbl">Date</span><span className="val">{dateShortEAT(result.created_at)}</span></div>
+            <div className="result-row"><span className="lbl">Time</span><span className="val">{timeEAT(result.created_at)}</span></div>
             <div className="result-row"><span className="lbl">Amount</span><span className="val">UGX {Number(result.amount).toLocaleString()}</span></div>
+            <div className="result-row">
+              <span className="lbl">Drops</span>
+              <span className="val">{units} drop{units === 1 ? '' : 's'}</span>
+            </div>
             <div className="result-row"><span className="lbl">Attendant</span><span className="val">{nameById[result.attendant_id] || '—'}</span></div>
             <div className="result-row"><span className="lbl">Supervisor</span><span className="val">{result.shift?.supervisor?.name || '—'}</span></div>
             <div className="result-row"><span className="lbl">Manager</span><span className="val">{result.shift?.manager?.name || '—'}</span></div>
