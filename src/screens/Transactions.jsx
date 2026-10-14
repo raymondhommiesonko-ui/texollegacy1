@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import ExcelJS from 'exceljs'
 import { supabase } from '../supabase'
-import { todayEAT, timeEAT, eatToISO } from '../lib/time'
+import { todayEAT, timeEAT, eatToISO, addDaysEAT } from '../lib/time'
 
 export default function Transactions({ profile }) {
   const user = profile.user
@@ -90,15 +90,55 @@ export default function Transactions({ profile }) {
       }
       setOnShift(true)
 
-      const fromISO = eatToISO(debouncedFilter.from, '00:00')
-      const toISO = eatToISO(debouncedFilter.to, '23:59')
+      // ============================================================
+      // Build ONE combined date+time window
+      // ============================================================
+      const tf = debouncedFilter.timeFrom
+      const tt = debouncedFilter.timeTo
+      const fromDate = debouncedFilter.from
+      const toDate = debouncedFilter.to
+
+      let windowStartISO, windowEndISO
+
+      if (tf && tt) {
+        const [fh, fm] = tf.split(':').map(Number)
+        const [th, tm] = tt.split(':').map(Number)
+        const fromMin = fh * 60 + fm
+        const toMin = th * 60 + tm
+
+        if (fromMin <= toMin) {
+          // Normal window (same day, or multi-day daytime range)
+          windowStartISO = eatToISO(fromDate, tf)
+          windowEndISO = eatToISO(toDate, tt)
+        } else {
+          // Cross-midnight window (e.g. 17:00 → 02:06)
+          if (fromDate === toDate) {
+            // Same date → the "to" side belongs to the NEXT day
+            windowStartISO = eatToISO(fromDate, tf)
+            windowEndISO = eatToISO(addDaysEAT(toDate, 1), tt)
+          } else {
+            // Different dates → user picked start and end explicitly
+            windowStartISO = eatToISO(fromDate, tf)
+            windowEndISO = eatToISO(toDate, tt)
+          }
+        }
+      } else if (tf) {
+        windowStartISO = eatToISO(fromDate, tf)
+        windowEndISO = eatToISO(toDate, '23:59')
+      } else if (tt) {
+        windowStartISO = eatToISO(fromDate, '00:00')
+        windowEndISO = eatToISO(toDate, tt)
+      } else {
+        windowStartISO = eatToISO(fromDate, '00:00')
+        windowEndISO = eatToISO(toDate, '23:59')
+      }
 
       let q = supabase
         .from('transactions')
         .select('*')
         .eq('station_id', user.station_id)
-        .gte('received_at', fromISO)
-        .lte('received_at', toISO)
+        .gte('received_at', windowStartISO)
+        .lte('received_at', windowEndISO)
         .order('received_at', { ascending: false })
         .limit(2000)
 
@@ -111,30 +151,16 @@ export default function Transactions({ profile }) {
 
       let result = data || []
 
-      // Helper to get HH:mm as integer minutes since midnight (Uganda time)
-      const minutesEAT = iso => {
-        const s = new Date(iso).toLocaleTimeString('en-GB', {
-          timeZone: 'Africa/Kampala', hour12: false,
-          hour: '2-digit', minute: '2-digit',
-        })
-        const [h, m] = s.split(':').map(Number)
-        return h * 60 + m
+      // Remaining filters (no time filter needed — DB already narrowed it)
+      if (debouncedFilter.provider !== 'all') {
+        result = result.filter(t => t.provider === debouncedFilter.provider)
       }
-
-      if (debouncedFilter.timeFrom) {
-        const [fh, fm] = debouncedFilter.timeFrom.split(':').map(Number)
-        const fromMin = fh * 60 + fm
-        result = result.filter(t => minutesEAT(t.received_at) >= fromMin)
+      if (debouncedFilter.attendant !== 'all') {
+        result = result.filter(t => t.claimed_by === debouncedFilter.attendant)
       }
-      if (debouncedFilter.timeTo) {
-        const [th, tm] = debouncedFilter.timeTo.split(':').map(Number)
-        const toMin = th * 60 + tm
-        result = result.filter(t => minutesEAT(t.received_at) <= toMin)
+      if (debouncedFilter.status !== 'all') {
+        result = result.filter(t => t.status === debouncedFilter.status)
       }
-
-      if (debouncedFilter.provider !== 'all') result = result.filter(t => t.provider === debouncedFilter.provider)
-      if (debouncedFilter.attendant !== 'all') result = result.filter(t => t.claimed_by === debouncedFilter.attendant)
-      if (debouncedFilter.status !== 'all') result = result.filter(t => t.status === debouncedFilter.status)
 
       if (debouncedFilter.search) {
         const s = debouncedFilter.search.toLowerCase()
@@ -488,6 +514,9 @@ export default function Transactions({ profile }) {
   )
 }
 
+/* ============================================================
+   REASSIGN MODAL
+   ============================================================ */
 function ReassignModal({ transaction, staffCodes, onClose, onSaved }) {
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(false)
@@ -536,6 +565,9 @@ function ReassignModal({ transaction, staffCodes, onClose, onSaved }) {
   )
 }
 
+/* ============================================================
+   CLAIM MODAL
+   ============================================================ */
 function ClaimModal({ transaction, myCode, onClose, onSaved }) {
   const [code, setCode] = useState(myCode || '')
   const [busy, setBusy] = useState(false)
