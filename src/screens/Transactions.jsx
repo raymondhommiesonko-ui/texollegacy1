@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import ExcelJS from 'exceljs'
 import { supabase } from '../supabase'
 import { todayEAT, timeEAT, eatToISO, addDaysEAT } from '../lib/time'
+import { parseStatementCsv, reconcileStatement } from '../lib/reconcile'
 
 export default function Transactions({ profile }) {
   const user = profile.user
@@ -15,6 +16,7 @@ export default function Transactions({ profile }) {
   const canExport = isManager || isSupervisor || powers.export_transactions
   const canReassign = isManager || isSupervisor
   const canClaim = isStaff || isManager || isSupervisor
+  const canReconcile = isManager || isSupervisor || powers.reconcile_transactions
 
   const [rows, setRows] = useState([])
   const [staffCodes, setStaffCodes] = useState({})
@@ -25,6 +27,7 @@ export default function Transactions({ profile }) {
   const [errorMsg, setErrorMsg] = useState('')
   const [openReassign, setOpenReassign] = useState(null)
   const [openClaim, setOpenClaim] = useState(null)
+  const [openReconcile, setOpenReconcile] = useState(false)
 
   const [filter, setFilter] = useState({
     from: todayEAT(),
@@ -107,17 +110,15 @@ export default function Transactions({ profile }) {
         const toMin = th * 60 + tm
 
         if (fromMin <= toMin) {
-          // Normal window (same day, or multi-day daytime range)
+          // Normal window (same day or multi-day daytime)
           windowStartISO = eatToISO(fromDate, tf)
           windowEndISO = eatToISO(toDate, tt)
         } else {
           // Cross-midnight window (e.g. 17:00 → 02:06)
           if (fromDate === toDate) {
-            // Same date → the "to" side belongs to the NEXT day
             windowStartISO = eatToISO(fromDate, tf)
             windowEndISO = eatToISO(addDaysEAT(toDate, 1), tt)
           } else {
-            // Different dates → user picked start and end explicitly
             windowStartISO = eatToISO(fromDate, tf)
             windowEndISO = eatToISO(toDate, tt)
           }
@@ -151,7 +152,6 @@ export default function Transactions({ profile }) {
 
       let result = data || []
 
-      // Remaining filters (no time filter needed — DB already narrowed it)
       if (debouncedFilter.provider !== 'all') {
         result = result.filter(t => t.provider === debouncedFilter.provider)
       }
@@ -186,7 +186,11 @@ export default function Transactions({ profile }) {
   const stats = useMemo(() => {
     const total = rows.reduce((s, r) => s + Number(r.amount || 0), 0)
     const claimed = rows.filter(r => r.status === 'claimed').length
-    const unclaimed = rows.filter(r => r.status === 'unclaimed' || r.status === 'supervisor_notified').length
+    const unclaimed = rows.filter(
+      r => r.status === 'unclaimed' ||
+           r.status === 'supervisor_notified' ||
+           r.status === 'pending_claim'
+    ).length
     return { total, claimed, unclaimed, count: rows.length }
   }, [rows])
 
@@ -334,6 +338,11 @@ export default function Transactions({ profile }) {
           </div>
         </div>
         <div className="txns-actions">
+          {canReconcile && (
+            <button className="btn-ghost" onClick={() => setOpenReconcile(true)}>
+              <i className="fas fa-balance-scale" /> Reconcile
+            </button>
+          )}
           {canExport ? (
             <>
               <button className="btn-ghost" onClick={() => exportExcel('airtel')}>
@@ -376,6 +385,7 @@ export default function Transactions({ profile }) {
           <option value="all">All statuses</option>
           <option value="claimed">Claimed</option>
           <option value="unclaimed">Unclaimed</option>
+          <option value="pending_claim">Pending claim</option>
           <option value="supervisor_notified">Supervisor notified</option>
         </select>
         <input
@@ -430,7 +440,11 @@ export default function Transactions({ profile }) {
               {rows.slice(0, 500).map(r => {
                 const sc = r.claimed_by ? staffCodes[r.claimed_by] : null
                 const timeStr = timeEAT(r.received_at)
-                const isUnclaimed = !r.claimed_by || r.status === 'unclaimed' || r.status === 'supervisor_notified'
+                const isUnclaimed =
+                  !r.claimed_by ||
+                  r.status === 'unclaimed' ||
+                  r.status === 'supervisor_notified' ||
+                  r.status === 'pending_claim'
                 const isClaimedByMe = r.claimed_by === user.id
 
                 return (
@@ -465,6 +479,7 @@ export default function Transactions({ profile }) {
                     <td>
                       <span className={`pill ${
                         r.status === 'claimed' ? 'green' :
+                        r.status === 'pending_claim' ? 'purple' :
                         r.status === 'unclaimed' ? 'amber' : 'red'
                       }`}>{r.status}</span>
                     </td>
@@ -508,6 +523,14 @@ export default function Transactions({ profile }) {
           myCode={myCode}
           onClose={() => setOpenClaim(null)}
           onSaved={async () => { setOpenClaim(null); await loadTransactions() }}
+        />
+      )}
+
+      {openReconcile && (
+        <ReconcileModal
+          profile={profile}
+          onClose={() => setOpenReconcile(false)}
+          onDone={async () => { setOpenReconcile(false); await loadTransactions() }}
         />
       )}
     </div>
@@ -609,6 +632,158 @@ function ClaimModal({ transaction, myCode, onClose, onSaved }) {
           <button className="btn-primary-full" onClick={save} disabled={busy || code.length !== 2}>
             {busy ? 'Claiming…' : 'Claim'}
           </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ============================================================
+   RECONCILE MODAL
+   ============================================================ */
+function ReconcileModal({ profile, onClose, onDone }) {
+  const user = profile.user
+  const [provider, setProvider] = useState('mtn')
+  const [file, setFile] = useState(null)
+  const [preview, setPreview] = useState([])
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const [result, setResult] = useState(null)
+
+  async function handleFile(f) {
+    if (!f) return
+    setFile(f); setErr(''); setResult(null)
+    try {
+      const text = await f.text()
+      const rows = parseStatementCsv(text)
+      setPreview(rows)
+      if (rows.length === 0) setErr('No valid rows found in file')
+    } catch (e) {
+      setErr(e.message || 'Could not read file')
+    }
+  }
+
+  async function run() {
+    if (preview.length === 0) { setErr('No rows to reconcile'); return }
+    setBusy(true); setErr(''); setResult(null)
+    try {
+      const summary = await reconcileStatement({
+        stationId: user.station_id,
+        provider,
+        userId: user.id,
+        rows: preview,
+        fileName: file?.name || null,
+      })
+      setResult(summary)
+    } catch (e) {
+      setErr(e.message || 'Reconciliation failed')
+    }
+    setBusy(false)
+  }
+
+  return (
+    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal modal-wide">
+        <h3>Reconcile Statement</h3>
+        <div className="modal-sub">
+          Upload an MTN or Airtel statement. Missing transactions will be inserted as
+          <strong> pending_claim</strong>.
+        </div>
+
+        <label>Provider</label>
+        <select value={provider} onChange={e => setProvider(e.target.value)} disabled={!!result}>
+          <option value="mtn">MTN MoMo</option>
+          <option value="airtel">Airtel Money</option>
+        </select>
+
+        <label>Statement file (.csv)</label>
+        <input
+          type="file"
+          accept=".csv,.txt"
+          onChange={e => handleFile(e.target.files?.[0])}
+          disabled={!!result}
+        />
+
+        {preview.length > 0 && !result && (
+          <>
+            <div className="section-title" style={{ padding: '16px 0 8px' }}>
+              Preview · {preview.length} rows
+            </div>
+            <div style={{ maxHeight: 220, overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: 10 }}>
+              <table className="drops-table" style={{ fontSize: 12 }}>
+                <thead>
+                  <tr><th>Txn ID</th><th>Amount</th><th>Time (EAT)</th></tr>
+                </thead>
+                <tbody>
+                  {preview.slice(0, 50).map((r, i) => (
+                    <tr key={i}>
+                      <td><span className="code-pill" style={{ fontSize: 11 }}>{r.txn_id}</span></td>
+                      <td>UGX {Number(r.amount).toLocaleString()}</td>
+                      <td>
+                        {new Date(r.received_at).toLocaleString('en-GB', {
+                          timeZone: 'Africa/Kampala', hour12: false,
+                        })}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {preview.length > 50 && (
+              <div style={{ fontSize: 12, color: '#8ba0b9', paddingTop: 6 }}>
+                Showing first 50 of {preview.length}
+              </div>
+            )}
+          </>
+        )}
+
+        {result && (
+          <div style={{ marginTop: 18 }}>
+            <div className="section-title" style={{ paddingBottom: 10 }}>Reconciliation result</div>
+            <div className="result-row">
+              <span className="lbl">Statement rows</span>
+              <span className="val">{result.total_rows}</span>
+            </div>
+            <div className="result-row">
+              <span className="lbl">Already in portal (matched)</span>
+              <span className="val" style={{ color: '#10b981' }}>{result.matched_count}</span>
+            </div>
+            <div className="result-row">
+              <span className="lbl">Inserted as pending_claim</span>
+              <span className="val" style={{ color: '#2563eb' }}>+{result.inserted_count}</span>
+            </div>
+            <div className="result-row">
+              <span className="lbl">Portal-only (not in statement)</span>
+              <span className="val" style={{ color: '#f59e0b' }}>{result.portal_only_count}</span>
+            </div>
+            {result.insertError && (
+              <div className="auth-err" style={{ marginTop: 12 }}>
+                Insert error: {result.insertError}
+              </div>
+            )}
+          </div>
+        )}
+
+        {err && <div className="auth-err" style={{ marginTop: 12 }}>{err}</div>}
+
+        <div className="modal-actions">
+          <button className="btn-ghost-full" onClick={onClose}>
+            {result ? 'Close' : 'Cancel'}
+          </button>
+          {!result && (
+            <button
+              className="btn-primary-full"
+              onClick={run}
+              disabled={busy || preview.length === 0}
+            >
+              {busy ? 'Reconciling…' : `Reconcile ${preview.length} rows`}
+            </button>
+          )}
+          {result && (
+            <button className="btn-primary-full" onClick={onDone}>
+              <i className="fas fa-check" /> Done
+            </button>
+          )}
         </div>
       </div>
     </div>

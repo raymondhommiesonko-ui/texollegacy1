@@ -8,12 +8,15 @@ export default function TransactionPopup({ txn, onClose, onClaimed }) {
   const [success, setSuccess] = useState(false)
   const [color, setColor] = useState(null)
   const [seconds, setSeconds] = useState(30)
+  const timeoutRef = useRef(null)
   const inputRef = useRef(null)
 
+  // Focus the input on mount
   useEffect(() => {
     if (inputRef.current) inputRef.current.focus()
   }, [])
 
+  // Countdown timer — auto-close after 30s
   useEffect(() => {
     if (success) return
     const t = setInterval(() => {
@@ -29,6 +32,7 @@ export default function TransactionPopup({ txn, onClose, onClaimed }) {
     return () => clearInterval(t)
   }, [success])
 
+  // Handle number pad press
   function press(digit) {
     if (busy || success) return
     setErr('')
@@ -36,6 +40,7 @@ export default function TransactionPopup({ txn, onClose, onClaimed }) {
     const next = code + digit
     setCode(next)
     if (next.length === 2) {
+      // Auto-submit on 2nd digit
       setTimeout(() => submit(next), 150)
     }
   }
@@ -62,6 +67,7 @@ export default function TransactionPopup({ txn, onClose, onClaimed }) {
         setBusy(false)
         return
       }
+      // Success
       setColor(data.color)
       setSuccess(true)
       setTimeout(() => {
@@ -86,17 +92,22 @@ export default function TransactionPopup({ txn, onClose, onClaimed }) {
       >
         {!success ? (
           <>
+            {/* HEADER */}
             <div className="txn-popup-header">
               <div className="txn-badge" style={{ background: providerColor }}>
                 {providerLabel}
               </div>
-              <div className="txn-countdown">{seconds}</div>
+              <div className="txn-countdown">
+                <div className="ring">{seconds}</div>
+              </div>
             </div>
 
+            {/* AMOUNT */}
             <div className="txn-amount">
               UGX {Number(txn.amount).toLocaleString()}
             </div>
 
+            {/* TXN INFO */}
             <div className="txn-info">
               <div className="row">
                 <span className="lbl">Transaction ID</span>
@@ -122,6 +133,7 @@ export default function TransactionPopup({ txn, onClose, onClaimed }) {
               )}
             </div>
 
+            {/* CODE INPUT */}
             <div className="txn-code-display">
               <input
                 ref={inputRef}
@@ -136,6 +148,7 @@ export default function TransactionPopup({ txn, onClose, onClaimed }) {
 
             {err && <div className="txn-error">{err}</div>}
 
+            {/* NUMBER PAD */}
             <div className="txn-numpad">
               {[1,2,3,4,5,6,7,8,9].map(n => (
                 <button key={n} onClick={() => press(String(n))} className="numpad-key">
@@ -157,7 +170,9 @@ export default function TransactionPopup({ txn, onClose, onClaimed }) {
           </>
         ) : (
           <div className="txn-success">
-            <div className="big-tick" style={{ background: color || '#10b981' }}>✓</div>
+            <div className="big-tick" style={{ background: color || '#10b981' }}>
+              ✓
+            </div>
             <div className="success-title">Claimed!</div>
             <div className="success-sub">
               UGX {Number(txn.amount).toLocaleString()} · Txn {txn.txn_id}
