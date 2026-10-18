@@ -7,15 +7,12 @@ export default function FuelCards({ profile }) {
   const user = profile.user
   const role = user.role
 
-  // Permissions
   const isManager = role === 'manager' || role === 'admin'
   const isSupervisor = role === 'supervisor'
   const isAmbassador = role === 'ambassador'
-  const isAttendant = role === 'attendant'
 
   const canUpload = isManager || isSupervisor || isAmbassador
-  const canDownload = isManager || isSupervisor // Attendants can't download
-  const canClaim = true // Everyone can claim app users
+  const canDownload = isManager || isSupervisor
 
   const [tab, setTab] = useState('overview')
   const [loading, setLoading] = useState(true)
@@ -29,6 +26,7 @@ export default function FuelCards({ profile }) {
 
   const [salesRows, setSalesRows] = useState([])
   const [topupRows, setTopupRows] = useState([])
+  const [appUserTxns, setAppUserTxns] = useState([])
   const [uploads, setUploads] = useState([])
 
   async function loadAll() {
@@ -45,27 +43,35 @@ export default function FuelCards({ profile }) {
       const fromISO = range.from + 'T00:00:00'
       const toISO = range.to + 'T23:59:59'
 
-      // Load Sales
-      const { data: s, error: sErr } = await supabase
+      // 1. Sales Data
+      const { data: s } = await supabase
         .from('card_sales')
         .select('*')
         .eq('station_id', user.station_id)
         .gte('txn_at', fromISO)
         .lte('txn_at', toISO)
-      if (sErr) throw sErr
       setSalesRows(s || [])
 
-      // Load Topups
-      const { data: t, error: tErr } = await supabase
+      // 2. Topups Data
+      const { data: t } = await supabase
         .from('card_topups')
         .select('*')
         .eq('station_id', user.station_id)
         .gte('txn_at', fromISO)
         .lte('txn_at', toISO)
-      if (tErr) throw tErr
       setTopupRows(t || [])
 
-      // Load Upload History
+      // 3. App Users Data (from transactions)
+      const { data: txns } = await supabase
+        .from('transactions')
+        .select('*')
+        .eq('station_id', user.station_id)
+        .eq('provider', 'card')
+        .gte('received_at', fromISO)
+        .lte('received_at', toISO)
+      setAppUserTxns(txns || [])
+
+      // 4. Upload History
       const { data: u } = await supabase
         .from('card_uploads')
         .select('*')
@@ -83,7 +89,7 @@ export default function FuelCards({ profile }) {
 
   useEffect(() => { loadAll() }, [user?.station_id, range.from, range.to])
 
-  // ---- Totals Calculation ----
+  // ---- CALCULATIONS ----
   const totals = useMemo(() => {
     let cardsSet = new Set()
     let totalLiters = 0
@@ -91,28 +97,19 @@ export default function FuelCards({ profile }) {
     let bigTopupsCount = 0
     let totalTopupsAmount = 0
 
-    // Process Sales
     salesRows.forEach(r => {
       if (r.card_number) cardsSet.add(r.card_number)
-      
-      // Add Liters (if PMS or AGO)
-      const prod = String(r.product || '').toUpperCase()
-      if (prod === 'PMS' || prod === 'AGO') {
-        totalLiters += Number(r.quantity || 0)
-      }
-
-      // Add Card Sales Amount
-      if (String(r.payment_method || '').toLowerCase() === 'card') {
-        totalSalesAmount += Number(r.amount || 0)
-      }
+      if (r.quantity) totalLiters += Number(r.quantity)
+      if (r.amount) totalSalesAmount += Number(r.amount)
     })
 
-    // Process Topups
     topupRows.forEach(r => {
       const amt = Number(r.amount || 0)
       totalTopupsAmount += amt
       if (amt >= 100000) bigTopupsCount++
     })
+
+    const difference = totalSalesAmount - totalTopupsAmount
 
     return {
       cardsWorked: cardsSet.size,
@@ -120,36 +117,33 @@ export default function FuelCards({ profile }) {
       totalSalesAmount,
       bigTopupsCount,
       totalTopupsAmount,
+      difference
     }
   }, [salesRows, topupRows])
 
-  // ---- Per-Staff Calculation ----
+  // ---- STAFF BREAKDOWN ----
   const staffMap = useMemo(() => {
     const map = {}
 
-    // Aggregate Sales
+    // Aggregate Sales by Staff (Ignoring App Users for this breakdown)
     salesRows.forEach(r => {
+      const isAppUser = String(r.transaction_type || '').toLowerCase().includes('app user') || 
+                        String(r.staff_name || '').toLowerCase() === 'app user'
+      
+      if (isAppUser) return // Skip app users here, they are handled in the App Users tab
+
       const name = r.staff_name || 'Unknown'
-      if (!map[name]) map[name] = { name, cards: new Set(), sales: 0, topups: 0, liters: 0, appUsers: 0 }
+      if (!map[name]) map[name] = { name, cards: new Set(), sales: 0, topups: 0, liters: 0 }
       
       if (r.card_number) map[name].cards.add(r.card_number)
-      const prod = String(r.product || '').toUpperCase()
-      if (prod === 'PMS' || prod === 'AGO') map[name].liters += Number(r.quantity || 0)
-      
-      if (String(r.payment_method || '').toLowerCase() === 'card') {
-        map[name].sales += Number(r.amount || 0)
-      }
-
-      // Track App Users specifically
-      if (String(r.transaction_type || '').toLowerCase().includes('app user')) {
-        map[name].appUsers++
-      }
+      if (r.quantity) map[name].liters += Number(r.quantity)
+      if (r.amount) map[name].sales += Number(r.amount)
     })
 
-    // Aggregate Topups
+    // Aggregate Topups by Staff
     topupRows.forEach(r => {
       const name = r.staff_name || 'Unknown'
-      if (!map[name]) map[name] = { name, cards: new Set(), sales: 0, topups: 0, liters: 0, appUsers: 0 }
+      if (!map[name]) map[name] = { name, cards: new Set(), sales: 0, topups: 0, liters: 0 }
       map[name].topups += Number(r.amount || 0)
     })
 
@@ -190,12 +184,16 @@ export default function FuelCards({ profile }) {
         <button className="btn-ghost btn-sm" onClick={() => setRange({ from: todayEAT(), to: todayEAT() })}>Today</button>
       </div>
 
-      {/* TOTALS CARDS */}
       <div className="dashboard-grid">
-        <Stat label="Cards Worked" value={totals.cardsWorked} sub="Distinct cards" />
-        <Stat label="Total Liters Sold" value={`${totals.totalLiters.toLocaleString()} L`} sub="PMS + AGO" />
-        <Stat label="Card Sales" value={`UGX ${totals.totalSalesAmount.toLocaleString()}`} sub="Total value" />
+        <Stat label="Cards Worked" value={totals.cardsWorked} sub="From sales report" />
+        <Stat label="Total Liters" value={`${totals.totalLiters.toLocaleString()} L`} sub="PMS + AGO" />
         <Stat label="Top-ups ≥100k" value={totals.bigTopupsCount} sub={`Total: UGX ${totals.totalTopupsAmount.toLocaleString()}`} />
+        <Stat 
+          label="Difference" 
+          value={`UGX ${totals.difference.toLocaleString()}`} 
+          sub="Sales minus Top-ups" 
+          valueColor={totals.difference < 0 ? 'var(--red)' : 'var(--green)'}
+        />
       </div>
 
       <div className="tabs" style={{ paddingTop: 0 }}>
@@ -224,10 +222,9 @@ export default function FuelCards({ profile }) {
                 <tr>
                   <th>Staff</th>
                   <th>Cards Worked</th>
-                  <th>Sales Amount</th>
-                  <th>Top-ups Amount</th>
-                  <th>Total Liters</th>
-                  <th>App Users</th>
+                  <th>Sales (L)</th>
+                  <th>Top-ups (F)</th>
+                  <th>Total Liters (H)</th>
                 </tr>
               </thead>
               <tbody>
@@ -238,7 +235,6 @@ export default function FuelCards({ profile }) {
                     <td>UGX {s.sales.toLocaleString()}</td>
                     <td>UGX {s.topups.toLocaleString()}</td>
                     <td>{s.liters.toLocaleString()} L</td>
-                    <td>{s.appUsers > 0 ? <span className="pill blue">{s.appUsers}</span> : '—'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -246,7 +242,7 @@ export default function FuelCards({ profile }) {
           </div>
         )
       ) : tab === 'app-users' ? (
-        <AppUsersPanel profile={profile} salesRows={salesRows} canClaim={canClaim} canDownload={canDownload} />
+        <AppUsersPanel appUserTxns={appUserTxns} canDownload={canDownload} onRefresh={loadAll} profile={profile} />
       ) : (
         uploads.length === 0 ? (
           <div className="drops-empty"><i className="fas fa-file-upload" /><h4>No uploads yet</h4></div>
@@ -291,26 +287,35 @@ export default function FuelCards({ profile }) {
 }
 
 /* ============================================================
-   APP USERS PANEL
+   APP USERS PANEL (Claimable)
    ============================================================ */
-function AppUsersPanel({ profile, salesRows, canClaim, canDownload }) {
+function AppUsersPanel({ profile, appUserTxns, canDownload, onRefresh }) {
+  const [claiming, setClaiming] = useState(null)
   const user = profile.user
-  // Filter for rows where Transaction By = 'App User'
-  const appUsers = salesRows.filter(r => 
-    String(r.transaction_type || '').toLowerCase().includes('app user') || 
-    String(r.staff_name || '').toLowerCase() === 'app user'
-  )
+  
+  const unclaimed = appUserTxns.filter(r => r.status === 'unclaimed')
+  const claimed = appUserTxns.filter(r => r.status === 'claimed')
 
-  const unclaimed = appUsers.filter(r => r.status === 'unclaimed' || r.status === 'pending_claim')
-  const claimed = appUsers.filter(r => r.status === 'claimed')
-
-  // Since these are read from the `card_sales` table, they are already reconciled.
-  // We just display them and allow claiming.
+  async function claimTxn(txnId) {
+    setClaiming(txnId)
+    const { error } = await supabase
+      .from('transactions')
+      .update({ 
+        status: 'claimed', 
+        claimed_by: user.id,
+        claimed_at: new Date().toISOString()
+      })
+      .eq('id', txnId)
+    
+    if (error) alert(error.message)
+    else await onRefresh()
+    setClaiming(null)
+  }
 
   return (
     <div>
       <div className="dashboard-grid" style={{ paddingTop: 0 }}>
-        <Stat label="Total App Users" value={appUsers.length} sub="From sales report" />
+        <Stat label="Total App Users" value={appUserTxns.length} sub="From sales report" />
         <Stat label="Claimed" value={claimed.length} sub="Reconciled" />
         <Stat label="Unclaimed" value={unclaimed.length} sub="Waiting to be claimed" />
       </div>
@@ -319,7 +324,7 @@ function AppUsersPanel({ profile, salesRows, canClaim, canDownload }) {
         <div style={{ display: 'flex', justifyContent: 'space-between', padding: '0 32px 12px' }}>
           <h3 style={{ margin: 0, fontSize: 16 }}>App User Transactions</h3>
           {canDownload && (
-            <button className="btn-ghost btn-sm" onClick={() => exportAppUsersCSV(appUsers)}>
+            <button className="btn-ghost btn-sm" onClick={() => exportAppUsersCSV(appUserTxns)}>
               <i className="fas fa-file-csv" /> Download List
             </button>
           )}
@@ -331,29 +336,33 @@ function AppUsersPanel({ profile, salesRows, canClaim, canDownload }) {
               <th>Time</th>
               <th>Txn ID</th>
               <th>Card No</th>
-              <th>Customer</th>
               <th>Amount</th>
               <th>Status</th>
+              <th>Claimed By</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
-            {appUsers.length === 0 ? (
+            {appUserTxns.length === 0 ? (
               <tr><td colSpan={7} style={{ textAlign: 'center', padding: 20 }}>No app user transactions found.</td></tr>
-            ) : appUsers.map(r => (
-              <tr key={r.txn_id}>
-                <td>{timeEAT(r.txn_at)}</td>
+            ) : appUserTxns.map(r => (
+              <tr key={r.id}>
+                <td>{timeEAT(r.received_at)}</td>
                 <td><span className="code-pill">{r.txn_id}</span></td>
-                <td><span className="code-pill" style={{ fontSize: 11 }}>{r.card_number}</span></td>
-                <td>{r.customer_name}</td>
+                <td><span className="code-pill" style={{ fontSize: 11 }}>{r.card_number || '—'}</span></td>
                 <td style={{ fontWeight: 700 }}>UGX {Number(r.amount).toLocaleString()}</td>
                 <td>
-                  <span className={`pill ${r.status === 'claimed' ? 'green' : 'amber'}`}>{r.status || 'unclaimed'}</span>
+                  <span className={`pill ${r.status === 'claimed' ? 'green' : 'amber'}`}>{r.status}</span>
                 </td>
+                <td>{r.status === 'claimed' ? (r.claimed_by === user.id ? 'You' : 'Other') : '—'}</td>
                 <td>
-                  {canClaim && (r.status === 'unclaimed' || r.status === 'pending_claim') && (
-                    <button className="btn-tiny success" onClick={() => alert('Claim logic goes here')}>
-                      <i className="fas fa-hand-paper" /> Claim
+                  {r.status === 'unclaimed' && (
+                    <button 
+                      className="btn-tiny success" 
+                      onClick={() => claimTxn(r.id)}
+                      disabled={claiming === r.id}
+                    >
+                      <i className="fas fa-hand-paper" /> {claiming === r.id ? 'Claiming…' : 'Claim'}
                     </button>
                   )}
                 </td>
@@ -367,8 +376,8 @@ function AppUsersPanel({ profile, salesRows, canClaim, canDownload }) {
 }
 
 function exportAppUsersCSV(rows) {
-  const header = 'Date,Txn ID,Card Number,Customer,Amount,Status\n'
-  const body = rows.map(r => `${r.txn_at},${r.txn_id},${r.card_number},${r.customer_name},${r.amount},${r.status}`).join('\n')
+  const header = 'Date,Txn ID,Card Number,Amount,Status\n'
+  const body = rows.map(r => `${r.received_at},${r.txn_id},${r.card_number},${r.amount},${r.status}`).join('\n')
   const blob = new Blob([header + body], { type: 'text/csv' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
@@ -379,7 +388,7 @@ function exportAppUsersCSV(rows) {
 }
 
 /* ============================================================
-   UPLOAD MODAL — handles Google Sheets & Excel
+   UPLOAD MODAL
    ============================================================ */
 function UploadModal({ profile, fileType, onClose, onSaved }) {
   const user = profile.user
@@ -395,8 +404,6 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
       const buf = await f.arrayBuffer()
       const wb = XLSX.read(buf)
       const sheet = wb.Sheets[wb.SheetNames[0]]
-      
-      // Convert to JSON with headers
       const rawJson = XLSX.utils.sheet_to_json(sheet, { defval: '' })
       
       if (rawJson.length === 0) { setErr('File has no data rows'); return }
@@ -419,7 +426,6 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
             transaction_type: String(r['Transaction Type'] || ''),
             staff_name: String(r['Transaction By'] || ''),
             narrative: String(r['Narrative'] || ''),
-            status: 'unclaimed', // Default for app users if needed
           }
         } else {
           return {
@@ -458,7 +464,6 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
 
   function parseDate(v) {
     if (v == null || v === '') return null
-    // Handle Excel serial date numbers
     if (typeof v === 'number') {
       try {
         const d = XLSX.SSF.parse_date_code(v)
@@ -466,7 +471,6 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
       } catch {}
       return null
     }
-    // Handle string dates from Google Sheets / CSV
     const s = String(v).trim()
     if (!s) return null
     const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{1,2})/)
@@ -489,7 +493,6 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
       const dateFrom = dates[0]?.slice(0, 10)
       const dateTo = dates[dates.length-1]?.slice(0, 10)
 
-      // 1. Create Upload Log
       const { data: up, error: uErr } = await supabase
         .from('card_uploads')
         .insert({
@@ -505,13 +508,35 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
         .single()
       if (uErr) throw uErr
 
-      // 2. Insert Rows in Batches
       const table = fileType === 'sales' ? 'card_sales' : 'card_topups'
       for (let i = 0; i < rows.length; i += 200) {
         const batch = rows.slice(i, i + 200).map(r => ({ ...r, upload_id: up.id, station_id: user.station_id }))
         const { error: bErr } = await supabase.from(table).insert(batch)
         if (bErr) throw bErr
       }
+
+      // Push App Users to Transactions
+      if (fileType === 'sales') {
+        const appUsers = rows.filter(r => 
+          String(r.transaction_type || '').toLowerCase().includes('app user') || 
+          String(r.staff_name || '').toLowerCase() === 'app user'
+        )
+        
+        if (appUsers.length > 0) {
+          const txnBatch = appUsers.map(r => ({
+            station_id: user.station_id,
+            provider: 'card',
+            txn_id: r.txn_id,
+            amount: r.amount,
+            card_number: r.card_number,
+            received_at: r.txn_at,
+            status: 'unclaimed',
+            source: 'reconcile'
+          }))
+          await supabase.from('transactions').insert(txnBatch)
+        }
+      }
+
       onSaved()
     } catch (e) {
       console.error(e)
@@ -562,11 +587,11 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
   )
 }
 
-function Stat({ label, value, sub }) {
+function Stat({ label, value, sub, valueColor }) {
   return (
     <div className="stat-card">
       <div className="stat-title">{label}</div>
-      <div className="stat-value">{value}</div>
+      <div className="stat-value" style={valueColor ? { color: valueColor } : undefined}>{value}</div>
       {sub && <div className="stat-sub">{sub}</div>}
     </div>
   )
