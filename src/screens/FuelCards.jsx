@@ -42,7 +42,7 @@ export default function FuelCards({ profile }) {
       const fromISO = range.from + 'T00:00:00'
       const toISO = range.to + 'T23:59:59'
 
-      // 1. Sales
+      // 1. Fetch Sales
       const { data: s } = await supabase
         .from('card_sales')
         .select('*')
@@ -51,7 +51,7 @@ export default function FuelCards({ profile }) {
         .lte('txn_at', toISO)
       setSalesRows(s || [])
 
-      // 2. Top-ups
+      // 2. Fetch Top-ups
       const { data: t } = await supabase
         .from('card_topups')
         .select('*')
@@ -60,7 +60,7 @@ export default function FuelCards({ profile }) {
         .lte('txn_at', toISO)
       setTopupRows(t || [])
 
-      // 3. Uploads history
+      // 3. Fetch Uploads
       const { data: u } = await supabase
         .from('card_uploads')
         .select('*')
@@ -69,39 +69,40 @@ export default function FuelCards({ profile }) {
         .limit(30)
       setUploads(u || [])
 
-      // 4. App Users (Removed the FK join so it doesn't fail if FK is missing)
-      const { data: au, error: auErr } = await supabase
+      // 4. Fetch App Users (Try table first)
+      const { data: au } = await supabase
         .from('app_users')
         .select('*')
         .eq('station_id', user.station_id)
         .order('created_at', { ascending: false })
 
-      if (auErr) console.error("Error loading app_users:", auErr)
-
-      // FALLBACK: If app_users table is empty, pull them directly from card_sales
       let finalAppUsers = au || []
+
+      // FALLBACK: If app_users is empty, pull straight from card_sales
       if (finalAppUsers.length === 0) {
+        // Get ALL app users for this station, ignoring date filters
         const { data: fromSales } = await supabase
           .from('card_sales')
-          .select('txn_id, card_number, customer_name')
+          .select('txn_id, card_number, customer_name, staff_name')
           .eq('station_id', user.station_id)
-          .ilike('staff_name', '%app user%')
         
         if (fromSales && fromSales.length > 0) {
-          // Map them to look like app_users
-          finalAppUsers = fromSales.map(s => ({
-            id: s.txn_id, // temp id
-            txn_id: s.txn_id,
-            card_number: s.card_number,
-            customer_name: s.customer_name,
-            claimed_by: null,
-            is_fallback: true
-          }))
+          const extracted = fromSales
+            .filter(r => String(r.staff_name).replace(/\s+/g, '').toLowerCase().includes('appuser'))
+            .map(s => ({
+              id: s.txn_id, // temp id
+              txn_id: s.txn_id,
+              card_number: s.card_number,
+              customer_name: s.customer_name,
+              claimed_by: null,
+              is_fallback: true
+            }))
+          finalAppUsers = extracted
         }
       }
       setAppUsers(finalAppUsers)
 
-      // 5. Staff codes
+      // 5. Fetch Staff Codes
       const { data: codes } = await supabase
         .from('staff_codes')
         .select('user_id, code, color')
@@ -157,6 +158,7 @@ export default function FuelCards({ profile }) {
   const staffPerformance = useMemo(() => {
     const map = {}
     
+    // Bulletproof App User checker
     const isAppUser = (name) => String(name || '').replace(/\s+/g, '').toLowerCase().includes('appuser')
 
     salesRows.forEach(r => {
@@ -373,7 +375,7 @@ function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }
               const codeObj = isClaimed ? staffCodes[u.claimed_by] : null
               
               return (
-                <tr key={u.id}>
+                <tr key={u.txn_id}>
                   <td><span className="code-pill">{u.txn_id}</span></td>
                   <td>{u.customer_name}</td>
                   <td>{u.card_number}</td>
@@ -433,14 +435,14 @@ function ClaimAppUserModal({ appUser, profile, onClose, onSaved }) {
 
     if (!sc) { setErr('Invalid code'); setBusy(false); return }
 
-    // If it's a fallback from card_sales, we need to actually insert it into app_users first
     if (appUser.is_fallback) {
+      // Insert it into app_users if it's from the fallback
       await supabase.from('app_users').insert({
         station_id: profile.user.station_id,
         txn_id: appUser.txn_id,
         card_number: appUser.card_number,
         customer_name: appUser.customer_name
-      })
+      }).select() // ignore error if already exists
     }
 
     const { error } = await supabase.from('app_users').update({
