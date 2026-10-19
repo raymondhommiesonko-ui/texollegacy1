@@ -1,18 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
 import * as XLSX from 'xlsx'
 import { supabase } from '../supabase'
-import { timeEAT, todayEAT } from '../lib/time'
+import { todayEAT } from '../lib/time'
 
 export default function FuelCards({ profile }) {
   const user = profile.user
-  const role = user.role
-
-  const isManager = role === 'manager' || role === 'admin'
-  const isSupervisor = role === 'supervisor'
-  const isAmbassador = role === 'ambassador'
-
-  const canUpload = isManager || isSupervisor || isAmbassador
-  const canDownload = isManager || isSupervisor
+  const powers = profile.powers || {}
+  const role = user?.role || 'attendant'
+  
+  const isManager = ['admin', 'manager', 'supervisor'].includes(role)
+  const canUpload = isManager || role === 'ambassador' || powers.upload_fuelcards
+  const canDownload = isManager || powers.export_performance
 
   const [tab, setTab] = useState('overview')
   const [loading, setLoading] = useState(true)
@@ -26,7 +24,8 @@ export default function FuelCards({ profile }) {
 
   const [salesRows, setSalesRows] = useState([])
   const [topupRows, setTopupRows] = useState([])
-  const [appUserTxns, setAppUserTxns] = useState([])
+  const [appUsers, setAppUsers] = useState([])
+  const [staffCodes, setStaffCodes] = useState({})
   const [uploads, setUploads] = useState([])
 
   async function loadAll() {
@@ -34,7 +33,7 @@ export default function FuelCards({ profile }) {
     setErrorMsg('')
 
     if (!user?.station_id) {
-      setErrorMsg('No station assigned to your account.')
+      setErrorMsg('No station assigned.')
       setLoading(false)
       return
     }
@@ -43,7 +42,7 @@ export default function FuelCards({ profile }) {
       const fromISO = range.from + 'T00:00:00'
       const toISO = range.to + 'T23:59:59'
 
-      // 1. Sales Data
+      // 1. Sales
       const { data: s } = await supabase
         .from('card_sales')
         .select('*')
@@ -52,7 +51,7 @@ export default function FuelCards({ profile }) {
         .lte('txn_at', toISO)
       setSalesRows(s || [])
 
-      // 2. Topups Data
+      // 2. Top-ups
       const { data: t } = await supabase
         .from('card_topups')
         .select('*')
@@ -61,17 +60,7 @@ export default function FuelCards({ profile }) {
         .lte('txn_at', toISO)
       setTopupRows(t || [])
 
-      // 3. App Users Data (from transactions)
-      const { data: txns } = await supabase
-        .from('transactions')
-        .select('*')
-        .eq('station_id', user.station_id)
-        .eq('provider', 'card')
-        .gte('received_at', fromISO)
-        .lte('received_at', toISO)
-      setAppUserTxns(txns || [])
-
-      // 4. Upload History
+      // 3. Uploads history
       const { data: u } = await supabase
         .from('card_uploads')
         .select('*')
@@ -79,97 +68,142 @@ export default function FuelCards({ profile }) {
         .order('uploaded_at', { ascending: false })
         .limit(30)
       setUploads(u || [])
+
+      // 4. App Users (Removed the FK join so it doesn't fail if FK is missing)
+      const { data: au, error: auErr } = await supabase
+        .from('app_users')
+        .select('*')
+        .eq('station_id', user.station_id)
+        .order('created_at', { ascending: false })
+
+      if (auErr) console.error("Error loading app_users:", auErr)
+
+      // FALLBACK: If app_users table is empty, pull them directly from card_sales
+      let finalAppUsers = au || []
+      if (finalAppUsers.length === 0) {
+        const { data: fromSales } = await supabase
+          .from('card_sales')
+          .select('txn_id, card_number, customer_name')
+          .eq('station_id', user.station_id)
+          .ilike('staff_name', '%app user%')
+        
+        if (fromSales && fromSales.length > 0) {
+          // Map them to look like app_users
+          finalAppUsers = fromSales.map(s => ({
+            id: s.txn_id, // temp id
+            txn_id: s.txn_id,
+            card_number: s.card_number,
+            customer_name: s.customer_name,
+            claimed_by: null,
+            is_fallback: true
+          }))
+        }
+      }
+      setAppUsers(finalAppUsers)
+
+      // 5. Staff codes
+      const { data: codes } = await supabase
+        .from('staff_codes')
+        .select('user_id, code, color')
+        .eq('station_id', user.station_id)
+      
+      const { data: staff } = await supabase
+        .from('users')
+        .select('id, name')
+        .eq('station_id', user.station_id)
+      
+      const userMap = {}
+      ;(staff || []).forEach(u => userMap[u.id] = u.name)
+      
+      const codeMap = {}
+      ;(codes || []).forEach(c => {
+        codeMap[c.user_id] = {
+          name: userMap[c.user_id] || '—',
+          code: c.code,
+          color: c.color
+        }
+      })
+      setStaffCodes(codeMap)
+
     } catch (e) {
-      console.error('Load error:', e)
+      console.error(e)
       setErrorMsg(e.message || 'Could not load data')
     }
-
     setLoading(false)
   }
 
   useEffect(() => { loadAll() }, [user?.station_id, range.from, range.to])
 
-  // ---- CALCULATIONS ----
-  const totals = useMemo(() => {
-    let cardsSet = new Set()
+  const stats = useMemo(() => {
     let totalLiters = 0
-    let totalSalesAmount = 0
-    let bigTopupsCount = 0
-    let totalTopupsAmount = 0
+    let totalSalesAmt = 0
+    let totalTopupAmt = 0
+    let bigTopups = 0
 
     salesRows.forEach(r => {
-      if (r.card_number) cardsSet.add(r.card_number)
-      if (r.quantity) totalLiters += Number(r.quantity)
-      if (r.amount) totalSalesAmount += Number(r.amount)
+      totalLiters += Number(r.quantity || 0)
+      totalSalesAmt += Number(r.original_amount || 0) 
     })
 
     topupRows.forEach(r => {
-      const amt = Number(r.amount || 0)
-      totalTopupsAmount += amt
-      if (amt >= 100000) bigTopupsCount++
+      const amt = Number(r.top_up_amount || 0) 
+      totalTopupAmt += amt
+      if (amt >= 100000) bigTopups++
     })
 
-    const difference = totalSalesAmount - totalTopupsAmount
-
-    return {
-      cardsWorked: cardsSet.size,
-      totalLiters,
-      totalSalesAmount,
-      bigTopupsCount,
-      totalTopupsAmount,
-      difference
-    }
+    return { totalLiters, totalSalesAmt, totalTopupAmt, bigTopups }
   }, [salesRows, topupRows])
 
-  // ---- STAFF BREAKDOWN ----
-  const staffMap = useMemo(() => {
+  const staffPerformance = useMemo(() => {
     const map = {}
+    
+    const isAppUser = (name) => String(name || '').replace(/\s+/g, '').toLowerCase().includes('appuser')
 
-    // Aggregate Sales by Staff (Ignoring App Users for this breakdown)
     salesRows.forEach(r => {
-      const isAppUser = String(r.transaction_type || '').toLowerCase().includes('app user') || 
-                        String(r.staff_name || '').toLowerCase() === 'app user'
-      
-      if (isAppUser) return // Skip app users here, they are handled in the App Users tab
+      const rawName = String(r.staff_name || '').trim()
+      if (isAppUser(rawName)) return 
 
-      const name = r.staff_name || 'Unknown'
-      if (!map[name]) map[name] = { name, cards: new Set(), sales: 0, topups: 0, liters: 0 }
+      const name = rawName || 'Unknown'
+      if (!map[name]) map[name] = { name, salesAmt: 0, liters: 0, topupAmt: 0, cards: new Set() }
       
+      map[name].salesAmt += Number(r.original_amount || 0)
+      map[name].liters += Number(r.quantity || 0)
       if (r.card_number) map[name].cards.add(r.card_number)
-      if (r.quantity) map[name].liters += Number(r.quantity)
-      if (r.amount) map[name].sales += Number(r.amount)
     })
 
-    // Aggregate Topups by Staff
     topupRows.forEach(r => {
-      const name = r.staff_name || 'Unknown'
-      if (!map[name]) map[name] = { name, cards: new Set(), sales: 0, topups: 0, liters: 0 }
-      map[name].topups += Number(r.amount || 0)
+      const rawName = String(r.staff_name || '').trim()
+      if (isAppUser(rawName)) return 
+
+      const name = rawName || 'Unknown'
+      if (!map[name]) map[name] = { name, salesAmt: 0, liters: 0, topupAmt: 0, cards: new Set() }
+      map[name].topupAmt += Number(r.top_up_amount || 0)
     })
 
     return Object.values(map).map(s => ({
       ...s,
-      cardsWorked: s.cards.size,
-    })).sort((a, b) => b.sales - a.sales)
+      cardsCount: s.cards.size,
+      difference: s.salesAmt - s.topupAmt
+    })).sort((a,b) => b.salesAmt - a.salesAmt)
   }, [salesRows, topupRows])
 
-  if (!user) return <div className="drops-empty"><i className="fas fa-user-slash" /><h4>Not signed in</h4></div>
+  if (!user) return <div className="drops-empty">Loading…</div>
 
   return (
     <div className="fuelcards-screen">
       <div className="fuelcards-head">
         <div>
           <h3>Fuel Cards</h3>
-          <div className="sub">Upload reports, track liters, and claim App Users</div>
+          <div className="sub">Sales, Top-ups, and App User claims</div>
         </div>
         <div className="fuelcards-actions">
           {canUpload && (
             <>
               <button className="btn-ghost" onClick={() => setOpenUpload('sales')}>
-                <i className="fas fa-upload" /> Upload Sales
+                <i className="fas fa-upload" /> Sales
               </button>
               <button className="btn-primary" onClick={() => setOpenUpload('topups')}>
-                <i className="fas fa-upload" /> Upload Top-ups
+                <i className="fas fa-upload" /> Top-ups
               </button>
             </>
           )}
@@ -185,93 +219,105 @@ export default function FuelCards({ profile }) {
       </div>
 
       <div className="dashboard-grid">
-        <Stat label="Cards Worked" value={totals.cardsWorked} sub="From sales report" />
-        <Stat label="Total Liters" value={`${totals.totalLiters.toLocaleString()} L`} sub="PMS + AGO" />
-        <Stat label="Top-ups ≥100k" value={totals.bigTopupsCount} sub={`Total: UGX ${totals.totalTopupsAmount.toLocaleString()}`} />
-        <Stat 
-          label="Difference" 
-          value={`UGX ${totals.difference.toLocaleString()}`} 
-          sub="Sales minus Top-ups" 
-          valueColor={totals.difference < 0 ? 'var(--red)' : 'var(--green)'}
-        />
+        <Stat label="Total Liters Sold" value={`${stats.totalLiters.toLocaleString()} L`} sub="From sales quantity" />
+        <Stat label="Total Sales Amount" value={`UGX ${stats.totalSalesAmt.toLocaleString()}`} sub="Original amount (Col L)" />
+        <Stat label="Total Top-ups" value={`UGX ${stats.totalTopupAmt.toLocaleString()}`} sub="Top-up amount (Col F)" />
+        <Stat label="Top-ups ≥100k" value={`${stats.bigTopups}`} sub="Qualifying top-ups" />
       </div>
 
-      <div className="tabs" style={{ paddingTop: 0 }}>
+      <div className="tabs" style={{ paddingTop: 0, overflowX: 'auto', whiteSpace: 'nowrap' }}>
         <button className={`tab ${tab === 'overview' ? 'active' : ''}`} onClick={() => setTab('overview')}>
+          <i className="fas fa-chart-bar" /> Daily
+        </button>
+        <button className={`tab ${tab === 'staff' ? 'active' : ''}`} onClick={() => setTab('staff')}>
           <i className="fas fa-user-tie" /> By Staff
         </button>
         <button className={`tab ${tab === 'app-users' ? 'active' : ''}`} onClick={() => setTab('app-users')}>
-          <i className="fas fa-mobile-alt" /> App Users
+          <i className="fas fa-mobile-alt" /> App Users (Claim)
         </button>
         <button className={`tab ${tab === 'uploads' ? 'active' : ''}`} onClick={() => setTab('uploads')}>
           <i className="fas fa-file-upload" /> Uploads
         </button>
       </div>
 
-      {errorMsg && <div className="auth-err" style={{ margin: '0 32px 20px' }}><i className="fas fa-exclamation-triangle" /> {errorMsg}</div>}
+      {errorMsg && <div className="auth-err" style={{ margin: '0 32px 20px' }}>{errorMsg}</div>}
 
       {loading ? (
         <div className="drops-empty">Loading…</div>
       ) : tab === 'overview' ? (
-        staffMap.length === 0 ? (
-          <div className="drops-empty"><i className="fas fa-users" /><h4>No staff activity</h4></div>
-        ) : (
-          <div className="drops-table-wrap">
-            <table className="drops-table">
-              <thead>
-                <tr>
-                  <th>Staff</th>
-                  <th>Cards Worked</th>
-                  <th>Sales (L)</th>
-                  <th>Top-ups (F)</th>
-                  <th>Total Liters (H)</th>
+        <div className="drops-empty">
+          <i className="fas fa-chart-pie" />
+          <h4>Daily breakdown</h4>
+          <p>Summary cards above reflect the selected date range.</p>
+        </div>
+      ) : tab === 'staff' ? (
+        <div className="drops-table-wrap">
+          <table className="drops-table">
+            <thead>
+              <tr>
+                <th>Staff</th>
+                <th>Sales Amount</th>
+                <th>Liters</th>
+                <th>Top-ups</th>
+                <th>Difference (Sales - Topups)</th>
+                <th>Cards Worked</th>
+              </tr>
+            </thead>
+            <tbody>
+              {staffPerformance.map(s => (
+                <tr key={s.name}>
+                  <td><strong>{s.name}</strong></td>
+                  <td>UGX {s.salesAmt.toLocaleString()}</td>
+                  <td>{s.liters.toLocaleString()} L</td>
+                  <td>UGX {s.topupAmt.toLocaleString()}</td>
+                  <td style={{ color: s.difference < 0 ? '#dc2626' : '#10b981', fontWeight: 700 }}>
+                    UGX {s.difference.toLocaleString()}
+                  </td>
+                  <td>{s.cardsCount}</td>
                 </tr>
-              </thead>
-              <tbody>
-                {staffMap.map(s => (
-                  <tr key={s.name}>
-                    <td><strong>{s.name}</strong></td>
-                    <td><span className="pill gold">{s.cardsWorked}</span></td>
-                    <td>UGX {s.sales.toLocaleString()}</td>
-                    <td>UGX {s.topups.toLocaleString()}</td>
-                    <td>{s.liters.toLocaleString()} L</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )
+              ))}
+              {staffPerformance.length === 0 && (
+                <tr><td colSpan="6" style={{ textAlign: 'center', padding: 20 }}>No staff activity in this range</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       ) : tab === 'app-users' ? (
-        <AppUsersPanel appUserTxns={appUserTxns} canDownload={canDownload} onRefresh={loadAll} profile={profile} />
+        <AppUsersTable 
+          appUsers={appUsers} 
+          staffCodes={staffCodes} 
+          profile={profile} 
+          onClaimed={loadAll} 
+          canDownload={canDownload}
+        />
       ) : (
-        uploads.length === 0 ? (
-          <div className="drops-empty"><i className="fas fa-file-upload" /><h4>No uploads yet</h4></div>
-        ) : (
-          <div className="drops-table-wrap">
-            <table className="drops-table">
-              <thead>
-                <tr>
-                  <th>Uploaded</th>
-                  <th>Type</th>
-                  <th>File</th>
-                  <th>Rows</th>
-                  <th>Range</th>
+        <div className="drops-table-wrap">
+          <table className="drops-table">
+            <thead>
+              <tr>
+                <th>Uploaded</th>
+                <th>Type</th>
+                <th>File</th>
+                <th>Rows</th>
+                <th>Range</th>
+              </tr>
+            </thead>
+            <tbody>
+              {uploads.map(u => (
+                <tr key={u.id}>
+                  <td>{new Date(u.uploaded_at).toLocaleString('en-GB', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' })}</td>
+                  <td><span className={`pill ${u.file_type === 'sales' ? 'blue' : 'green'}`}>{u.file_type}</span></td>
+                  <td>{u.file_name || '—'}</td>
+                  <td>{u.row_count}</td>
+                  <td>{u.date_from && u.date_to ? `${u.date_from} → ${u.date_to}` : '—'}</td>
                 </tr>
-              </thead>
-              <tbody>
-                {uploads.map(u => (
-                  <tr key={u.id}>
-                    <td>{new Date(u.uploaded_at).toLocaleString('en-GB')}</td>
-                    <td><span className={`pill ${u.file_type === 'sales' ? 'blue' : 'green'}`}>{u.file_type}</span></td>
-                    <td>{u.file_name || '—'}</td>
-                    <td>{u.row_count}</td>
-                    <td>{u.date_from && u.date_to ? `${u.date_from} → ${u.date_to}` : '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )
+              ))}
+              {uploads.length === 0 && (
+                <tr><td colSpan="5" style={{ textAlign: 'center', padding: 20 }}>No uploads yet</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       )}
 
       {openUpload && (
@@ -287,104 +333,150 @@ export default function FuelCards({ profile }) {
 }
 
 /* ============================================================
-   APP USERS PANEL (Claimable)
+   APP USERS TABLE
    ============================================================ */
-function AppUsersPanel({ profile, appUserTxns, canDownload, onRefresh }) {
-  const [claiming, setClaiming] = useState(null)
-  const user = profile.user
-  
-  const unclaimed = appUserTxns.filter(r => r.status === 'unclaimed')
-  const claimed = appUserTxns.filter(r => r.status === 'claimed')
+function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }) {
+  const [openClaim, setOpenClaim] = useState(null)
 
-  async function claimTxn(txnId) {
-    setClaiming(txnId)
-    const { error } = await supabase
-      .from('transactions')
-      .update({ 
-        status: 'claimed', 
-        claimed_by: user.id,
-        claimed_at: new Date().toISOString()
-      })
-      .eq('id', txnId)
-    
-    if (error) alert(error.message)
-    else await onRefresh()
-    setClaiming(null)
+  function download() {
+    const rows = appUsers.map(u => [
+      u.txn_id, u.customer_name, u.card_number, 
+      u.claimed_by ? staffCodes[u.claimed_by]?.name || 'Claimed' : 'Unclaimed'
+    ])
+    const csv = "Txn ID,Customer,Card,Status\n" + rows.map(r => r.join(',')).join('\n')
+    const blob = new Blob([csv], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a'); a.href = url; a.download = 'app-users.csv'; a.click()
   }
 
   return (
-    <div>
-      <div className="dashboard-grid" style={{ paddingTop: 0 }}>
-        <Stat label="Total App Users" value={appUserTxns.length} sub="From sales report" />
-        <Stat label="Claimed" value={claimed.length} sub="Reconciled" />
-        <Stat label="Unclaimed" value={unclaimed.length} sub="Waiting to be claimed" />
+    <>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '0 32px 10px' }}>
+        {canDownload && (
+          <button className="btn-ghost" onClick={download}><i className="fas fa-download" /> Download CSV</button>
+        )}
       </div>
-
       <div className="drops-table-wrap">
-        <div style={{ display: 'flex', justifyContent: 'space-between', padding: '0 32px 12px' }}>
-          <h3 style={{ margin: 0, fontSize: 16 }}>App User Transactions</h3>
-          {canDownload && (
-            <button className="btn-ghost btn-sm" onClick={() => exportAppUsersCSV(appUserTxns)}>
-              <i className="fas fa-file-csv" /> Download List
-            </button>
-          )}
-        </div>
-        
         <table className="drops-table">
           <thead>
             <tr>
-              <th>Time</th>
               <th>Txn ID</th>
-              <th>Card No</th>
-              <th>Amount</th>
-              <th>Status</th>
+              <th>Customer</th>
+              <th>Card Number</th>
               <th>Claimed By</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
-            {appUserTxns.length === 0 ? (
-              <tr><td colSpan={7} style={{ textAlign: 'center', padding: 20 }}>No app user transactions found.</td></tr>
-            ) : appUserTxns.map(r => (
-              <tr key={r.id}>
-                <td>{timeEAT(r.received_at)}</td>
-                <td><span className="code-pill">{r.txn_id}</span></td>
-                <td><span className="code-pill" style={{ fontSize: 11 }}>{r.card_number || '—'}</span></td>
-                <td style={{ fontWeight: 700 }}>UGX {Number(r.amount).toLocaleString()}</td>
-                <td>
-                  <span className={`pill ${r.status === 'claimed' ? 'green' : 'amber'}`}>{r.status}</span>
-                </td>
-                <td>{r.status === 'claimed' ? (r.claimed_by === user.id ? 'You' : 'Other') : '—'}</td>
-                <td>
-                  {r.status === 'unclaimed' && (
-                    <button 
-                      className="btn-tiny success" 
-                      onClick={() => claimTxn(r.id)}
-                      disabled={claiming === r.id}
-                    >
-                      <i className="fas fa-hand-paper" /> {claiming === r.id ? 'Claiming…' : 'Claim'}
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
+            {appUsers.map(u => {
+              const isClaimed = !!u.claimed_by
+              const codeObj = isClaimed ? staffCodes[u.claimed_by] : null
+              
+              return (
+                <tr key={u.id}>
+                  <td><span className="code-pill">{u.txn_id}</span></td>
+                  <td>{u.customer_name}</td>
+                  <td>{u.card_number}</td>
+                  <td>
+                    {isClaimed ? (
+                      <span style={{ color: codeObj?.color || '#000', fontWeight: 700 }}>
+                        {codeObj?.name || 'Staff'} ({codeObj?.code || '—'})
+                      </span>
+                    ) : (
+                      <span className="pill amber">Unclaimed</span>
+                    )}
+                  </td>
+                  <td>
+                    {!isClaimed && (
+                      <button className="btn-tiny success" onClick={() => setOpenClaim(u)}>
+                        <i className="fas fa-hand-paper" /> Claim
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              )
+            })}
+            {appUsers.length === 0 && (
+              <tr><td colSpan="5" style={{ textAlign: 'center', padding: 20 }}>No App Users found</td></tr>
+            )}
           </tbody>
         </table>
       </div>
-    </div>
+
+      {openClaim && (
+        <ClaimAppUserModal 
+          appUser={openClaim} 
+          profile={profile}
+          onClose={() => setOpenClaim(null)} 
+          onSaved={async () => { setOpenClaim(null); await onClaimed() }} 
+        />
+      )}
+    </>
   )
 }
 
-function exportAppUsersCSV(rows) {
-  const header = 'Date,Txn ID,Card Number,Amount,Status\n'
-  const body = rows.map(r => `${r.received_at},${r.txn_id},${r.card_number},${r.amount},${r.status}`).join('\n')
-  const blob = new Blob([header + body], { type: 'text/csv' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `app-users-${todayEAT()}.csv`
-  a.click()
-  URL.revokeObjectURL(url)
+function ClaimAppUserModal({ appUser, profile, onClose, onSaved }) {
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+
+  async function claim() {
+    if (!code.trim()) { setErr('Enter your 2-digit code'); return }
+    setBusy(true); setErr('')
+    
+    const { data: sc } = await supabase
+      .from('staff_codes')
+      .select('user_id')
+      .eq('station_id', profile.user.station_id)
+      .eq('code', code.trim())
+      .single()
+
+    if (!sc) { setErr('Invalid code'); setBusy(false); return }
+
+    // If it's a fallback from card_sales, we need to actually insert it into app_users first
+    if (appUser.is_fallback) {
+      await supabase.from('app_users').insert({
+        station_id: profile.user.station_id,
+        txn_id: appUser.txn_id,
+        card_number: appUser.card_number,
+        customer_name: appUser.customer_name
+      })
+    }
+
+    const { error } = await supabase.from('app_users').update({
+      claimed_by: sc.user_id,
+      claimed_at: new Date().toISOString(),
+      staff_code: code.trim()
+    }).eq('txn_id', appUser.txn_id).is('claimed_by', null)
+
+    setBusy(false)
+    if (error) { setErr(error.message); return }
+    onSaved()
+  }
+
+  return (
+    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal">
+        <h3>Claim App User</h3>
+        <div className="modal-sub">{appUser.customer_name} · {appUser.card_number}</div>
+        <label>Your Code</label>
+        <input 
+          type="text" 
+          maxLength={2} 
+          value={code} 
+          onChange={e => setCode(e.target.value.replace(/\D/g,'').slice(0,2))} 
+          autoFocus 
+        />
+        {err && <div className="auth-err">{err}</div>}
+        <div className="modal-actions">
+          <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
+          <button className="btn-primary-full" onClick={claim} disabled={busy || code.length !== 2}>
+            {busy ? 'Claiming…' : 'Claim'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 /* ============================================================
@@ -396,60 +488,89 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
   const [err, setErr] = useState('')
   const [preview, setPreview] = useState(null)
   const [file, setFile] = useState(null)
+  const [replaceExisting, setReplaceExisting] = useState(true)
+
+  function csvToArray(text) {
+    let p = '', row = [''], ret = [row], i = 0, r = 0, s = !0, l
+    for (l of text) {
+      if ('"' === l) {
+        if (s && l === p) row[i] += l
+        s = !s
+      } else if (',' === l && s) l = row[++i] = ''
+      else if ('\n' === l && s) {
+        if ('\r' === p) row[i] = row[i].slice(0, -1)
+        row = ret[++r] = [l = '']; i = 0
+      } else row[i] += l
+      p = l
+    }
+    return ret
+  }
 
   async function handleFile(f) {
     if (!f) return
     setErr(''); setFile(f)
     try {
-      const buf = await f.arrayBuffer()
-      const wb = XLSX.read(buf)
-      const sheet = wb.Sheets[wb.SheetNames[0]]
-      const rawJson = XLSX.utils.sheet_to_json(sheet, { defval: '' })
-      
-      if (rawJson.length === 0) { setErr('File has no data rows'); return }
+      let rows = []
 
-      const parsed = rawJson.map(r => {
+      if (f.name.toLowerCase().endsWith('.csv')) {
+        let text = await f.text()
+        text = text.replace(/^\uFEFF/, '') 
+        rows = csvToArray(text).filter(r => r.length > 5 && r[0].trim() !== '')
+      } else {
+        const buf = await f.arrayBuffer()
+        const wb = XLSX.read(buf)
+        const sheet = wb.Sheets[wb.SheetNames[0]]
+        rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
+      }
+
+      if (rows.length < 2) { setErr('File has no data rows'); return }
+      
+      const dataRows = rows.slice(1)
+
+      const parsed = dataRows.map(r => {
         if (fileType === 'sales') {
           return {
-            txn_id: String(r['Transaction Id'] || ''),
-            txn_at: parseDate(r['Transaction Date']),
-            customer_name: String(r['Customer'] || ''),
-            card_number: String(r['Card Number'] || ''),
-            product_code: String(r['Product Code'] || ''),
-            product: String(r['Product'] || ''),
-            quantity: num(r['Quantity']),
-            unit_price: num(r['Original Unit Price']),
-            discount: num(r['Discount']),
-            amount: num(r['Original Amount']),
-            payment_method: String(r['Payment Mode'] || ''),
-            points: num(r['Points Earned']),
-            transaction_type: String(r['Transaction Type'] || ''),
-            staff_name: String(r['Transaction By'] || ''),
-            narrative: String(r['Narrative'] || ''),
+            txn_id: String(r[0] || ''),                     
+            txn_at: parseDate(r[1]),                        
+            customer_name: String(r[3] || ''),              
+            card_number: String(r[4] || ''),                
+            product_code: String(r[5] || ''),               
+            product: String(r[6] || ''),                    
+            quantity: num(r[7]),                            
+            original_price: num(r[8]),                      
+            discounted_price: num(r[9]),                    
+            discount: num(r[10]),                           
+            original_amount: num(r[11]),                    
+            discounted_amount: num(r[12]),                  
+            payment_method: String(r[13] || ''),            
+            points: num(r[14]),                             
+            transaction_type: String(r[15] || ''),          
+            staff_name: String(r[16] || ''),                
+            narrative: String(r[17] || ''),                 
           }
         } else {
           return {
-            txn_id: String(r['Transaction Id'] || ''),
-            txn_at: parseDate(r['Transaction Date']),
-            customer_name: String(r['Customer'] || ''),
-            card_number: String(r['Card Number'] || ''),
-            amount: num(r['Top Up Amount']),
-            prev_balance: num(r['Previous Balance']),
-            new_balance: num(r['Current Balance']),
-            prev_points: num(r['Previous Points']),
-            new_points: num(r['Current Points']),
-            transaction_type: String(r['Transaction Type'] || ''),
-            staff_name: String(r['Transaction By'] || ''),
-            narrative: String(r['Narrative'] || ''),
+            txn_id: String(r[0] || ''),                     
+            txn_at: parseDate(r[1]),                        
+            customer_name: String(r[3] || ''),              
+            card_number: String(r[4] || ''),                
+            top_up_amount: num(r[5]),                       
+            prev_balance: num(r[6]),                        
+            new_balance: num(r[7]),                         
+            prev_points: num(r[8]),                         
+            new_points: num(r[9]),                          
+            transaction_type: String(r[10] || ''),          
+            staff_name: String(r[11] || ''),                
+            narrative: String(r[12] || ''),                 
           }
         }
       }).filter(r => r.txn_at && r.txn_id)
 
       if (parsed.length === 0) {
-        setErr('No valid rows found. Check column names and date formats.')
+        setErr('No valid rows — could not parse dates or IDs. Check columns.')
         return
       }
-      setPreview({ rows: parsed, totalRaw: rawJson.length, sample: parsed.slice(0, 5) })
+      setPreview({ rows: parsed, totalRaw: dataRows.length, sample: parsed.slice(0, 5) })
     } catch (e) {
       console.error(e)
       setErr('Could not parse file: ' + (e.message || 'unknown'))
@@ -464,23 +585,21 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
 
   function parseDate(v) {
     if (v == null || v === '') return null
-    if (typeof v === 'number') {
-      try {
-        const d = XLSX.SSF.parse_date_code(v)
-        if (d) return new Date(Date.UTC(d.y, d.m-1, d.d, d.H||0, d.M||0, Math.floor(d.S||0))).toISOString()
-      } catch {}
-      return null
-    }
     const s = String(v).trim()
-    if (!s) return null
-    const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{1,2})/)
-    if (m) {
-      const [, y, mo, d, h, mi] = m
-      const dt = new Date(`${y}-${mo}-${d}T${String(h).padStart(2,'0')}:${String(mi).padStart(2,'0')}:00Z`)
+    
+    const match = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/)
+    if (match) {
+      const [, y, mo, d, h, mi, sec] = match
+      const dt = new Date(Date.UTC(
+        Number(y), Number(mo) - 1, Number(d), 
+        Number(h), Number(mi), Number(sec || 0)
+      ))
       if (!isNaN(dt.getTime())) return dt.toISOString()
     }
+
     const iso = new Date(s)
     if (!isNaN(iso.getTime())) return iso.toISOString()
+    
     return null
   }
 
@@ -508,6 +627,20 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
         .single()
       if (uErr) throw uErr
 
+      if (replaceExisting && dateFrom && dateTo) {
+        const { data: old } = await supabase
+          .from('card_uploads')
+          .select('id')
+          .eq('station_id', user.station_id)
+          .eq('file_type', fileType)
+          .eq('date_from', dateFrom)
+          .eq('date_to', dateTo)
+          .neq('id', up.id)
+        if (old?.length) {
+          await supabase.from('card_uploads').delete().in('id', old.map(o => o.id))
+        }
+      }
+
       const table = fileType === 'sales' ? 'card_sales' : 'card_topups'
       for (let i = 0; i < rows.length; i += 200) {
         const batch = rows.slice(i, i + 200).map(r => ({ ...r, upload_id: up.id, station_id: user.station_id }))
@@ -515,25 +648,18 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
         if (bErr) throw bErr
       }
 
-      // Push App Users to Transactions
       if (fileType === 'sales') {
-        const appUsers = rows.filter(r => 
-          String(r.transaction_type || '').toLowerCase().includes('app user') || 
-          String(r.staff_name || '').toLowerCase() === 'app user'
-        )
-        
-        if (appUsers.length > 0) {
-          const txnBatch = appUsers.map(r => ({
+        const appUserRows = rows
+          .filter(r => String(r.staff_name).replace(/\s+/g, '').toLowerCase().includes('appuser'))
+          .map(r => ({
             station_id: user.station_id,
-            provider: 'card',
             txn_id: r.txn_id,
-            amount: r.amount,
             card_number: r.card_number,
-            received_at: r.txn_at,
-            status: 'unclaimed',
-            source: 'reconcile'
+            customer_name: r.customer_name
           }))
-          await supabase.from('transactions').insert(txnBatch)
+        
+        if (appUserRows.length > 0) {
+          await supabase.from('app_users').upsert(appUserRows, { onConflict: 'txn_id', ignoreDuplicates: true })
         }
       }
 
@@ -549,10 +675,15 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
     <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="modal modal-wide">
         <h3>{fileType === 'sales' ? 'Upload Sales Report' : 'Upload Top-up Entries'}</h3>
-        <div className="modal-sub">Google Sheets CSV or Excel (.xlsx)</div>
+        <div className="modal-sub">CSV or Excel</div>
 
-        <label>Select File</label>
-        <input type="file" accept=".csv, .xlsx, .xls" onChange={e => handleFile(e.target.files?.[0])} />
+        <label>File</label>
+        <input type="file" accept=".csv,.xlsx,.xls" onChange={e => handleFile(e.target.files?.[0])} />
+
+        <label className="check-row" style={{ marginTop: 12 }}>
+          <input type="checkbox" checked={replaceExisting} onChange={e => setReplaceExisting(e.target.checked)} />
+          <span>Replace any existing file for the same date range</span>
+        </label>
 
         {preview && (
           <>
@@ -561,12 +692,13 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
             </div>
             <div className="import-preview">
               {preview.sample.map((r, i) => (
-                <div key={i} className="preview-head" style={{ gridTemplateColumns: 'repeat(6, 1fr)', fontSize: 12 }}>
+                <div key={i} className="preview-head" style={{ gridTemplateColumns: 'repeat(7, 1fr)', fontSize: 11 }}>
                   <div className="cell">{r.txn_id}</div>
                   <div className="cell">{String(r.txn_at).slice(0,10)}</div>
                   <div className="cell">{r.customer_name}</div>
                   <div className="cell">{r.card_number}</div>
-                  <div className="cell">{r.amount || r.quantity}</div>
+                  <div className="cell">{r.product || ''}</div>
+                  <div className="cell">{r.quantity || r.top_up_amount}</div>
                   <div className="cell">{r.staff_name}</div>
                 </div>
               ))}
@@ -587,11 +719,11 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
   )
 }
 
-function Stat({ label, value, sub, valueColor }) {
+function Stat({ label, value, sub }) {
   return (
     <div className="stat-card">
       <div className="stat-title">{label}</div>
-      <div className="stat-value" style={valueColor ? { color: valueColor } : undefined}>{value}</div>
+      <div className="stat-value">{value}</div>
       {sub && <div className="stat-sub">{sub}</div>}
     </div>
   )
