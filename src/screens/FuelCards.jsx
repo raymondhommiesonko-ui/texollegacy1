@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import * as XLSX from 'xlsx'
 import { supabase } from '../supabase'
-import { todayEAT } from '../lib/time'
 
 export default function FuelCards({ profile }) {
   const user = profile?.user
@@ -17,11 +16,9 @@ export default function FuelCards({ profile }) {
   const [errorMsg, setErrorMsg] = useState('')
   const [openUpload, setOpenUpload] = useState(null)
 
-  // Safe date initialization
-  const [range, setRange] = useState({
-    from: todayEAT ? todayEAT() : new Date().toISOString().slice(0,10),
-    to: todayEAT ? todayEAT() : new Date().toISOString().slice(0,10),
-  })
+  // Safe date initialization without external dependencies
+  const today = new Date().toISOString().slice(0, 10)
+  const [range, setRange] = useState({ from: today, to: today })
 
   const [salesRows, setSalesRows] = useState([])
   const [topupRows, setTopupRows] = useState([])
@@ -40,27 +37,22 @@ export default function FuelCards({ profile }) {
     }
 
     try {
-      // 1. Fetch Sales (Safely)
       const { data: s, error: sErr } = await supabase
         .from('card_sales')
         .select('*')
         .eq('station_id', user.station_id)
         .order('txn_at', { ascending: false })
-      
-      if (sErr) console.error("Sales Error:", sErr)
+      if (sErr) console.error(sErr)
       setSalesRows(s || [])
 
-      // 2. Fetch Top-ups (Safely)
       const { data: t, error: tErr } = await supabase
         .from('card_topups')
         .select('*')
         .eq('station_id', user.station_id)
         .order('txn_at', { ascending: false })
-      
-      if (tErr) console.error("Topups Error:", tErr)
+      if (tErr) console.error(tErr)
       setTopupRows(t || [])
 
-      // 3. Fetch Uploads
       const { data: u } = await supabase
         .from('card_uploads')
         .select('*')
@@ -69,7 +61,6 @@ export default function FuelCards({ profile }) {
         .limit(20)
       setUploads(u || [])
 
-      // 4. Fetch App Users
       const { data: au } = await supabase
         .from('app_users')
         .select('*')
@@ -78,30 +69,28 @@ export default function FuelCards({ profile }) {
 
       let finalAppUsers = au || []
 
-      // Fallback for App Users
       if (finalAppUsers.length === 0) {
         const { data: fromSales } = await supabase
           .from('card_sales')
-          .select('txn_id, card_number, customer_name, staff_name')
+          .select('txn_id, card_number, customer_name, staff_name, original_amount')
           .eq('station_id', user.station_id)
         
         if (fromSales && fromSales.length > 0) {
-          const extracted = fromSales
+          finalAppUsers = fromSales
             .filter(r => String(r.staff_name || '').replace(/\s+/g, '').toLowerCase().includes('appuser'))
             .map(s => ({
               id: s.txn_id,
               txn_id: s.txn_id,
               card_number: s.card_number,
               customer_name: s.customer_name,
+              amount: s.original_amount,
               claimed_by: null,
               is_fallback: true
             }))
-          finalAppUsers = extracted
         }
       }
       setAppUsers(finalAppUsers)
 
-      // 5. Fetch Staff Codes
       const { data: codes } = await supabase
         .from('staff_codes')
         .select('user_id, code, color')
@@ -128,7 +117,7 @@ export default function FuelCards({ profile }) {
       setStaffCodes(codeMap)
 
     } catch (e) {
-      console.error("Crash caught:", e)
+      console.error(e)
       setErrorMsg(e.message || 'Could not load data')
     }
     setLoading(false)
@@ -141,14 +130,11 @@ export default function FuelCards({ profile }) {
     let totalSalesAmt = 0
     let totalTopupAmt = 0
     let bigTopups = 0
-
-    // Filter by range manually for safety
     const inRange = (d) => d && d >= range.from && d <= range.to
 
     salesRows.forEach(r => {
       const day = String(r?.txn_at || '').slice(0, 10)
       if (!inRange(day)) return
-      
       totalLiters += Number(r?.quantity || 0)
       totalSalesAmt += Number(r?.original_amount || 0) 
     })
@@ -156,7 +142,6 @@ export default function FuelCards({ profile }) {
     topupRows.forEach(r => {
       const day = String(r?.txn_at || '').slice(0, 10)
       if (!inRange(day)) return
-
       const amt = Number(r?.top_up_amount || 0) 
       totalTopupAmt += amt
       if (amt >= 100000) bigTopups++
@@ -173,13 +158,11 @@ export default function FuelCards({ profile }) {
     salesRows.forEach(r => {
       const day = String(r?.txn_at || '').slice(0, 10)
       if (!inRange(day)) return
-
       const rawName = String(r?.staff_name || '').trim()
       if (isAppUser(rawName)) return 
 
       const name = rawName || 'Unknown'
       if (!map[name]) map[name] = { name, salesAmt: 0, liters: 0, topupAmt: 0, cards: new Set() }
-      
       map[name].salesAmt += Number(r?.original_amount || 0)
       map[name].liters += Number(r?.quantity || 0)
       if (r?.card_number) map[name].cards.add(r.card_number)
@@ -188,13 +171,12 @@ export default function FuelCards({ profile }) {
     topupRows.forEach(r => {
       const day = String(r?.txn_at || '').slice(0, 10)
       if (!inRange(day)) return
-
       const rawName = String(r?.staff_name || '').trim()
       if (isAppUser(rawName)) return 
 
       const name = rawName || 'Unknown'
       if (!map[name]) map[name] = { name, salesAmt: 0, liters: 0, topupAmt: 0, cards: new Set() }
-      map[name].topupAmt += Number(r?.top_up_amount || 0)
+      map[name].topupAmt += Number(r?.top_up_amount || r?.amount || 0)
     })
 
     return Object.values(map).map(s => ({
@@ -232,7 +214,7 @@ export default function FuelCards({ profile }) {
         <input type="date" value={range.from} onChange={e => setRange(r => ({ ...r, from: e.target.value }))} />
         <label style={{ alignSelf: 'center', fontSize: 13, color: '#6b85a0', fontWeight: 600 }}>To</label>
         <input type="date" value={range.to} onChange={e => setRange(r => ({ ...r, to: e.target.value }))} />
-        <button className="btn-ghost btn-sm" onClick={() => setRange({ from: todayEAT(), to: todayEAT() })}>Today</button>
+        <button className="btn-ghost btn-sm" onClick={() => setRange({ from: today, to: today })}>Today</button>
       </div>
 
       <div className="dashboard-grid">
@@ -243,18 +225,10 @@ export default function FuelCards({ profile }) {
       </div>
 
       <div className="tabs" style={{ paddingTop: 0, overflowX: 'auto', whiteSpace: 'nowrap' }}>
-        <button className={`tab ${tab === 'overview' ? 'active' : ''}`} onClick={() => setTab('overview')}>
-          <i className="fas fa-chart-bar" /> Daily
-        </button>
-        <button className={`tab ${tab === 'staff' ? 'active' : ''}`} onClick={() => setTab('staff')}>
-          <i className="fas fa-user-tie" /> By Staff
-        </button>
-        <button className={`tab ${tab === 'app-users' ? 'active' : ''}`} onClick={() => setTab('app-users')}>
-          <i className="fas fa-mobile-alt" /> App Users (Claim)
-        </button>
-        <button className={`tab ${tab === 'uploads' ? 'active' : ''}`} onClick={() => setTab('uploads')}>
-          <i className="fas fa-file-upload" /> Uploads
-        </button>
+        <button className={`tab ${tab === 'overview' ? 'active' : ''}`} onClick={() => setTab('overview')}>Daily</button>
+        <button className={`tab ${tab === 'staff' ? 'active' : ''}`} onClick={() => setTab('staff')}>By Staff</button>
+        <button className={`tab ${tab === 'app-users' ? 'active' : ''}`} onClick={() => setTab('app-users')}>App Users (Claim)</button>
+        <button className={`tab ${tab === 'uploads' ? 'active' : ''}`} onClick={() => setTab('uploads')}>Uploads</button>
       </div>
 
       {errorMsg && <div className="auth-err" style={{ margin: '0 32px 20px' }}>{errorMsg}</div>}
@@ -276,7 +250,7 @@ export default function FuelCards({ profile }) {
                 <th>Sales Amount</th>
                 <th>Liters</th>
                 <th>Top-ups</th>
-                <th>Difference (Sales - Topups)</th>
+                <th>Difference</th>
                 <th>Cards Worked</th>
               </tr>
             </thead>
@@ -350,17 +324,17 @@ export default function FuelCards({ profile }) {
 }
 
 /* ============================================================
-   APP USERS TABLE
+   APP USERS TABLE (With Amount Column)
    ============================================================ */
 function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }) {
   const [openClaim, setOpenClaim] = useState(null)
 
   function download() {
     const rows = appUsers.map(u => [
-      u.txn_id, u.customer_name, u.card_number, 
+      u.txn_id, u.customer_name, u.card_number, u.amount,
       u.claimed_by ? staffCodes[u.claimed_by]?.name || 'Claimed' : 'Unclaimed'
     ])
-    const csv = "Txn ID,Customer,Card,Status\n" + rows.map(r => r.join(',')).join('\n')
+    const csv = "Txn ID,Customer,Card,Amount,Status\n" + rows.map(r => r.join(',')).join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a'); a.href = url; a.download = 'app-users.csv'; a.click()
@@ -380,6 +354,7 @@ function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }
               <th>Txn ID</th>
               <th>Customer</th>
               <th>Card Number</th>
+              <th>Amount</th>
               <th>Claimed By</th>
               <th></th>
             </tr>
@@ -394,6 +369,7 @@ function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }
                   <td><span className="code-pill">{u.txn_id}</span></td>
                   <td>{u.customer_name}</td>
                   <td>{u.card_number}</td>
+                  <td><strong>UGX {Number(u.amount || 0).toLocaleString()}</strong></td>
                   <td>
                     {isClaimed ? (
                       <span style={{ color: codeObj?.color || '#000', fontWeight: 700 }}>
@@ -414,7 +390,7 @@ function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }
               )
             })}
             {appUsers.length === 0 && (
-              <tr><td colSpan="5" style={{ textAlign: 'center', padding: 20 }}>No App Users found</td></tr>
+              <tr><td colSpan="6" style={{ textAlign: 'center', padding: 20 }}>No App Users found</td></tr>
             )}
           </tbody>
         </table>
@@ -455,7 +431,8 @@ function ClaimAppUserModal({ appUser, profile, onClose, onSaved }) {
         station_id: profile.user.station_id,
         txn_id: appUser.txn_id,
         card_number: appUser.card_number,
-        customer_name: appUser.customer_name
+        customer_name: appUser.customer_name,
+        amount: appUser.amount
       }).select()
     }
 
@@ -474,7 +451,7 @@ function ClaimAppUserModal({ appUser, profile, onClose, onSaved }) {
     <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="modal">
         <h3>Claim App User</h3>
-        <div className="modal-sub">{appUser.customer_name} · {appUser.card_number}</div>
+        <div className="modal-sub">{appUser.customer_name} · UGX {Number(appUser.amount || 0).toLocaleString()}</div>
         <label>Your Code</label>
         <input 
           type="text" 
@@ -581,26 +558,26 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
     if (v == null || v === '') return null
     const s = String(v).trim()
     
-    const matchYMD = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/)
+    const matchYMD = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
     if (matchYMD) {
       const [, y, mo, d, h, mi, sec] = matchYMD
       const dt = new Date(Date.UTC(
         Number(y), Number(mo) - 1, Number(d), 
-        Number(h), Number(mi), Number(sec || 0)
+        Number(h || 0), Number(mi || 0), Number(sec || 0)
       ))
       if (!isNaN(dt.getTime())) return dt.toISOString()
     }
 
-    const matchMDY = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/)
+    const matchMDY = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
     if (matchMDY) {
       let [, p1, p2, y, h, mi, sec] = matchMDY
-      p1 = Number(p1); p2 = Number(p2)
+      p1 = Number(p1); p2 = Number(p2); y = Number(y)
+      if (y < 100) y += 2000
       const mo = p1 > 12 ? p2 : p1
       const d = p1 > 12 ? p1 : p2
-      
       const dt = new Date(Date.UTC(
-        Number(y), mo - 1, d, 
-        Number(h), Number(mi), Number(sec || 0)
+        y, mo - 1, d, 
+        Number(h || 0), Number(mi || 0), Number(sec || 0)
       ))
       if (!isNaN(dt.getTime())) return dt.toISOString()
     }
@@ -650,10 +627,24 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
       }
 
       const table = fileType === 'sales' ? 'card_sales' : 'card_topups'
+      
       for (let i = 0; i < rows.length; i += 200) {
         const batch = rows.slice(i, i + 200).map(r => ({ ...r, upload_id: up.id, station_id: user.station_id }))
+        
         const { error: bErr } = await supabase.from(table).insert(batch)
-        if (bErr) throw bErr
+        
+        if (bErr && bErr.message.includes("top_up_amount")) {
+           const fallbackBatch = batch.map(r => {
+             const copy = { ...r }
+             copy.amount = copy.top_up_amount
+             delete copy.top_up_amount
+             return copy
+           })
+           const { error: bErr2 } = await supabase.from(table).insert(fallbackBatch)
+           if (bErr2) throw bErr2
+        } else if (bErr) {
+           throw bErr
+        }
       }
 
       if (fileType === 'sales') {
@@ -663,11 +654,12 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
             station_id: user.station_id,
             txn_id: r.txn_id,
             card_number: r.card_number,
-            customer_name: r.customer_name
+            customer_name: r.customer_name,
+            amount: r.original_amount
           }))
         
         if (appUserRows.length > 0) {
-          await supabase.from('app_users').upsert(appUserRows, { onConflict: 'txn_id', ignoreDuplicates: true })
+          await supabase.from('app_users').upsert(appUserRows, { onConflict: 'txn_id' })
         }
       }
 
