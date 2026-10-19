@@ -4,8 +4,8 @@ import { supabase } from '../supabase'
 import { todayEAT } from '../lib/time'
 
 export default function FuelCards({ profile }) {
-  const user = profile.user
-  const powers = profile.powers || {}
+  const user = profile?.user
+  const powers = profile?.powers || {}
   const role = user?.role || 'attendant'
   
   const isManager = ['admin', 'manager', 'supervisor'].includes(role)
@@ -17,9 +17,10 @@ export default function FuelCards({ profile }) {
   const [errorMsg, setErrorMsg] = useState('')
   const [openUpload, setOpenUpload] = useState(null)
 
+  // Safe date initialization
   const [range, setRange] = useState({
-    from: todayEAT(),
-    to: todayEAT(),
+    from: todayEAT ? todayEAT() : new Date().toISOString().slice(0,10),
+    to: todayEAT ? todayEAT() : new Date().toISOString().slice(0,10),
   })
 
   const [salesRows, setSalesRows] = useState([])
@@ -39,25 +40,24 @@ export default function FuelCards({ profile }) {
     }
 
     try {
-      const fromISO = range.from + 'T00:00:00'
-      const toISO = range.to + 'T23:59:59'
-
-      // 1. Fetch Sales
-      const { data: s } = await supabase
+      // 1. Fetch Sales (Safely)
+      const { data: s, error: sErr } = await supabase
         .from('card_sales')
         .select('*')
         .eq('station_id', user.station_id)
-        .gte('txn_at', fromISO)
-        .lte('txn_at', toISO)
+        .order('txn_at', { ascending: false })
+      
+      if (sErr) console.error("Sales Error:", sErr)
       setSalesRows(s || [])
 
-      // 2. Fetch Top-ups
-      const { data: t } = await supabase
+      // 2. Fetch Top-ups (Safely)
+      const { data: t, error: tErr } = await supabase
         .from('card_topups')
         .select('*')
         .eq('station_id', user.station_id)
-        .gte('txn_at', fromISO)
-        .lte('txn_at', toISO)
+        .order('txn_at', { ascending: false })
+      
+      if (tErr) console.error("Topups Error:", tErr)
       setTopupRows(t || [])
 
       // 3. Fetch Uploads
@@ -66,10 +66,10 @@ export default function FuelCards({ profile }) {
         .select('*')
         .eq('station_id', user.station_id)
         .order('uploaded_at', { ascending: false })
-        .limit(30)
+        .limit(20)
       setUploads(u || [])
 
-      // 4. Fetch App Users (Try table first)
+      // 4. Fetch App Users
       const { data: au } = await supabase
         .from('app_users')
         .select('*')
@@ -78,9 +78,8 @@ export default function FuelCards({ profile }) {
 
       let finalAppUsers = au || []
 
-      // FALLBACK: If app_users is empty, pull straight from card_sales
+      // Fallback for App Users
       if (finalAppUsers.length === 0) {
-        // Get ALL app users for this station, ignoring date filters
         const { data: fromSales } = await supabase
           .from('card_sales')
           .select('txn_id, card_number, customer_name, staff_name')
@@ -88,9 +87,9 @@ export default function FuelCards({ profile }) {
         
         if (fromSales && fromSales.length > 0) {
           const extracted = fromSales
-            .filter(r => String(r.staff_name).replace(/\s+/g, '').toLowerCase().includes('appuser'))
+            .filter(r => String(r.staff_name || '').replace(/\s+/g, '').toLowerCase().includes('appuser'))
             .map(s => ({
-              id: s.txn_id, // temp id
+              id: s.txn_id,
               txn_id: s.txn_id,
               card_number: s.card_number,
               customer_name: s.customer_name,
@@ -114,26 +113,28 @@ export default function FuelCards({ profile }) {
         .eq('station_id', user.station_id)
       
       const userMap = {}
-      ;(staff || []).forEach(u => userMap[u.id] = u.name)
+      ;(staff || []).forEach(u => { if (u?.id) userMap[u.id] = u.name || 'Staff' })
       
       const codeMap = {}
       ;(codes || []).forEach(c => {
-        codeMap[c.user_id] = {
-          name: userMap[c.user_id] || '—',
-          code: c.code,
-          color: c.color
+        if (c?.user_id) {
+          codeMap[c.user_id] = {
+            name: userMap[c.user_id] || 'Staff',
+            code: c.code || '—',
+            color: c.color || '#64748B'
+          }
         }
       })
       setStaffCodes(codeMap)
 
     } catch (e) {
-      console.error(e)
+      console.error("Crash caught:", e)
       setErrorMsg(e.message || 'Could not load data')
     }
     setLoading(false)
   }
 
-  useEffect(() => { loadAll() }, [user?.station_id, range.from, range.to])
+  useEffect(() => { loadAll() }, [user?.station_id])
 
   const stats = useMemo(() => {
     let totalLiters = 0
@@ -141,45 +142,59 @@ export default function FuelCards({ profile }) {
     let totalTopupAmt = 0
     let bigTopups = 0
 
+    // Filter by range manually for safety
+    const inRange = (d) => d && d >= range.from && d <= range.to
+
     salesRows.forEach(r => {
-      totalLiters += Number(r.quantity || 0)
-      totalSalesAmt += Number(r.original_amount || 0) 
+      const day = String(r?.txn_at || '').slice(0, 10)
+      if (!inRange(day)) return
+      
+      totalLiters += Number(r?.quantity || 0)
+      totalSalesAmt += Number(r?.original_amount || 0) 
     })
 
     topupRows.forEach(r => {
-      const amt = Number(r.top_up_amount || 0) 
+      const day = String(r?.txn_at || '').slice(0, 10)
+      if (!inRange(day)) return
+
+      const amt = Number(r?.top_up_amount || 0) 
       totalTopupAmt += amt
       if (amt >= 100000) bigTopups++
     })
 
     return { totalLiters, totalSalesAmt, totalTopupAmt, bigTopups }
-  }, [salesRows, topupRows])
+  }, [salesRows, topupRows, range])
 
   const staffPerformance = useMemo(() => {
     const map = {}
-    
-    // Bulletproof App User checker
     const isAppUser = (name) => String(name || '').replace(/\s+/g, '').toLowerCase().includes('appuser')
+    const inRange = (d) => d && d >= range.from && d <= range.to
 
     salesRows.forEach(r => {
-      const rawName = String(r.staff_name || '').trim()
+      const day = String(r?.txn_at || '').slice(0, 10)
+      if (!inRange(day)) return
+
+      const rawName = String(r?.staff_name || '').trim()
       if (isAppUser(rawName)) return 
 
       const name = rawName || 'Unknown'
       if (!map[name]) map[name] = { name, salesAmt: 0, liters: 0, topupAmt: 0, cards: new Set() }
       
-      map[name].salesAmt += Number(r.original_amount || 0)
-      map[name].liters += Number(r.quantity || 0)
-      if (r.card_number) map[name].cards.add(r.card_number)
+      map[name].salesAmt += Number(r?.original_amount || 0)
+      map[name].liters += Number(r?.quantity || 0)
+      if (r?.card_number) map[name].cards.add(r.card_number)
     })
 
     topupRows.forEach(r => {
-      const rawName = String(r.staff_name || '').trim()
+      const day = String(r?.txn_at || '').slice(0, 10)
+      if (!inRange(day)) return
+
+      const rawName = String(r?.staff_name || '').trim()
       if (isAppUser(rawName)) return 
 
       const name = rawName || 'Unknown'
       if (!map[name]) map[name] = { name, salesAmt: 0, liters: 0, topupAmt: 0, cards: new Set() }
-      map[name].topupAmt += Number(r.top_up_amount || 0)
+      map[name].topupAmt += Number(r?.top_up_amount || 0)
     })
 
     return Object.values(map).map(s => ({
@@ -187,7 +202,7 @@ export default function FuelCards({ profile }) {
       cardsCount: s.cards.size,
       difference: s.salesAmt - s.topupAmt
     })).sort((a,b) => b.salesAmt - a.salesAmt)
-  }, [salesRows, topupRows])
+  }, [salesRows, topupRows, range])
 
   if (!user) return <div className="drops-empty">Loading…</div>
 
@@ -436,13 +451,12 @@ function ClaimAppUserModal({ appUser, profile, onClose, onSaved }) {
     if (!sc) { setErr('Invalid code'); setBusy(false); return }
 
     if (appUser.is_fallback) {
-      // Insert it into app_users if it's from the fallback
       await supabase.from('app_users').insert({
         station_id: profile.user.station_id,
         txn_id: appUser.txn_id,
         card_number: appUser.card_number,
         customer_name: appUser.customer_name
-      }).select() // ignore error if already exists
+      }).select()
     }
 
     const { error } = await supabase.from('app_users').update({
@@ -492,38 +506,16 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
   const [file, setFile] = useState(null)
   const [replaceExisting, setReplaceExisting] = useState(true)
 
-  function csvToArray(text) {
-    let p = '', row = [''], ret = [row], i = 0, r = 0, s = !0, l
-    for (l of text) {
-      if ('"' === l) {
-        if (s && l === p) row[i] += l
-        s = !s
-      } else if (',' === l && s) l = row[++i] = ''
-      else if ('\n' === l && s) {
-        if ('\r' === p) row[i] = row[i].slice(0, -1)
-        row = ret[++r] = [l = '']; i = 0
-      } else row[i] += l
-      p = l
-    }
-    return ret
-  }
-
   async function handleFile(f) {
     if (!f) return
     setErr(''); setFile(f)
     try {
-      let rows = []
-
-      if (f.name.toLowerCase().endsWith('.csv')) {
-        let text = await f.text()
-        text = text.replace(/^\uFEFF/, '') 
-        rows = csvToArray(text).filter(r => r.length > 5 && r[0].trim() !== '')
-      } else {
-        const buf = await f.arrayBuffer()
-        const wb = XLSX.read(buf)
-        const sheet = wb.Sheets[wb.SheetNames[0]]
-        rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
-      }
+      const buf = await f.arrayBuffer()
+      const wb = XLSX.read(buf, { type: 'array' })
+      const sheet = wb.Sheets[wb.SheetNames[0]]
+      
+      let rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
+      rows = rows.filter(r => r.length > 0 && r.some(c => c !== '' && c != null))
 
       if (rows.length < 2) { setErr('File has no data rows'); return }
       
@@ -589,11 +581,25 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
     if (v == null || v === '') return null
     const s = String(v).trim()
     
-    const match = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/)
-    if (match) {
-      const [, y, mo, d, h, mi, sec] = match
+    const matchYMD = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/)
+    if (matchYMD) {
+      const [, y, mo, d, h, mi, sec] = matchYMD
       const dt = new Date(Date.UTC(
         Number(y), Number(mo) - 1, Number(d), 
+        Number(h), Number(mi), Number(sec || 0)
+      ))
+      if (!isNaN(dt.getTime())) return dt.toISOString()
+    }
+
+    const matchMDY = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/)
+    if (matchMDY) {
+      let [, p1, p2, y, h, mi, sec] = matchMDY
+      p1 = Number(p1); p2 = Number(p2)
+      const mo = p1 > 12 ? p2 : p1
+      const d = p1 > 12 ? p1 : p2
+      
+      const dt = new Date(Date.UTC(
+        Number(y), mo - 1, d, 
         Number(h), Number(mi), Number(sec || 0)
       ))
       if (!isNaN(dt.getTime())) return dt.toISOString()
