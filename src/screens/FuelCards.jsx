@@ -43,7 +43,7 @@ export default function FuelCards({ profile }) {
       const fromISO = range.from + 'T00:00:00'
       const toISO = range.to + 'T23:59:59'
 
-      // 1. Fetch Sales (filtered by date)
+      // 1. Fetch Sales
       const { data: s, error: sErr } = await supabase
         .from('card_sales')
         .select('*')
@@ -55,7 +55,7 @@ export default function FuelCards({ profile }) {
       if (sErr) console.error("Sales Error:", sErr)
       setSalesRows(s || [])
 
-      // 2. Fetch Top-ups (filtered by date)
+      // 2. Fetch Top-ups
       const { data: t, error: tErr } = await supabase
         .from('card_topups')
         .select('*')
@@ -76,7 +76,7 @@ export default function FuelCards({ profile }) {
         .limit(20)
       setUploads(u || [])
 
-      // 4. Fetch App Users (NOW FILTERED BY DATE)
+      // 4. Fetch App Users
       const { data: au } = await supabase
         .from('app_users')
         .select('*')
@@ -87,7 +87,6 @@ export default function FuelCards({ profile }) {
 
       let finalAppUsers = au || []
 
-      // Fallback for App Users if table is empty for this range
       if (finalAppUsers.length === 0) {
         const { data: fromSales } = await supabase
           .from('card_sales')
@@ -528,52 +527,53 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
     if (!f) return
     setErr(''); setFile(f)
     try {
-      const buf = await f.arrayBuffer()
-      const wb = XLSX.read(buf, { type: 'array' })
-      const sheet = wb.Sheets[wb.SheetNames[0]]
-      
-      let rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
-      rows = rows.filter(r => r.length > 0 && r.some(c => c !== '' && c != null))
+      let rows = []
 
-      if (rows.length < 2) { setErr('File has no data rows'); return }
+      let text = await f.text()
+      text = text.replace(/^\uFEFF/, '') 
+      text = text.replace(/"/g, '') 
+
+      const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0)
       
-      const dataRows = rows.slice(1)
+      if (lines.length < 2) { setErr('File is empty or has no data rows'); return }
+
+      const dataRows = lines.slice(1).map(line => line.split(','))
 
       const parsed = dataRows.map(r => {
         if (fileType === 'sales') {
           return {
-            txn_id: String(r[0] || ''),                     
+            txn_id: String(r[0] || '').trim(),                     
             txn_at: parseDate(r[1]),                        
-            customer_name: String(r[3] || ''),              
-            card_number: String(r[4] || ''),                
-            product_code: String(r[5] || ''),               
-            product: String(r[6] || ''),                    
+            customer_name: String(r[3] || '').trim(),              
+            card_number: String(r[4] || '').trim(),                
+            product_code: String(r[5] || '').trim(),               
+            product: String(r[6] || '').trim(),                    
             quantity: num(r[7]),                            
             original_price: num(r[8]),                      
             discounted_price: num(r[9]),                    
             discount: num(r[10]),                           
             original_amount: num(r[11]),                    
             discounted_amount: num(r[12]),                  
-            payment_method: String(r[13] || ''),            
+            payment_method: String(r[13] || '').trim(),            
             points: num(r[14]),                             
-            transaction_type: String(r[15] || ''),          
-            staff_name: String(r[16] || ''),                
-            narrative: String(r[17] || ''),                 
+            transaction_type: String(r[15] || '').trim(),          
+            staff_name: String(r[16] || '').trim(),                
+            narrative: String(r[17] || '').trim(),                 
           }
         } else {
           return {
-            txn_id: String(r[0] || ''),                     
+            txn_id: String(r[0] || '').trim(),                     
             txn_at: parseDate(r[1]),                        
-            customer_name: String(r[3] || ''),              
-            card_number: String(r[4] || ''),                
+            customer_name: String(r[3] || '').trim(),              
+            card_number: String(r[4] || '').trim(),                
             top_up_amount: num(r[5]),                       
             prev_balance: num(r[6]),                        
             new_balance: num(r[7]),                         
             prev_points: num(r[8]),                         
             new_points: num(r[9]),                          
-            transaction_type: String(r[10] || ''),          
-            staff_name: String(r[11] || ''),                
-            narrative: String(r[12] || ''),                 
+            transaction_type: String(r[10] || '').trim(),          
+            staff_name: String(r[11] || '').trim(),                
+            narrative: String(r[12] || '').trim(),                 
           }
         }
       }).filter(r => r.txn_at && r.txn_id)
@@ -776,36 +776,36 @@ function ReconcileModal({ profile, onClose, onSaved }) {
     if (!f) return
     setErr(''); setFile(f); setResult(null)
     try {
-      const buf = await f.arrayBuffer()
-      const wb = XLSX.read(buf, { type: 'array' })
-      const sheet = wb.Sheets[wb.SheetNames[0]]
+      let rows = []
+      let text = await f.text()
+      text = text.replace(/^\uFEFF/, '') 
+      text = text.replace(/"/g, '') 
+      const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0)
       
-      let rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
-      rows = rows.filter(r => r.length > 0 && r.some(c => c !== '' && c != null))
+      if (lines.length < 2) { setErr('File is empty or has no data rows'); return }
 
-      if (rows.length < 2) { setErr('File has no data rows'); return }
-      const dataRows = rows.slice(1)
+      const dataRows = lines.slice(1).map(line => line.split(','))
 
       const parsed = dataRows.map(r => {
         if (fileType === 'sales') {
           return {
-            txn_id: String(r[0] || ''), txn_at: parseDate(r[1]),
-            customer_name: String(r[3] || ''), card_number: String(r[4] || ''),
-            product_code: String(r[5] || ''), product: String(r[6] || ''),
+            txn_id: String(r[0] || '').trim(), txn_at: parseDate(r[1]),
+            customer_name: String(r[3] || '').trim(), card_number: String(r[4] || '').trim(),
+            product_code: String(r[5] || '').trim(), product: String(r[6] || '').trim(),
             quantity: num(r[7]), original_price: num(r[8]), discounted_price: num(r[9]),
             discount: num(r[10]), original_amount: num(r[11]), discounted_amount: num(r[12]),
-            payment_method: String(r[13] || ''), points: num(r[14]),
-            transaction_type: String(r[15] || ''), staff_name: String(r[16] || ''),
-            narrative: String(r[17] || ''),
+            payment_method: String(r[13] || '').trim(), points: num(r[14]),
+            transaction_type: String(r[15] || '').trim(), staff_name: String(r[16] || '').trim(),
+            narrative: String(r[17] || '').trim(),
           }
         } else {
           return {
-            txn_id: String(r[0] || ''), txn_at: parseDate(r[1]),
-            customer_name: String(r[3] || ''), card_number: String(r[4] || ''),
+            txn_id: String(r[0] || '').trim(), txn_at: parseDate(r[1]),
+            customer_name: String(r[3] || '').trim(), card_number: String(r[4] || '').trim(),
             top_up_amount: num(r[5]), prev_balance: num(r[6]), new_balance: num(r[7]),
             prev_points: num(r[8]), new_points: num(r[9]),
-            transaction_type: String(r[10] || ''), staff_name: String(r[11] || ''),
-            narrative: String(r[12] || ''),
+            transaction_type: String(r[10] || '').trim(), staff_name: String(r[11] || '').trim(),
+            narrative: String(r[12] || '').trim(),
           }
         }
       }).filter(r => r.txn_at && r.txn_id)
