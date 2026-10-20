@@ -14,9 +14,12 @@ export default function FuelCards({ profile }) {
   const [tab, setTab] = useState('overview')
   const [loading, setLoading] = useState(true)
   const [errorMsg, setErrorMsg] = useState('')
+  
+  // Modals
   const [openUpload, setOpenUpload] = useState(null)
+  const [openReconcile, setOpenReconcile] = useState(false)
 
-  // Safe date initialization without external dependencies
+  // Safe date initialization
   const today = new Date().toISOString().slice(0, 10)
   const [range, setRange] = useState({ from: today, to: today })
 
@@ -37,22 +40,34 @@ export default function FuelCards({ profile }) {
     }
 
     try {
+      const fromISO = range.from + 'T00:00:00'
+      const toISO = range.to + 'T23:59:59'
+
+      // 1. Fetch Sales (filtered by date)
       const { data: s, error: sErr } = await supabase
         .from('card_sales')
         .select('*')
         .eq('station_id', user.station_id)
+        .gte('txn_at', fromISO)
+        .lte('txn_at', toISO)
         .order('txn_at', { ascending: false })
-      if (sErr) console.error(sErr)
+      
+      if (sErr) console.error("Sales Error:", sErr)
       setSalesRows(s || [])
 
+      // 2. Fetch Top-ups (filtered by date)
       const { data: t, error: tErr } = await supabase
         .from('card_topups')
         .select('*')
         .eq('station_id', user.station_id)
+        .gte('txn_at', fromISO)
+        .lte('txn_at', toISO)
         .order('txn_at', { ascending: false })
-      if (tErr) console.error(tErr)
+      
+      if (tErr) console.error("Topups Error:", tErr)
       setTopupRows(t || [])
 
+      // 3. Fetch Uploads
       const { data: u } = await supabase
         .from('card_uploads')
         .select('*')
@@ -61,19 +76,25 @@ export default function FuelCards({ profile }) {
         .limit(20)
       setUploads(u || [])
 
+      // 4. Fetch App Users (NOW FILTERED BY DATE)
       const { data: au } = await supabase
         .from('app_users')
         .select('*')
         .eq('station_id', user.station_id)
+        .gte('created_at', fromISO)
+        .lte('created_at', toISO)
         .order('created_at', { ascending: false })
 
       let finalAppUsers = au || []
 
+      // Fallback for App Users if table is empty for this range
       if (finalAppUsers.length === 0) {
         const { data: fromSales } = await supabase
           .from('card_sales')
           .select('txn_id, card_number, customer_name, staff_name, original_amount')
           .eq('station_id', user.station_id)
+          .gte('txn_at', fromISO)
+          .lte('txn_at', toISO)
         
         if (fromSales && fromSales.length > 0) {
           finalAppUsers = fromSales
@@ -91,6 +112,7 @@ export default function FuelCards({ profile }) {
       }
       setAppUsers(finalAppUsers)
 
+      // 5. Fetch Staff Codes
       const { data: codes } = await supabase
         .from('staff_codes')
         .select('user_id, code, color')
@@ -117,19 +139,22 @@ export default function FuelCards({ profile }) {
       setStaffCodes(codeMap)
 
     } catch (e) {
-      console.error(e)
+      console.error("Crash caught:", e)
       setErrorMsg(e.message || 'Could not load data')
     }
     setLoading(false)
   }
 
-  useEffect(() => { loadAll() }, [user?.station_id])
+  useEffect(() => { 
+    loadAll() 
+  }, [user?.station_id, range.from, range.to])
 
   const stats = useMemo(() => {
     let totalLiters = 0
     let totalSalesAmt = 0
     let totalTopupAmt = 0
     let bigTopups = 0
+
     const inRange = (d) => d && d >= range.from && d <= range.to
 
     salesRows.forEach(r => {
@@ -142,7 +167,7 @@ export default function FuelCards({ profile }) {
     topupRows.forEach(r => {
       const day = String(r?.txn_at || '').slice(0, 10)
       if (!inRange(day)) return
-      const amt = Number(r?.top_up_amount || 0) 
+      const amt = Number(r?.top_up_amount || r?.amount || 0) 
       totalTopupAmt += amt
       if (amt >= 100000) bigTopups++
     })
@@ -163,6 +188,7 @@ export default function FuelCards({ profile }) {
 
       const name = rawName || 'Unknown'
       if (!map[name]) map[name] = { name, salesAmt: 0, liters: 0, topupAmt: 0, cards: new Set() }
+      
       map[name].salesAmt += Number(r?.original_amount || 0)
       map[name].liters += Number(r?.quantity || 0)
       if (r?.card_number) map[name].cards.add(r.card_number)
@@ -203,6 +229,13 @@ export default function FuelCards({ profile }) {
               </button>
               <button className="btn-primary" onClick={() => setOpenUpload('topups')}>
                 <i className="fas fa-upload" /> Top-ups
+              </button>
+              <button 
+                className="btn-ghost" 
+                style={{ color: '#2563eb', borderColor: '#2563eb' }} 
+                onClick={() => setOpenReconcile(true)}
+              >
+                <i className="fas fa-balance-scale" /> Reconcile
               </button>
             </>
           )}
@@ -319,12 +352,20 @@ export default function FuelCards({ profile }) {
           onSaved={async () => { setOpenUpload(null); await loadAll() }}
         />
       )}
+
+      {openReconcile && (
+        <ReconcileModal
+          profile={profile}
+          onClose={() => setOpenReconcile(false)}
+          onSaved={async () => { setOpenReconcile(false); await loadAll() }}
+        />
+      )}
     </div>
   )
 }
 
 /* ============================================================
-   APP USERS TABLE (With Amount Column)
+   APP USERS TABLE
    ============================================================ */
 function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }) {
   const [openClaim, setOpenClaim] = useState(null)
@@ -713,6 +754,203 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
           <button className="btn-primary-full" onClick={save} disabled={busy || !preview}>
             {busy ? 'Saving…' : preview ? `Save ${preview.rows.length} rows` : 'Save'}
           </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ============================================================
+   RECONCILE MODAL
+   ============================================================ */
+function ReconcileModal({ profile, onClose, onSaved }) {
+  const user = profile.user
+  const [fileType, setFileType] = useState('sales')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const [result, setResult] = useState(null)
+  const [preview, setPreview] = useState(null)
+  const [file, setFile] = useState(null)
+
+  async function handleFile(f) {
+    if (!f) return
+    setErr(''); setFile(f); setResult(null)
+    try {
+      const buf = await f.arrayBuffer()
+      const wb = XLSX.read(buf, { type: 'array' })
+      const sheet = wb.Sheets[wb.SheetNames[0]]
+      
+      let rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
+      rows = rows.filter(r => r.length > 0 && r.some(c => c !== '' && c != null))
+
+      if (rows.length < 2) { setErr('File has no data rows'); return }
+      const dataRows = rows.slice(1)
+
+      const parsed = dataRows.map(r => {
+        if (fileType === 'sales') {
+          return {
+            txn_id: String(r[0] || ''), txn_at: parseDate(r[1]),
+            customer_name: String(r[3] || ''), card_number: String(r[4] || ''),
+            product_code: String(r[5] || ''), product: String(r[6] || ''),
+            quantity: num(r[7]), original_price: num(r[8]), discounted_price: num(r[9]),
+            discount: num(r[10]), original_amount: num(r[11]), discounted_amount: num(r[12]),
+            payment_method: String(r[13] || ''), points: num(r[14]),
+            transaction_type: String(r[15] || ''), staff_name: String(r[16] || ''),
+            narrative: String(r[17] || ''),
+          }
+        } else {
+          return {
+            txn_id: String(r[0] || ''), txn_at: parseDate(r[1]),
+            customer_name: String(r[3] || ''), card_number: String(r[4] || ''),
+            top_up_amount: num(r[5]), prev_balance: num(r[6]), new_balance: num(r[7]),
+            prev_points: num(r[8]), new_points: num(r[9]),
+            transaction_type: String(r[10] || ''), staff_name: String(r[11] || ''),
+            narrative: String(r[12] || ''),
+          }
+        }
+      }).filter(r => r.txn_at && r.txn_id)
+
+      if (parsed.length === 0) { setErr('No valid rows found in file.'); return }
+      setPreview(parsed)
+    } catch (e) {
+      console.error(e)
+      setErr('Could not parse file: ' + e.message)
+    }
+  }
+
+  async function runReconcile() {
+    if (!preview || preview.length === 0) return
+    setBusy(true); setErr(''); setResult(null)
+    
+    try {
+      const table = fileType === 'sales' ? 'card_sales' : 'card_topups'
+      const txnIds = preview.map(r => r.txn_id)
+      
+      const { data: existing, error: fetchErr } = await supabase
+        .from(table)
+        .select('txn_id')
+        .eq('station_id', user.station_id)
+        .in('txn_id', txnIds)
+      
+      if (fetchErr) throw fetchErr
+      
+      const existingSet = new Set((existing || []).map(e => e.txn_id))
+      
+      const toUpdate = preview.filter(r => existingSet.has(r.txn_id))
+      const toInsert = preview.filter(r => !existingSet.has(r.txn_id))
+
+      let updatedCount = 0
+      let insertedCount = 0
+
+      if (toInsert.length > 0) {
+        const insertRows = toInsert.map(r => ({ 
+          ...r, 
+          station_id: user.station_id,
+          updated_at: new Date().toISOString()
+        }))
+        
+        for (let i = 0; i < insertRows.length; i += 200) {
+          const batch = insertRows.slice(i, i + 200)
+          const { error } = await supabase.from(table).insert(batch)
+          if (error) throw error
+          insertedCount += batch.length
+        }
+      }
+
+      if (toUpdate.length > 0) {
+        for (const row of toUpdate) {
+          const { txn_id, ...updateData } = row
+          
+          const { error } = await supabase.from(table)
+            .update({ ...updateData, updated_at: new Date().toISOString() })
+            .eq('station_id', user.station_id)
+            .eq('txn_id', txn_id)
+            
+          if (error) throw error
+          updatedCount++
+        }
+      }
+
+      setResult({ updatedCount, insertedCount, total: preview.length })
+      setPreview(null)
+    } catch (e) {
+      console.error(e)
+      setErr(e.message || 'Reconciliation failed')
+    }
+    setBusy(false)
+  }
+
+  function num(v) {
+    if (v == null || v === '') return 0
+    const n = Number(String(v).replace(/,/g, '').trim())
+    return isNaN(n) ? 0 : n
+  }
+
+  function parseDate(v) {
+    if (v == null || v === '') return null
+    const s = String(v).trim()
+    const matchYMD = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
+    if (matchYMD) {
+      const [, y, mo, d, h, mi, sec] = matchYMD
+      const dt = new Date(Date.UTC(Number(y), Number(mo)-1, Number(d), Number(h||0), Number(mi||0), Number(sec||0)))
+      if (!isNaN(dt.getTime())) return dt.toISOString()
+    }
+    const matchMDY = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
+    if (matchMDY) {
+      let [, p1, p2, y, h, mi, sec] = matchMDY
+      p1 = Number(p1); p2 = Number(p2); y = Number(y); if(y<100) y+=2000
+      const mo = p1 > 12 ? p2 : p1; const d = p1 > 12 ? p1 : p2
+      const dt = new Date(Date.UTC(y, mo-1, d, Number(h||0), Number(mi||0), Number(sec||0)))
+      if (!isNaN(dt.getTime())) return dt.toISOString()
+    }
+    const iso = new Date(s)
+    if (!isNaN(iso.getTime())) return iso.toISOString()
+    return null
+  }
+
+  return (
+    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal modal-wide">
+        <h3>Reconcile Fuel Cards</h3>
+        <div className="modal-sub">
+          Upload a file to update existing records and insert missing ones.
+        </div>
+
+        <label>Data Type</label>
+        <select value={fileType} onChange={e => { setFileType(e.target.value); setPreview(null); setResult(null) }} disabled={busy || !!result}>
+          <option value="sales">Sales Report</option>
+          <option value="topups">Top-up Report</option>
+        </select>
+
+        <label>File</label>
+        <input type="file" accept=".csv,.xlsx,.xls" onChange={e => handleFile(e.target.files?.[0])} disabled={busy || !!result} />
+
+        {preview && !result && (
+          <div className="field-hint" style={{ marginTop: 12, background: '#eff6ff', color: '#1e40af' }}>
+            <i className="fas fa-info-circle" /> Ready to process {preview.length} rows.
+          </div>
+        )}
+
+        {result && (
+          <div style={{ marginTop: 20 }}>
+            <div className="section-title">Reconciliation Result</div>
+            <div className="result-row"><span className="lbl">Total rows in file</span><span className="val">{result.total}</span></div>
+            <div className="result-row"><span className="lbl" style={{ color: '#2563eb' }}>Updated existing</span><span className="val">{result.updatedCount}</span></div>
+            <div className="result-row"><span className="lbl" style={{ color: '#10b981' }}>Inserted new</span><span className="val">{result.insertedCount}</span></div>
+          </div>
+        )}
+
+        {err && <div className="auth-err">{err}</div>}
+
+        <div className="modal-actions">
+          <button className="btn-ghost-full" onClick={result ? onSaved : onClose}>
+            {result ? 'Done' : 'Cancel'}
+          </button>
+          {!result && (
+            <button className="btn-primary-full" onClick={runReconcile} disabled={busy || !preview}>
+              {busy ? 'Reconciling…' : 'Run Reconciliation'}
+            </button>
+          )}
         </div>
       </div>
     </div>
