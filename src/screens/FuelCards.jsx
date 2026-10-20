@@ -7,9 +7,12 @@ export default function FuelCards({ profile }) {
   const powers = profile?.powers || {}
   const role = user?.role || 'attendant'
   
+  const isCompanyPhone = role === 'company_phone'
   const isManager = ['admin', 'manager', 'supervisor'].includes(role)
-  const canUpload = isManager || role === 'ambassador' || powers.upload_fuelcards
-  const canDownload = isManager || powers.export_performance
+  
+  // Only managers and ambassadors can upload
+  const canUpload = !isCompanyPhone && (isManager || role === 'ambassador' || powers.upload_fuelcards)
+  const canDownload = !isCompanyPhone && (isManager || powers.export_performance)
 
   const [tab, setTab] = useState('overview')
   const [loading, setLoading] = useState(true)
@@ -44,27 +47,23 @@ export default function FuelCards({ profile }) {
       const toISO = range.to + 'T23:59:59'
 
       // 1. Fetch Sales
-      const { data: s, error: sErr } = await supabase
+      const { data: s } = await supabase
         .from('card_sales')
         .select('*')
         .eq('station_id', user.station_id)
         .gte('txn_at', fromISO)
         .lte('txn_at', toISO)
         .order('txn_at', { ascending: false })
-      
-      if (sErr) console.error("Sales Error:", sErr)
       setSalesRows(s || [])
 
       // 2. Fetch Top-ups
-      const { data: t, error: tErr } = await supabase
+      const { data: t } = await supabase
         .from('card_topups')
         .select('*')
         .eq('station_id', user.station_id)
         .gte('txn_at', fromISO)
         .lte('txn_at', toISO)
         .order('txn_at', { ascending: false })
-      
-      if (tErr) console.error("Topups Error:", tErr)
       setTopupRows(t || [])
 
       // 3. Fetch Uploads
@@ -260,7 +259,9 @@ export default function FuelCards({ profile }) {
         <button className={`tab ${tab === 'overview' ? 'active' : ''}`} onClick={() => setTab('overview')}>Daily</button>
         <button className={`tab ${tab === 'staff' ? 'active' : ''}`} onClick={() => setTab('staff')}>By Staff</button>
         <button className={`tab ${tab === 'app-users' ? 'active' : ''}`} onClick={() => setTab('app-users')}>App Users (Claim)</button>
-        <button className={`tab ${tab === 'uploads' ? 'active' : ''}`} onClick={() => setTab('uploads')}>Uploads</button>
+        {!isCompanyPhone && (
+          <button className={`tab ${tab === 'uploads' ? 'active' : ''}`} onClick={() => setTab('uploads')}>Uploads</button>
+        )}
       </div>
 
       {errorMsg && <div className="auth-err" style={{ margin: '0 32px 20px' }}>{errorMsg}</div>}
@@ -527,8 +528,6 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
     if (!f) return
     setErr(''); setFile(f)
     try {
-      let rows = []
-
       let text = await f.text()
       text = text.replace(/^\uFEFF/, '') 
       text = text.replace(/"/g, '') 
@@ -761,7 +760,7 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
 }
 
 /* ============================================================
-   RECONCILE MODAL
+   RECONCILE MODAL (Upsert version - instant)
    ============================================================ */
 function ReconcileModal({ profile, onClose, onSaved }) {
   const user = profile.user
@@ -776,10 +775,10 @@ function ReconcileModal({ profile, onClose, onSaved }) {
     if (!f) return
     setErr(''); setFile(f); setResult(null)
     try {
-      let rows = []
       let text = await f.text()
       text = text.replace(/^\uFEFF/, '') 
       text = text.replace(/"/g, '') 
+
       const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0)
       
       if (lines.length < 2) { setErr('File is empty or has no data rows'); return }
@@ -824,54 +823,20 @@ function ReconcileModal({ profile, onClose, onSaved }) {
     
     try {
       const table = fileType === 'sales' ? 'card_sales' : 'card_topups'
-      const txnIds = preview.map(r => r.txn_id)
       
-      const { data: existing, error: fetchErr } = await supabase
+      const upsertData = preview.map(r => ({
+        ...r,
+        station_id: user.station_id,
+        updated_at: new Date().toISOString()
+      }))
+
+      const { error: upsertErr } = await supabase
         .from(table)
-        .select('txn_id')
-        .eq('station_id', user.station_id)
-        .in('txn_id', txnIds)
-      
-      if (fetchErr) throw fetchErr
-      
-      const existingSet = new Set((existing || []).map(e => e.txn_id))
-      
-      const toUpdate = preview.filter(r => existingSet.has(r.txn_id))
-      const toInsert = preview.filter(r => !existingSet.has(r.txn_id))
+        .upsert(upsertData, { onConflict: 'txn_id' })
 
-      let updatedCount = 0
-      let insertedCount = 0
+      if (upsertErr) throw upsertErr
 
-      if (toInsert.length > 0) {
-        const insertRows = toInsert.map(r => ({ 
-          ...r, 
-          station_id: user.station_id,
-          updated_at: new Date().toISOString()
-        }))
-        
-        for (let i = 0; i < insertRows.length; i += 200) {
-          const batch = insertRows.slice(i, i + 200)
-          const { error } = await supabase.from(table).insert(batch)
-          if (error) throw error
-          insertedCount += batch.length
-        }
-      }
-
-      if (toUpdate.length > 0) {
-        for (const row of toUpdate) {
-          const { txn_id, ...updateData } = row
-          
-          const { error } = await supabase.from(table)
-            .update({ ...updateData, updated_at: new Date().toISOString() })
-            .eq('station_id', user.station_id)
-            .eq('txn_id', txn_id)
-            
-          if (error) throw error
-          updatedCount++
-        }
-      }
-
-      setResult({ updatedCount, insertedCount, total: preview.length })
+      setResult({ total: preview.length })
       setPreview(null)
     } catch (e) {
       console.error(e)
@@ -934,9 +899,10 @@ function ReconcileModal({ profile, onClose, onSaved }) {
         {result && (
           <div style={{ marginTop: 20 }}>
             <div className="section-title">Reconciliation Result</div>
-            <div className="result-row"><span className="lbl">Total rows in file</span><span className="val">{result.total}</span></div>
-            <div className="result-row"><span className="lbl" style={{ color: '#2563eb' }}>Updated existing</span><span className="val">{result.updatedCount}</span></div>
-            <div className="result-row"><span className="lbl" style={{ color: '#10b981' }}>Inserted new</span><span className="val">{result.insertedCount}</span></div>
+            <div className="result-row">
+              <span className="lbl">Successfully processed</span>
+              <span className="val" style={{ color: '#10b981' }}>{result.total} rows</span>
+            </div>
           </div>
         )}
 

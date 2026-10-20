@@ -130,14 +130,13 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
     loadCount()
   }, [profile?.user?.id, screen])
 
-  // Realtime transactions — only for staff who can view or claim
+  // Realtime transactions
   const canReceivePopups = profile?.user && (
     ['admin','manager','supervisor','ambassador','attendant','company_phone'].includes(profile.user.role)
   )
 
   useRealtimeTransactions(
     canReceivePopups ? profile?.user?.station_id : null,
-    // New transaction arrives
     (txn) => {
       if (popupTxn) {
         setPopupQueue(q => [...q, txn])
@@ -145,7 +144,6 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
         setPopupTxn(txn)
       }
     },
-    // Transaction was claimed elsewhere
     (updated) => {
       if (popupTxn && popupTxn.id === updated.id && updated.status === 'claimed') {
         setPopupTxn(null)
@@ -170,7 +168,6 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
   const access = user.access_score ?? 30
   const isCompanyPhone = user.role === 'company_phone'
 
-  // Collect mode: full screen
   if (collectMode) {
     return (
       <Collect
@@ -183,10 +180,11 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
     )
   }
 
-  // Sidebar menu — different rules for company phones
+  // Sidebar menu
   let visibleMenu
   if (isCompanyPhone) {
-    const allowedIds = ['home', 'transactions', 'drops', 'fuel-cards']
+    // Added 'fuel-cards' here so company phones can see it
+    const allowedIds = ['home', 'transactions', 'drops', 'fuel-cards'] 
     visibleMenu = MENU.map(group => ({
       ...group,
       items: group.items.filter(item => allowedIds.includes(item.id))
@@ -207,7 +205,6 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
     <div className="layout">
       {sidebarOpen && <div className="backdrop" onClick={() => setSidebarOpen(false)} />}
 
-      {/* SIDEBAR */}
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
         <div className="sidebar-brand">
           <h1><i className="fas fa-gas-pump" /> TEXOL</h1>
@@ -253,9 +250,7 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
         </div>
       </aside>
 
-      {/* MAIN */}
       <main className="main">
-        {/* TOPBAR */}
         <header className="topbar">
           <div className="topbar-left">
             <button className="menu-toggle" onClick={() => setSidebarOpen(true)}>
@@ -269,7 +264,6 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
             </h2>
           </div>
           <div className="topbar-right">
-            {/* Notification bell — hidden for company phones */}
             {!isCompanyPhone && (
               <button className="notif-btn" onClick={() => go('notifications')}>
                 <i className="fas fa-bell" />
@@ -302,7 +296,6 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
                     <div className="access">{access}%</div>
                   </div>
 
-                  {/* My account — hidden for company phones */}
                   {!isCompanyPhone && (
                     <button
                       className="signout-btn"
@@ -322,7 +315,6 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
           </div>
         </header>
 
-        {/* SCREEN CONTENT */}
         <div className="screen-wrap">
           {screen === 'home' && <Home profile={profile} onNavigate={go} />}
           {screen === 'attendance' && !isCompanyPhone && <Attendance profile={profile} />}
@@ -348,7 +340,10 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
               <p>Company phone accounts can't change their own password. Ask an admin.</p>
             </div>
           )}
-          {screen === 'fuel-cards' && !isCompanyPhone && <FuelCards profile={profile} />}
+          
+          {/* Removed !isCompanyPhone so company phones can view Fuel Cards */}
+          {screen === 'fuel-cards' && <FuelCards profile={profile} />}
+          
           {screen === 'shortages' && !isCompanyPhone && <Shortages profile={profile} />}
           {screen === 'customers' && !isCompanyPhone && <Customers profile={profile} />}
           {screen === 'reports' && !isCompanyPhone && <Reports profile={profile} />}
@@ -361,13 +356,12 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
            screen !== 'fuel-cards' && screen !== 'shortages' &&
            screen !== 'customers' && screen !== 'reports' &&
            screen !== 'transactions' && screen !== 'balancing' &&
-           screen !== 'settings' && (
+           screen !== 'settings' && screen !== 'audit' && (
             <Placeholder screenId={screen} onBack={() => go('home')} />
           )}
         </div>
       </main>
 
-      {/* TRANSACTION POPUP */}
       {popupTxn && (
         <TransactionPopup
           txn={popupTxn}
