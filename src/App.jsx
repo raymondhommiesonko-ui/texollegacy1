@@ -186,7 +186,7 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
   // Sidebar menu — different rules for company phones
   let visibleMenu
   if (isCompanyPhone) {
-    const allowedIds = ['home', 'transactions', 'drops']
+    const allowedIds = ['home', 'transactions', 'drops', 'fuel-cards']
     visibleMenu = MENU.map(group => ({
       ...group,
       items: group.items.filter(item => allowedIds.includes(item.id))
