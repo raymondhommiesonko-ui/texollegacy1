@@ -10,7 +10,6 @@ export default function FuelCards({ profile }) {
   const isCompanyPhone = role === 'company_phone'
   const isManager = ['admin', 'manager', 'supervisor'].includes(role)
   
-  // Only managers and ambassadors can upload
   const canUpload = !isCompanyPhone && (isManager || role === 'ambassador' || powers.upload_fuelcards)
   const canDownload = !isCompanyPhone && (isManager || powers.export_performance)
 
@@ -255,12 +254,13 @@ export default function FuelCards({ profile }) {
         <Stat label="Top-ups ≥100k" value={`${stats.bigTopups}`} sub="Qualifying top-ups" />
       </div>
 
-      <div className="tabs" style={{ paddingTop: 0, overflowX: 'auto', whiteSpace: 'nowrap' }}>
-        <button className={`tab ${tab === 'overview' ? 'active' : ''}`} onClick={() => setTab('overview')}>Daily</button>
-        <button className={`tab ${tab === 'staff' ? 'active' : ''}`} onClick={() => setTab('staff')}>By Staff</button>
-        <button className={`tab ${tab === 'app-users' ? 'active' : ''}`} onClick={() => setTab('app-users')}>App Users (Claim)</button>
+      {/* CLEAN TABS */}
+      <div className="staff-filters" style={{ borderBottom: '1px solid #e2e8f0', paddingBottom: 0, marginBottom: 20, gap: 4 }}>
+        <button className={`btn-ghost btn-sm ${tab === 'overview' ? 'active' : ''}`} style={{ borderRadius: '10px 10px 0 0', borderBottom: tab === 'overview' ? '2px solid #0b1a2e' : '2px solid transparent', fontWeight: 600 }} onClick={() => setTab('overview')}>Daily</button>
+        <button className={`btn-ghost btn-sm ${tab === 'staff' ? 'active' : ''}`} style={{ borderRadius: '10px 10px 0 0', borderBottom: tab === 'staff' ? '2px solid #0b1a2e' : '2px solid transparent', fontWeight: 600 }} onClick={() => setTab('staff')}>By Staff</button>
+        <button className={`btn-ghost btn-sm ${tab === 'app-users' ? 'active' : ''}`} style={{ borderRadius: '10px 10px 0 0', borderBottom: tab === 'app-users' ? '2px solid #0b1a2e' : '2px solid transparent', fontWeight: 600 }} onClick={() => setTab('app-users')}>App Users (Claim)</button>
         {!isCompanyPhone && (
-          <button className={`tab ${tab === 'uploads' ? 'active' : ''}`} onClick={() => setTab('uploads')}>Uploads</button>
+          <button className={`btn-ghost btn-sm ${tab === 'uploads' ? 'active' : ''}`} style={{ borderRadius: '10px 10px 0 0', borderBottom: tab === 'uploads' ? '2px solid #0b1a2e' : '2px solid transparent', fontWeight: 600 }} onClick={() => setTab('uploads')}>Uploads</button>
         )}
       </div>
 
@@ -365,10 +365,34 @@ export default function FuelCards({ profile }) {
 }
 
 /* ============================================================
-   APP USERS TABLE
+   APP USERS TABLE (Grouped by Staff)
    ============================================================ */
 function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }) {
   const [openClaim, setOpenClaim] = useState(null)
+  const [view, setView] = useState('grouped') // 'grouped' | 'all'
+
+  // Group by staff
+  const grouped = useMemo(() => {
+    const map = {}
+    appUsers.forEach(u => {
+      const key = u.claimed_by || 'unclaimed'
+      if (!map[key]) {
+        const codeObj = u.claimed_by ? staffCodes[u.claimed_by] : null
+        map[key] = {
+          id: key,
+          name: codeObj ? `${codeObj.name} (${codeObj.code})` : 'Unclaimed',
+          color: codeObj?.color || '#64748B',
+          total: 0,
+          count: 0,
+          rows: []
+        }
+      }
+      map[key].total += Number(u.amount || 0)
+      map[key].count++
+      map[key].rows.push(u)
+    })
+    return Object.values(map).sort((a,b) => b.total - a.total)
+  }, [appUsers, staffCodes])
 
   function download() {
     const rows = appUsers.map(u => [
@@ -383,59 +407,104 @@ function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }
 
   return (
     <>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '0 32px 10px' }}>
+      <div className="staff-filters" style={{ paddingTop: 0 }}>
+        <button className={`btn-ghost btn-sm ${view === 'grouped' ? 'active' : ''}`} onClick={() => setView('grouped')}>By Attendant</button>
+        <button className={`btn-ghost btn-sm ${view === 'all' ? 'active' : ''}`} onClick={() => setView('all')}>All Transactions</button>
+        
+        <div style={{ flex: 1 }}></div>
+        
         {canDownload && (
-          <button className="btn-ghost" onClick={download}><i className="fas fa-download" /> Download CSV</button>
+          <button className="btn-ghost btn-sm" onClick={download}><i className="fas fa-download" /> Download CSV</button>
         )}
       </div>
-      <div className="drops-table-wrap">
-        <table className="drops-table">
-          <thead>
-            <tr>
-              <th>Txn ID</th>
-              <th>Customer</th>
-              <th>Card Number</th>
-              <th>Amount</th>
-              <th>Claimed By</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {appUsers.map(u => {
-              const isClaimed = !!u.claimed_by
-              const codeObj = isClaimed ? staffCodes[u.claimed_by] : null
-              
-              return (
-                <tr key={u.txn_id}>
-                  <td><span className="code-pill">{u.txn_id}</span></td>
-                  <td>{u.customer_name}</td>
-                  <td>{u.card_number}</td>
-                  <td><strong>UGX {Number(u.amount || 0).toLocaleString()}</strong></td>
+
+      {view === 'grouped' ? (
+        <div className="drops-table-wrap">
+          <table className="drops-table">
+            <thead>
+              <tr>
+                <th>Attendant</th>
+                <th>Transactions</th>
+                <th>Total Claimed</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {grouped.map(g => (
+                <tr key={g.id}>
                   <td>
-                    {isClaimed ? (
-                      <span style={{ color: codeObj?.color || '#000', fontWeight: 700 }}>
-                        {codeObj?.name || 'Staff'} ({codeObj?.code || '—'})
-                      </span>
-                    ) : (
-                      <span className="pill amber">Unclaimed</span>
-                    )}
+                    <span style={{ 
+                      display: 'inline-block', width: 10, height: 10, borderRadius: '50%', 
+                      background: g.color, marginRight: 8 
+                    }} />
+                    <strong style={{ color: g.id === 'unclaimed' ? '#dc2626' : '#0b1a2e' }}>{g.name}</strong>
                   </td>
+                  <td>{g.count} txns</td>
+                  <td><strong>UGX {g.total.toLocaleString()}</strong></td>
                   <td>
-                    {!isClaimed && (
-                      <button className="btn-tiny success" onClick={() => setOpenClaim(u)}>
-                        <i className="fas fa-hand-paper" /> Claim
-                      </button>
-                    )}
+                    <button className="btn-tiny" onClick={() => {
+                      // Quick switch to all and filter visually
+                      setView('all')
+                    }}>View</button>
                   </td>
                 </tr>
-              )
-            })}
-            {appUsers.length === 0 && (
-              <tr><td colSpan="6" style={{ textAlign: 'center', padding: 20 }}>No App Users found</td></tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+              ))}
+              {grouped.length === 0 && (
+                <tr><td colSpan="4" style={{ textAlign: 'center', padding: 20 }}>No App Users found</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="drops-table-wrap">
+          <table className="drops-table">
+            <thead>
+              <tr>
+                <th>Txn ID</th>
+                <th>Customer</th>
+                <th>Card Number</th>
+                <th>Amount</th>
+                <th>Claimed By</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {appUsers.map(u => {
+                const isClaimed = !!u.claimed_by
+                const codeObj = isClaimed ? staffCodes[u.claimed_by] : null
+                
+                return (
+                  <tr key={u.txn_id}>
+                    <td><span className="code-pill">{u.txn_id}</span></td>
+                    <td>{u.customer_name}</td>
+                    <td>{u.card_number}</td>
+                    <td><strong>UGX {Number(u.amount || 0).toLocaleString()}</strong></td>
+                    <td>
+                      {isClaimed ? (
+                        <span style={{ color: codeObj?.color || '#000', fontWeight: 700 }}>
+                          {codeObj?.name || 'Staff'} ({codeObj?.code || '—'})
+                        </span>
+                      ) : (
+                        <span className="pill amber">Unclaimed</span>
+                      )}
+                    </td>
+                    <td>
+                      {!isClaimed && (
+                        <button className="btn-tiny success" onClick={() => setOpenClaim(u)}>
+                          <i className="fas fa-hand-paper" /> Claim
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+              {appUsers.length === 0 && (
+                <tr><td colSpan="6" style={{ textAlign: 'center', padding: 20 }}>No App Users found</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {openClaim && (
         <ClaimAppUserModal 
@@ -760,7 +829,7 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
 }
 
 /* ============================================================
-   RECONCILE MODAL (Upsert version - instant)
+   RECONCILE MODAL (Safe Insert Only)
    ============================================================ */
 function ReconcileModal({ profile, onClose, onSaved }) {
   const user = profile.user
@@ -823,20 +892,56 @@ function ReconcileModal({ profile, onClose, onSaved }) {
     
     try {
       const table = fileType === 'sales' ? 'card_sales' : 'card_topups'
+      const txnIds = preview.map(r => r.txn_id)
       
-      const upsertData = preview.map(r => ({
-        ...r,
-        station_id: user.station_id,
-        updated_at: new Date().toISOString()
-      }))
-
-      const { error: upsertErr } = await supabase
+      const { data: existing, error: fetchErr } = await supabase
         .from(table)
-        .upsert(upsertData, { onConflict: 'txn_id' })
+        .select('txn_id')
+        .eq('station_id', user.station_id)
+        .in('txn_id', txnIds)
+      
+      if (fetchErr) throw fetchErr
+      
+      const existingSet = new Set((existing || []).map(e => e.txn_id))
+      const toInsert = preview.filter(r => !existingSet.has(r.txn_id))
+      let insertedCount = 0
 
-      if (upsertErr) throw upsertErr
+      if (toInsert.length > 0) {
+        const insertRows = toInsert.map(r => ({ 
+          ...r, 
+          station_id: user.station_id,
+          updated_at: new Date().toISOString()
+        }))
+        
+        for (let i = 0; i < insertRows.length; i += 200) {
+          const batch = insertRows.slice(i, i + 200)
+          const { error } = await supabase.from(table).insert(batch)
+          if (error) throw error
+          insertedCount += batch.length
+        }
+      }
 
-      setResult({ total: preview.length })
+      if (fileType === 'sales' && insertedCount > 0) {
+        const appUserRows = toInsert
+          .filter(r => String(r.staff_name).replace(/\s+/g, '').toLowerCase().includes('appuser'))
+          .map(r => ({
+            station_id: user.station_id,
+            txn_id: r.txn_id,
+            card_number: r.card_number,
+            customer_name: r.customer_name,
+            amount: r.original_amount
+          }))
+        
+        if (appUserRows.length > 0) {
+          await supabase.from('app_users').upsert(appUserRows, { onConflict: 'txn_id' })
+        }
+      }
+
+      setResult({ 
+        total: preview.length,
+        inserted: insertedCount,
+        skipped: preview.length - insertedCount
+      })
       setPreview(null)
     } catch (e) {
       console.error(e)
@@ -878,7 +983,7 @@ function ReconcileModal({ profile, onClose, onSaved }) {
       <div className="modal modal-wide">
         <h3>Reconcile Fuel Cards</h3>
         <div className="modal-sub">
-          Upload a file to update existing records and insert missing ones.
+          Upload a file to find missing records. This only adds new rows, it does not overwrite existing ones.
         </div>
 
         <label>Data Type</label>
@@ -892,7 +997,7 @@ function ReconcileModal({ profile, onClose, onSaved }) {
 
         {preview && !result && (
           <div className="field-hint" style={{ marginTop: 12, background: '#eff6ff', color: '#1e40af' }}>
-            <i className="fas fa-info-circle" /> Ready to process {preview.length} rows.
+            <i className="fas fa-info-circle" /> Ready to compare {preview.length} rows.
           </div>
         )}
 
@@ -900,8 +1005,16 @@ function ReconcileModal({ profile, onClose, onSaved }) {
           <div style={{ marginTop: 20 }}>
             <div className="section-title">Reconciliation Result</div>
             <div className="result-row">
-              <span className="lbl">Successfully processed</span>
-              <span className="val" style={{ color: '#10b981' }}>{result.total} rows</span>
+              <span className="lbl">Rows in file</span>
+              <span className="val">{result.total}</span>
+            </div>
+            <div className="result-row">
+              <span className="lbl" style={{ color: '#10b981' }}>New records inserted</span>
+              <span className="val">{result.inserted}</span>
+            </div>
+            <div className="result-row">
+              <span className="lbl" style={{ color: '#8ba0b9' }}>Already existed (skipped)</span>
+              <span className="val">{result.skipped}</span>
             </div>
           </div>
         )}
