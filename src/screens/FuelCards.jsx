@@ -29,6 +29,7 @@ export default function FuelCards({ profile }) {
   const [topupRows, setTopupRows] = useState([])
   const [appUsers, setAppUsers] = useState([])
   const [staffCodes, setStaffCodes] = useState({})
+  const [staffRoles, setStaffRoles] = useState({})
   const [uploads, setUploads] = useState([])
 
   async function loadAll() {
@@ -74,21 +75,21 @@ export default function FuelCards({ profile }) {
         .limit(20)
       setUploads(u || [])
 
-      // 4. Fetch App Users
+      // 4. Fetch App Users (NOW FILTERING BY TXN_AT, NOT CREATED_AT)
       const { data: au } = await supabase
         .from('app_users')
         .select('*')
         .eq('station_id', user.station_id)
-        .gte('created_at', fromISO)
-        .lte('created_at', toISO)
-        .order('created_at', { ascending: false })
+        .gte('txn_at', fromISO)
+        .lte('txn_at', toISO)
+        .order('txn_at', { ascending: false })
 
       let finalAppUsers = au || []
 
       if (finalAppUsers.length === 0) {
         const { data: fromSales } = await supabase
           .from('card_sales')
-          .select('txn_id, card_number, customer_name, staff_name, original_amount')
+          .select('txn_id, card_number, customer_name, staff_name, original_amount, txn_at')
           .eq('station_id', user.station_id)
           .gte('txn_at', fromISO)
           .lte('txn_at', toISO)
@@ -102,6 +103,7 @@ export default function FuelCards({ profile }) {
               card_number: s.card_number,
               customer_name: s.customer_name,
               amount: s.original_amount,
+              txn_at: s.txn_at,
               claimed_by: null,
               is_fallback: true
             }))
@@ -109,7 +111,7 @@ export default function FuelCards({ profile }) {
       }
       setAppUsers(finalAppUsers)
 
-      // 5. Fetch Staff Codes
+      // 5. Fetch Staff Codes & Roles
       const { data: codes } = await supabase
         .from('staff_codes')
         .select('user_id, code, color')
@@ -117,11 +119,17 @@ export default function FuelCards({ profile }) {
       
       const { data: staff } = await supabase
         .from('users')
-        .select('id, name')
+        .select('id, name, role')
         .eq('station_id', user.station_id)
       
       const userMap = {}
-      ;(staff || []).forEach(u => { if (u?.id) userMap[u.id] = u.name || 'Staff' })
+      const roleMap = {}
+      ;(staff || []).forEach(u => { 
+        if (u?.id) {
+          userMap[u.id] = u.name || 'Staff'
+          roleMap[u.name || 'Staff'] = u.role || 'attendant'
+        }
+      })
       
       const codeMap = {}
       ;(codes || []).forEach(c => {
@@ -134,6 +142,7 @@ export default function FuelCards({ profile }) {
         }
       })
       setStaffCodes(codeMap)
+      setStaffRoles(roleMap)
 
     } catch (e) {
       console.error("Crash caught:", e)
@@ -146,19 +155,28 @@ export default function FuelCards({ profile }) {
     loadAll() 
   }, [user?.station_id, range.from, range.to])
 
+  // --- MAIN STATS ---
   const stats = useMemo(() => {
     let totalLiters = 0
     let totalSalesAmt = 0
     let totalTopupAmt = 0
     let bigTopups = 0
+    let ambassadorSales = 0
+    let attendantSales = 0
 
     const inRange = (d) => d && d >= range.from && d <= range.to
 
     salesRows.forEach(r => {
       const day = String(r?.txn_at || '').slice(0, 10)
       if (!inRange(day)) return
+      
+      const amt = Number(r?.original_amount || 0)
       totalLiters += Number(r?.quantity || 0)
-      totalSalesAmt += Number(r?.original_amount || 0) 
+      totalSalesAmt += amt
+
+      const role = staffRoles[r.staff_name] || 'attendant'
+      if (role === 'ambassador') ambassadorSales += amt
+      else attendantSales += amt
     })
 
     topupRows.forEach(r => {
@@ -169,9 +187,48 @@ export default function FuelCards({ profile }) {
       if (amt >= 100000) bigTopups++
     })
 
-    return { totalLiters, totalSalesAmt, totalTopupAmt, bigTopups }
+    return { totalLiters, totalSalesAmt, totalTopupAmt, bigTopups, ambassadorSales, attendantSales }
+  }, [salesRows, topupRows, range, staffRoles])
+
+  // --- CHART DATA (Top 5 Staff) ---
+  const chartData = useMemo(() => {
+    const map = {}
+    const isAppUser = (name) => String(name || '').replace(/\s+/g, '').toLowerCase().includes('appuser')
+    const inRange = (d) => d && d >= range.from && d <= range.to
+
+    salesRows.forEach(r => {
+      const day = String(r?.txn_at || '').slice(0, 10)
+      if (!inRange(day)) return
+      const rawName = String(r?.staff_name || '').trim()
+      if (isAppUser(rawName)) return 
+
+      const name = rawName || 'Unknown'
+      if (!map[name]) map[name] = { name, sales: 0, topups: 0 }
+      map[name].sales += Number(r?.original_amount || 0)
+    })
+
+    topupRows.forEach(r => {
+      const day = String(r?.txn_at || '').slice(0, 10)
+      if (!inRange(day)) return
+      const rawName = String(r?.staff_name || '').trim()
+      if (isAppUser(rawName)) return 
+
+      const name = rawName || 'Unknown'
+      if (!map[name]) map[name] = { name, sales: 0, topups: 0 }
+      map[name].topups += Number(r?.top_up_amount || r?.amount || 0)
+    })
+
+    const sorted = Object.values(map).sort((a,b) => b.sales - a.sales).slice(0, 5)
+    const maxVal = Math.max(...sorted.map(s => Math.max(s.sales, s.topups)), 1)
+    
+    return sorted.map(s => ({
+      ...s,
+      salesPct: (s.sales / maxVal) * 100,
+      topupsPct: (s.topups / maxVal) * 100
+    }))
   }, [salesRows, topupRows, range])
 
+  // --- PER STAFF TABLE ---
   const staffPerformance = useMemo(() => {
     const map = {}
     const isAppUser = (name) => String(name || '').replace(/\s+/g, '').toLowerCase().includes('appuser')
@@ -249,14 +306,14 @@ export default function FuelCards({ profile }) {
 
       <div className="dashboard-grid">
         <Stat label="Total Liters Sold" value={`${stats.totalLiters.toLocaleString()} L`} sub="From sales quantity" />
-        <Stat label="Total Sales Amount" value={`UGX ${stats.totalSalesAmt.toLocaleString()}`} sub="Original amount (Col L)" />
-        <Stat label="Total Top-ups" value={`UGX ${stats.totalTopupAmt.toLocaleString()}`} sub="Top-up amount (Col F)" />
+        <Stat label="Total Sales" value={`UGX ${stats.totalSalesAmt.toLocaleString()}`} sub="Amb vs Att below" />
+        <Stat label="Total Top-ups" value={`UGX ${stats.totalTopupAmt.toLocaleString()}`} sub="Top-up amount" />
         <Stat label="Top-ups ≥100k" value={`${stats.bigTopups}`} sub="Qualifying top-ups" />
       </div>
 
       {/* CLEAN TABS */}
       <div className="staff-filters" style={{ borderBottom: '1px solid #e2e8f0', paddingBottom: 0, marginBottom: 20, gap: 4 }}>
-        <button className={`btn-ghost btn-sm ${tab === 'overview' ? 'active' : ''}`} style={{ borderRadius: '10px 10px 0 0', borderBottom: tab === 'overview' ? '2px solid #0b1a2e' : '2px solid transparent', fontWeight: 600 }} onClick={() => setTab('overview')}>Daily</button>
+        <button className={`btn-ghost btn-sm ${tab === 'overview' ? 'active' : ''}`} style={{ borderRadius: '10px 10px 0 0', borderBottom: tab === 'overview' ? '2px solid #0b1a2e' : '2px solid transparent', fontWeight: 600 }} onClick={() => setTab('overview')}>Daily Chart</button>
         <button className={`btn-ghost btn-sm ${tab === 'staff' ? 'active' : ''}`} style={{ borderRadius: '10px 10px 0 0', borderBottom: tab === 'staff' ? '2px solid #0b1a2e' : '2px solid transparent', fontWeight: 600 }} onClick={() => setTab('staff')}>By Staff</button>
         <button className={`btn-ghost btn-sm ${tab === 'app-users' ? 'active' : ''}`} style={{ borderRadius: '10px 10px 0 0', borderBottom: tab === 'app-users' ? '2px solid #0b1a2e' : '2px solid transparent', fontWeight: 600 }} onClick={() => setTab('app-users')}>App Users (Claim)</button>
         {!isCompanyPhone && (
@@ -269,11 +326,54 @@ export default function FuelCards({ profile }) {
       {loading ? (
         <div className="drops-empty">Loading…</div>
       ) : tab === 'overview' ? (
-        <div className="drops-empty">
-          <i className="fas fa-chart-pie" />
-          <h4>Daily breakdown</h4>
-          <p>Summary cards above reflect the selected date range.</p>
+        // --- DAILY BREAKDOWN (Chart + Amb vs Att) ---
+        <div style={{ padding: '0 32px 32px' }}>
+          
+          <div className="dashboard-grid" style={{ padding: 0, marginBottom: 24 }}>
+            <div className="stat-card" style={{ borderLeft: '4px solid #10b981' }}>
+              <div className="stat-title">Ambassador Sales</div>
+              <div className="stat-value">UGX {stats.ambassadorSales.toLocaleString()}</div>
+            </div>
+            <div className="stat-card" style={{ borderLeft: '4px solid #3b82f6' }}>
+              <div className="stat-title">Attendant Sales</div>
+              <div className="stat-value">UGX {stats.attendantSales.toLocaleString()}</div>
+            </div>
+          </div>
+
+          <div className="card" style={{ padding: 24 }}>
+            <h3 style={{ marginBottom: 24 }}>Top 5 Staff Performance (Sales vs Top-ups)</h3>
+            
+            {chartData.length === 0 ? (
+              <div className="drops-empty">No data for this date range.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+                {chartData.map(s => (
+                  <div key={s.name}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 13, fontWeight: 600 }}>
+                      <span>{s.name}</span>
+                      <span style={{ color: '#6b85a0' }}>Sales: UGX {s.sales.toLocaleString()}</span>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                        <div style={{ width: '100%', background: '#e2e8f0', height: 12, borderRadius: 6, overflow: 'hidden' }}>
+                          <div style={{ width: `${s.salesPct}%`, background: '#3b82f6', height: '100%', borderRadius: 6 }} />
+                        </div>
+                        <span style={{ fontSize: 11, color: '#6b85a0', width: 80, textAlign: 'right' }}>Sales</span>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                        <div style={{ width: '100%', background: '#e2e8f0', height: 12, borderRadius: 6, overflow: 'hidden' }}>
+                          <div style={{ width: `${s.topupsPct}%`, background: '#10b981', height: '100%', borderRadius: 6 }} />
+                        </div>
+                        <span style={{ fontSize: 11, color: '#6b85a0', width: 80, textAlign: 'right' }}>Top-ups</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
+
       ) : tab === 'staff' ? (
         <div className="drops-table-wrap">
           <table className="drops-table">
@@ -365,13 +465,12 @@ export default function FuelCards({ profile }) {
 }
 
 /* ============================================================
-   APP USERS TABLE (Grouped by Staff)
+   APP USERS TABLE
    ============================================================ */
 function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }) {
   const [openClaim, setOpenClaim] = useState(null)
   const [view, setView] = useState('grouped') // 'grouped' | 'all'
 
-  // Group by staff
   const grouped = useMemo(() => {
     const map = {}
     appUsers.forEach(u => {
@@ -443,7 +542,6 @@ function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }
                   <td><strong>UGX {g.total.toLocaleString()}</strong></td>
                   <td>
                     <button className="btn-tiny" onClick={() => {
-                      // Quick switch to all and filter visually
                       setView('all')
                     }}>View</button>
                   </td>
@@ -542,7 +640,8 @@ function ClaimAppUserModal({ appUser, profile, onClose, onSaved }) {
         txn_id: appUser.txn_id,
         card_number: appUser.card_number,
         customer_name: appUser.customer_name,
-        amount: appUser.amount
+        amount: appUser.amount,
+        txn_at: appUser.txn_at // Added txn_at
       }).select()
     }
 
@@ -764,7 +863,8 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
             txn_id: r.txn_id,
             card_number: r.card_number,
             customer_name: r.customer_name,
-            amount: r.original_amount
+            amount: r.original_amount,
+            txn_at: r.txn_at // SAVING txn_at HERE
           }))
         
         if (appUserRows.length > 0) {
@@ -929,7 +1029,8 @@ function ReconcileModal({ profile, onClose, onSaved }) {
             txn_id: r.txn_id,
             card_number: r.card_number,
             customer_name: r.customer_name,
-            amount: r.original_amount
+            amount: r.original_amount,
+            txn_at: r.txn_at // SAVING txn_at HERE
           }))
         
         if (appUserRows.length > 0) {
