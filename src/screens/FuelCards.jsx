@@ -21,9 +21,9 @@ export default function FuelCards({ profile }) {
   const [openUpload, setOpenUpload] = useState(null)
   const [openReconcile, setOpenReconcile] = useState(false)
 
-  // Safe date initialization
-  const today = new Date().toISOString().slice(0, 10)
-  const [range, setRange] = useState({ from: today, to: today })
+  // SHIFT STATE
+  const [activeShift, setActiveShift] = useState(null)
+  const [shiftWindow, setShiftWindow] = useState({ from: '', to: '', label: 'Today' })
 
   const [salesRows, setSalesRows] = useState([])
   const [topupRows, setTopupRows] = useState([])
@@ -32,6 +32,61 @@ export default function FuelCards({ profile }) {
   const [staffRoles, setStaffRoles] = useState({})
   const [uploads, setUploads] = useState([])
 
+  // --- 1. FIND THE ACTIVE SHIFT WINDOW ---
+  async function loadShiftWindow() {
+    if (!user?.station_id) return null
+
+    // Check for open shift first
+    const { data: openShifts } = await supabase
+      .from('shifts')
+      .select('*')
+      .eq('station_id', user.station_id)
+      .eq('status', 'open')
+      .order('opened_at', { ascending: false })
+      .limit(1)
+
+    if (openShifts && openShifts.length > 0) {
+      const s = openShifts[0]
+      setActiveShift(s)
+      setShiftWindow({
+        from: s.opened_at,
+        to: new Date().toISOString(),
+        label: `Active Shift (${new Date(s.opened_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} - Now)`
+      })
+      return
+    }
+
+    // If no open shift, find the most recently closed shift
+    const { data: closedShifts } = await supabase
+      .from('shifts')
+      .select('*')
+      .eq('station_id', user.station_id)
+      .eq('status', 'closed')
+      .order('closed_at', { ascending: false })
+      .limit(1)
+
+    if (closedShifts && closedShifts.length > 0) {
+      const s = closedShifts[0]
+      setActiveShift(null)
+      setShiftWindow({
+        from: s.opened_at,
+        to: s.closed_at,
+        label: `Last Shift (${new Date(s.opened_at).toLocaleDateString()} ${new Date(s.opened_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} - ${new Date(s.closed_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})})`
+      })
+      return
+    }
+
+    // Fallback: No shifts exist, use today
+    const today = new Date().toISOString().slice(0, 10)
+    setActiveShift(null)
+    setShiftWindow({
+      from: today + 'T00:00:00',
+      to: today + 'T23:59:59',
+      label: 'Today (No active shift)'
+    })
+  }
+
+  // --- 2. LOAD DATA USING SHIFT WINDOW ---
   async function loadAll() {
     setLoading(true)
     setErrorMsg('')
@@ -43,16 +98,24 @@ export default function FuelCards({ profile }) {
     }
 
     try {
-      const fromISO = range.from + 'T00:00:00'
-      const toISO = range.to + 'T23:59:59'
+      // Get the dates first
+      await loadShiftWindow()
+      
+      // We use the shift window set in state (or fallback)
+      const fromISO = shiftWindow.from
+      const toISO = shiftWindow.to
+
+      // If state didn't update fast enough, we grab it directly
+      const finalFrom = fromISO || (new Date().toISOString().slice(0, 10) + 'T00:00:00')
+      const finalTo = toISO || (new Date().toISOString().slice(0, 10) + 'T23:59:59')
 
       // 1. Fetch Sales
       const { data: s } = await supabase
         .from('card_sales')
         .select('*')
         .eq('station_id', user.station_id)
-        .gte('txn_at', fromISO)
-        .lte('txn_at', toISO)
+        .gte('txn_at', finalFrom)
+        .lte('txn_at', finalTo)
         .order('txn_at', { ascending: false })
       setSalesRows(s || [])
 
@@ -61,8 +124,8 @@ export default function FuelCards({ profile }) {
         .from('card_topups')
         .select('*')
         .eq('station_id', user.station_id)
-        .gte('txn_at', fromISO)
-        .lte('txn_at', toISO)
+        .gte('txn_at', finalFrom)
+        .lte('txn_at', finalTo)
         .order('txn_at', { ascending: false })
       setTopupRows(t || [])
 
@@ -75,13 +138,13 @@ export default function FuelCards({ profile }) {
         .limit(20)
       setUploads(u || [])
 
-      // 4. Fetch App Users (NOW FILTERING BY TXN_AT, NOT CREATED_AT)
+      // 4. Fetch App Users
       const { data: au } = await supabase
         .from('app_users')
         .select('*')
         .eq('station_id', user.station_id)
-        .gte('txn_at', fromISO)
-        .lte('txn_at', toISO)
+        .gte('txn_at', finalFrom)
+        .lte('txn_at', finalTo)
         .order('txn_at', { ascending: false })
 
       let finalAppUsers = au || []
@@ -91,8 +154,8 @@ export default function FuelCards({ profile }) {
           .from('card_sales')
           .select('txn_id, card_number, customer_name, staff_name, original_amount, txn_at')
           .eq('station_id', user.station_id)
-          .gte('txn_at', fromISO)
-          .lte('txn_at', toISO)
+          .gte('txn_at', finalFrom)
+          .lte('txn_at', finalTo)
         
         if (fromSales && fromSales.length > 0) {
           finalAppUsers = fromSales
@@ -151,9 +214,10 @@ export default function FuelCards({ profile }) {
     setLoading(false)
   }
 
+  // Trigger load when user changes, but NOT on date changes (dates are tied to shift)
   useEffect(() => { 
     loadAll() 
-  }, [user?.station_id, range.from, range.to])
+  }, [user?.station_id])
 
   // --- MAIN STATS ---
   const stats = useMemo(() => {
@@ -164,12 +228,7 @@ export default function FuelCards({ profile }) {
     let ambassadorSales = 0
     let attendantSales = 0
 
-    const inRange = (d) => d && d >= range.from && d <= range.to
-
     salesRows.forEach(r => {
-      const day = String(r?.txn_at || '').slice(0, 10)
-      if (!inRange(day)) return
-      
       const amt = Number(r?.original_amount || 0)
       totalLiters += Number(r?.quantity || 0)
       totalSalesAmt += amt
@@ -180,25 +239,20 @@ export default function FuelCards({ profile }) {
     })
 
     topupRows.forEach(r => {
-      const day = String(r?.txn_at || '').slice(0, 10)
-      if (!inRange(day)) return
       const amt = Number(r?.top_up_amount || r?.amount || 0) 
       totalTopupAmt += amt
       if (amt >= 100000) bigTopups++
     })
 
     return { totalLiters, totalSalesAmt, totalTopupAmt, bigTopups, ambassadorSales, attendantSales }
-  }, [salesRows, topupRows, range, staffRoles])
+  }, [salesRows, topupRows, staffRoles])
 
   // --- CHART DATA (Top 5 Staff) ---
   const chartData = useMemo(() => {
     const map = {}
     const isAppUser = (name) => String(name || '').replace(/\s+/g, '').toLowerCase().includes('appuser')
-    const inRange = (d) => d && d >= range.from && d <= range.to
 
     salesRows.forEach(r => {
-      const day = String(r?.txn_at || '').slice(0, 10)
-      if (!inRange(day)) return
       const rawName = String(r?.staff_name || '').trim()
       if (isAppUser(rawName)) return 
 
@@ -208,8 +262,6 @@ export default function FuelCards({ profile }) {
     })
 
     topupRows.forEach(r => {
-      const day = String(r?.txn_at || '').slice(0, 10)
-      if (!inRange(day)) return
       const rawName = String(r?.staff_name || '').trim()
       if (isAppUser(rawName)) return 
 
@@ -226,17 +278,14 @@ export default function FuelCards({ profile }) {
       salesPct: (s.sales / maxVal) * 100,
       topupsPct: (s.topups / maxVal) * 100
     }))
-  }, [salesRows, topupRows, range])
+  }, [salesRows, topupRows])
 
   // --- PER STAFF TABLE ---
   const staffPerformance = useMemo(() => {
     const map = {}
     const isAppUser = (name) => String(name || '').replace(/\s+/g, '').toLowerCase().includes('appuser')
-    const inRange = (d) => d && d >= range.from && d <= range.to
 
     salesRows.forEach(r => {
-      const day = String(r?.txn_at || '').slice(0, 10)
-      if (!inRange(day)) return
       const rawName = String(r?.staff_name || '').trim()
       if (isAppUser(rawName)) return 
 
@@ -249,8 +298,6 @@ export default function FuelCards({ profile }) {
     })
 
     topupRows.forEach(r => {
-      const day = String(r?.txn_at || '').slice(0, 10)
-      if (!inRange(day)) return
       const rawName = String(r?.staff_name || '').trim()
       if (isAppUser(rawName)) return 
 
@@ -264,7 +311,7 @@ export default function FuelCards({ profile }) {
       cardsCount: s.cards.size,
       difference: s.salesAmt - s.topupAmt
     })).sort((a,b) => b.salesAmt - a.salesAmt)
-  }, [salesRows, topupRows, range])
+  }, [salesRows, topupRows])
 
   if (!user) return <div className="drops-empty">Loading…</div>
 
@@ -296,12 +343,14 @@ export default function FuelCards({ profile }) {
         </div>
       </div>
 
-      <div className="staff-filters">
-        <label style={{ alignSelf: 'center', fontSize: 13, color: '#6b85a0', fontWeight: 600 }}>From</label>
-        <input type="date" value={range.from} onChange={e => setRange(r => ({ ...r, from: e.target.value }))} />
-        <label style={{ alignSelf: 'center', fontSize: 13, color: '#6b85a0', fontWeight: 600 }}>To</label>
-        <input type="date" value={range.to} onChange={e => setRange(r => ({ ...r, to: e.target.value }))} />
-        <button className="btn-ghost btn-sm" onClick={() => setRange({ from: today, to: today })}>Today</button>
+      {/* SHIFT FILTER DISPLAY (Replaces Date Inputs) */}
+      <div className="staff-filters" style={{ background: activeShift ? '#d1fae5' : '#f8fafc', border: activeShift ? '1px solid #10b981' : '1px solid #e2e8f0', padding: '12px 16px', borderRadius: 12, marginBottom: 20 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600, color: activeShift ? '#065f46' : '#475569' }}>
+          <i className={`fas ${activeShift ? 'fa-check-circle' : 'fa-clock'}`}></i>
+          {shiftWindow.label}
+        </div>
+        <div style={{ flex: 1 }}></div>
+        <button className="btn-ghost btn-sm" onClick={loadAll}>Refresh</button>
       </div>
 
       <div className="dashboard-grid">
@@ -326,9 +375,7 @@ export default function FuelCards({ profile }) {
       {loading ? (
         <div className="drops-empty">Loading…</div>
       ) : tab === 'overview' ? (
-        // --- DAILY BREAKDOWN (Chart + Amb vs Att) ---
         <div style={{ padding: '0 32px 32px' }}>
-          
           <div className="dashboard-grid" style={{ padding: 0, marginBottom: 24 }}>
             <div className="stat-card" style={{ borderLeft: '4px solid #10b981' }}>
               <div className="stat-title">Ambassador Sales</div>
@@ -344,7 +391,7 @@ export default function FuelCards({ profile }) {
             <h3 style={{ marginBottom: 24 }}>Top 5 Staff Performance (Sales vs Top-ups)</h3>
             
             {chartData.length === 0 ? (
-              <div className="drops-empty">No data for this date range.</div>
+              <div className="drops-empty">No data for this shift.</div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
                 {chartData.map(s => (
@@ -401,7 +448,7 @@ export default function FuelCards({ profile }) {
                 </tr>
               ))}
               {staffPerformance.length === 0 && (
-                <tr><td colSpan="6" style={{ textAlign: 'center', padding: 20 }}>No staff activity in this range</td></tr>
+                <tr><td colSpan="6" style={{ textAlign: 'center', padding: 20 }}>No staff activity in this shift</td></tr>
               )}
             </tbody>
           </table>
@@ -469,7 +516,7 @@ export default function FuelCards({ profile }) {
    ============================================================ */
 function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }) {
   const [openClaim, setOpenClaim] = useState(null)
-  const [view, setView] = useState('grouped') // 'grouped' | 'all'
+  const [view, setView] = useState('grouped')
 
   const grouped = useMemo(() => {
     const map = {}
@@ -541,9 +588,7 @@ function AppUsersTable({ appUsers, staffCodes, profile, onClaimed, canDownload }
                   <td>{g.count} txns</td>
                   <td><strong>UGX {g.total.toLocaleString()}</strong></td>
                   <td>
-                    <button className="btn-tiny" onClick={() => {
-                      setView('all')
-                    }}>View</button>
+                    <button className="btn-tiny" onClick={() => setView('all')}>View</button>
                   </td>
                 </tr>
               ))}
@@ -630,7 +675,7 @@ function ClaimAppUserModal({ appUser, profile, onClose, onSaved }) {
       .select('user_id')
       .eq('station_id', profile.user.station_id)
       .eq('code', code.trim())
-      .single()
+      .maybeSingle()
 
     if (!sc) { setErr('Invalid code'); setBusy(false); return }
 
@@ -641,7 +686,7 @@ function ClaimAppUserModal({ appUser, profile, onClose, onSaved }) {
         card_number: appUser.card_number,
         customer_name: appUser.customer_name,
         amount: appUser.amount,
-        txn_at: appUser.txn_at // Added txn_at
+        txn_at: appUser.txn_at 
       }).select()
     }
 
