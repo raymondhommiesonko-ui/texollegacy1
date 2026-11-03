@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import * as XLSX from 'xlsx'
 import { supabase } from '../supabase'
+import { todayEAT, eatToISO, addDaysEAT } from '../lib/time'
 
 export default function FuelCards({ profile }) {
   const user = profile?.user
@@ -21,9 +22,14 @@ export default function FuelCards({ profile }) {
   const [openUpload, setOpenUpload] = useState(null)
   const [openReconcile, setOpenReconcile] = useState(false)
 
-  // SHIFT STATE
-  const [activeShift, setActiveShift] = useState(null)
-  const [shiftWindow, setShiftWindow] = useState({ from: '', to: '', label: 'Today' })
+  // --- DATE & TIME FILTERS ---
+  const today = todayEAT()
+  const [filters, setFilters] = useState({
+    fromDate: today,
+    toDate: today,
+    fromTime: '',
+    toTime: ''
+  })
 
   const [salesRows, setSalesRows] = useState([])
   const [topupRows, setTopupRows] = useState([])
@@ -32,11 +38,9 @@ export default function FuelCards({ profile }) {
   const [staffRoles, setStaffRoles] = useState({})
   const [uploads, setUploads] = useState([])
 
-  // --- 1. FIND THE ACTIVE SHIFT WINDOW ---
-  async function loadShiftWindow() {
-    if (!user?.station_id) return null
-
-    // Check for open shift first
+  // --- QUICK SET TO CURRENT SHIFT ---
+  async function setToActiveShift() {
+    if (!user?.station_id) return
     const { data: openShifts } = await supabase
       .from('shifts')
       .select('*')
@@ -47,46 +51,20 @@ export default function FuelCards({ profile }) {
 
     if (openShifts && openShifts.length > 0) {
       const s = openShifts[0]
-      setActiveShift(s)
-      setShiftWindow({
-        from: s.opened_at,
-        to: new Date().toISOString(),
-        label: `Active Shift (${new Date(s.opened_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} - Now)`
+      const openedAt = new Date(s.opened_at)
+      
+      setFilters({
+        fromDate: openedAt.toISOString().slice(0, 10),
+        fromTime: openedAt.toTimeString().slice(0, 5),
+        toDate: today,
+        toTime: new Date().toTimeString().slice(0, 5)
       })
-      return
+    } else {
+      alert('No active shift found.')
     }
-
-    // If no open shift, find the most recently closed shift
-    const { data: closedShifts } = await supabase
-      .from('shifts')
-      .select('*')
-      .eq('station_id', user.station_id)
-      .eq('status', 'closed')
-      .order('closed_at', { ascending: false })
-      .limit(1)
-
-    if (closedShifts && closedShifts.length > 0) {
-      const s = closedShifts[0]
-      setActiveShift(null)
-      setShiftWindow({
-        from: s.opened_at,
-        to: s.closed_at,
-        label: `Last Shift (${new Date(s.opened_at).toLocaleDateString()} ${new Date(s.opened_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} - ${new Date(s.closed_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})})`
-      })
-      return
-    }
-
-    // Fallback: No shifts exist, use today
-    const today = new Date().toISOString().slice(0, 10)
-    setActiveShift(null)
-    setShiftWindow({
-      from: today + 'T00:00:00',
-      to: today + 'T23:59:59',
-      label: 'Today (No active shift)'
-    })
   }
 
-  // --- 2. LOAD DATA USING SHIFT WINDOW ---
+  // --- LOAD DATA WITH CROSS-MIDNIGHT LOGIC ---
   async function loadAll() {
     setLoading(true)
     setErrorMsg('')
@@ -98,24 +76,51 @@ export default function FuelCards({ profile }) {
     }
 
     try {
-      // Get the dates first
-      await loadShiftWindow()
-      
-      // We use the shift window set in state (or fallback)
-      const fromISO = shiftWindow.from
-      const toISO = shiftWindow.to
+      const tf = filters.fromTime
+      const tt = filters.toTime
+      const fromDate = filters.fromDate
+      const toDate = filters.toDate
 
-      // If state didn't update fast enough, we grab it directly
-      const finalFrom = fromISO || (new Date().toISOString().slice(0, 10) + 'T00:00:00')
-      const finalTo = toISO || (new Date().toISOString().slice(0, 10) + 'T23:59:59')
+      let windowStartISO, windowEndISO
+
+      if (tf && tt) {
+        const [fh, fm] = tf.split(':').map(Number)
+        const [th, tm] = tt.split(':').map(Number)
+        const fromMin = fh * 60 + fm
+        const toMin = th * 60 + tm
+
+        if (fromMin <= toMin) {
+          // Normal window
+          windowStartISO = eatToISO(fromDate, tf)
+          windowEndISO = eatToISO(toDate, tt)
+        } else {
+          // Cross-midnight window
+          if (fromDate === toDate) {
+            windowStartISO = eatToISO(fromDate, tf)
+            windowEndISO = eatToISO(addDaysEAT(toDate, 1), tt)
+          } else {
+            windowStartISO = eatToISO(fromDate, tf)
+            windowEndISO = eatToISO(toDate, tt)
+          }
+        }
+      } else if (tf) {
+        windowStartISO = eatToISO(fromDate, tf)
+        windowEndISO = eatToISO(toDate, '23:59')
+      } else if (tt) {
+        windowStartISO = eatToISO(fromDate, '00:00')
+        windowEndISO = eatToISO(toDate, tt)
+      } else {
+        windowStartISO = eatToISO(fromDate, '00:00')
+        windowEndISO = eatToISO(toDate, '23:59')
+      }
 
       // 1. Fetch Sales
       const { data: s } = await supabase
         .from('card_sales')
         .select('*')
         .eq('station_id', user.station_id)
-        .gte('txn_at', finalFrom)
-        .lte('txn_at', finalTo)
+        .gte('txn_at', windowStartISO)
+        .lte('txn_at', windowEndISO)
         .order('txn_at', { ascending: false })
       setSalesRows(s || [])
 
@@ -124,8 +129,8 @@ export default function FuelCards({ profile }) {
         .from('card_topups')
         .select('*')
         .eq('station_id', user.station_id)
-        .gte('txn_at', finalFrom)
-        .lte('txn_at', finalTo)
+        .gte('txn_at', windowStartISO)
+        .lte('txn_at', windowEndISO)
         .order('txn_at', { ascending: false })
       setTopupRows(t || [])
 
@@ -143,8 +148,8 @@ export default function FuelCards({ profile }) {
         .from('app_users')
         .select('*')
         .eq('station_id', user.station_id)
-        .gte('txn_at', finalFrom)
-        .lte('txn_at', finalTo)
+        .gte('txn_at', windowStartISO)
+        .lte('txn_at', windowEndISO)
         .order('txn_at', { ascending: false })
 
       let finalAppUsers = au || []
@@ -154,8 +159,8 @@ export default function FuelCards({ profile }) {
           .from('card_sales')
           .select('txn_id, card_number, customer_name, staff_name, original_amount, txn_at')
           .eq('station_id', user.station_id)
-          .gte('txn_at', finalFrom)
-          .lte('txn_at', finalTo)
+          .gte('txn_at', windowStartISO)
+          .lte('txn_at', windowEndISO)
         
         if (fromSales && fromSales.length > 0) {
           finalAppUsers = fromSales
@@ -214,10 +219,10 @@ export default function FuelCards({ profile }) {
     setLoading(false)
   }
 
-  // Trigger load when user changes, but NOT on date changes (dates are tied to shift)
+  // Trigger load when user or filters change
   useEffect(() => { 
     loadAll() 
-  }, [user?.station_id])
+  }, [user?.station_id, filters.fromDate, filters.toDate, filters.fromTime, filters.toTime])
 
   // --- MAIN STATS ---
   const stats = useMemo(() => {
@@ -343,14 +348,29 @@ export default function FuelCards({ profile }) {
         </div>
       </div>
 
-      {/* SHIFT FILTER DISPLAY (Replaces Date Inputs) */}
-      <div className="staff-filters" style={{ background: activeShift ? '#d1fae5' : '#f8fafc', border: activeShift ? '1px solid #10b981' : '1px solid #e2e8f0', padding: '12px 16px', borderRadius: 12, marginBottom: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600, color: activeShift ? '#065f46' : '#475569' }}>
-          <i className={`fas ${activeShift ? 'fa-check-circle' : 'fa-clock'}`}></i>
-          {shiftWindow.label}
+      {/* DATE AND TIME FILTERS */}
+      <div className="staff-filters" style={{ flexWrap: 'wrap', alignItems: 'center' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: '#6b85a0' }}>From:</span>
+          <input type="date" value={filters.fromDate} onChange={e => setFilters({...filters, fromDate: e.target.value})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
+          <input type="time" value={filters.fromTime} onChange={e => setFilters({...filters, fromTime: e.target.value})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
         </div>
-        <div style={{ flex: 1 }}></div>
-        <button className="btn-ghost btn-sm" onClick={loadAll}>Refresh</button>
+        
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: '#6b85a0' }}>To:</span>
+          <input type="date" value={filters.toDate} onChange={e => setFilters({...filters, toDate: e.target.value})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
+          <input type="time" value={filters.toTime} onChange={e => setFilters({...filters, toTime: e.target.value})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
+        </div>
+
+        <button className="btn-ghost btn-sm" onClick={setToActiveShift} style={{ background: '#d1fae5', color: '#065f46' }}>
+          <i className="fas fa-clock" /> Current Shift
+        </button>
+        
+        <button className="btn-ghost btn-sm" onClick={() => setFilters({ fromDate: today, toDate: today, fromTime: '', toTime: '' })}>
+          Today
+        </button>
+        
+        <button className="btn-ghost btn-sm" onClick={loadAll}><i className="fas fa-sync" /></button>
       </div>
 
       <div className="dashboard-grid">
@@ -391,7 +411,7 @@ export default function FuelCards({ profile }) {
             <h3 style={{ marginBottom: 24 }}>Top 5 Staff Performance (Sales vs Top-ups)</h3>
             
             {chartData.length === 0 ? (
-              <div className="drops-empty">No data for this shift.</div>
+              <div className="drops-empty">No data for this range.</div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
                 {chartData.map(s => (
@@ -448,7 +468,7 @@ export default function FuelCards({ profile }) {
                 </tr>
               ))}
               {staffPerformance.length === 0 && (
-                <tr><td colSpan="6" style={{ textAlign: 'center', padding: 20 }}>No staff activity in this shift</td></tr>
+                <tr><td colSpan="6" style={{ textAlign: 'center', padding: 20 }}>No staff activity in this range</td></tr>
               )}
             </tbody>
           </table>

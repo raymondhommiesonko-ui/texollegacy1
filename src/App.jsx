@@ -32,24 +32,54 @@ export default function App() {
   )
 
   useEffect(() => {
+    let mounted = true
+
     supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session)
-      setLoading(false)
+      if (mounted) {
+        setSession(session)
+        setLoading(false)
+      }
     })
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, s) => setSession(s))
-    return () => subscription.unsubscribe()
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, s) => {
+      if (mounted) setSession(s)
+    })
+
+    return () => {
+      mounted = false
+      subscription.unsubscribe()
+    }
   }, [])
 
   if (loading) return <div className="loading">Loading…</div>
   if (!session) return <Login />
+  
   return (
-    <Portal
+    <AppWrapper
       session={session}
       autoCollect={autoCollect}
       onExitCollect={() => {
         setAutoCollect(false)
         window.history.replaceState({}, '', '/')
       }}
+    />
+  )
+}
+
+// Wrapper to ensure profile is loaded before mounting Portal
+function AppWrapper({ session, autoCollect, onExitCollect }) {
+  const { profile, loading } = useProfile(session)
+
+  if (loading || !profile?.user) {
+    return <div className="loading">Loading your profile…</div>
+  }
+
+  return (
+    <Portal
+      session={session}
+      profile={profile}
+      autoCollect={autoCollect}
+      onExitCollect={onExitCollect}
     />
   )
 }
@@ -93,8 +123,7 @@ function Login() {
 /* ============================================================
    PORTAL
    ============================================================ */
-function Portal({ session, autoCollect = false, onExitCollect }) {
-  const { profile, loading } = useProfile(session)
+function Portal({ session, profile, autoCollect = false, onExitCollect }) {
   const [screen, setScreen] = useState('home')
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [roleMenuOpen, setRoleMenuOpen] = useState(false)
@@ -159,10 +188,6 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
     }
   )
 
-  if (loading || !profile?.user) {
-    return <div className="loading">Loading your profile…</div>
-  }
-
   const user = profile.user
   const station = profile.station
   const access = user.access_score ?? 30
@@ -183,7 +208,6 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
   // Sidebar menu
   let visibleMenu
   if (isCompanyPhone) {
-    // Added 'fuel-cards' here so company phones can see it
     const allowedIds = ['home', 'transactions', 'drops', 'fuel-cards'] 
     visibleMenu = MENU.map(group => ({
       ...group,
@@ -341,7 +365,6 @@ function Portal({ session, autoCollect = false, onExitCollect }) {
             </div>
           )}
           
-          {/* Removed !isCompanyPhone so company phones can view Fuel Cards */}
           {screen === 'fuel-cards' && <FuelCards profile={profile} />}
           
           {screen === 'shortages' && !isCompanyPhone && <Shortages profile={profile} />}
