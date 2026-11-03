@@ -106,7 +106,7 @@ function Login() {
       <div className="auth-card">
         <div className="auth-logo">⛽</div>
         <h1>TEXOL PORTAL</h1>
-        <p className="auth-tag">Employee Portal · Uganda</p>
+        <p className="auth-tag">Employee Portal · LEGACY</p>
         <form onSubmit={signIn}>
           <label>Email</label>
           <input type="email" value={email} onChange={e => setEmail(e.target.value)} required />

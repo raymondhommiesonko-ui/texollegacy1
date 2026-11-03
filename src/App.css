@@ -31,7 +31,7 @@ button { font-family: inherit; }
 .loading {
   min-height: 100vh;
   display: flex; align-items: center; justify-content: center;
-  color: #94a3b8; font-size: 16px;
+  color: #4e7dbe; font-size: 16px;
   background: var(--navy);
 }
 
@@ -45,7 +45,7 @@ button { font-family: inherit; }
   padding: 20px;
 }
 .auth-card {
-  background: #fff; color: var(--text);
+  background: #da78da; color: var(--text);
   border-radius: 24px; padding: 40px 32px;
   width: 100%; max-width: 400px;
   text-align: center;
