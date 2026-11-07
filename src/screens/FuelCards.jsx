@@ -90,11 +90,9 @@ export default function FuelCards({ profile }) {
         const toMin = th * 60 + tm
 
         if (fromMin <= toMin) {
-          // Normal window
           windowStartISO = eatToISO(fromDate, tf)
           windowEndISO = eatToISO(toDate, tt)
         } else {
-          // Cross-midnight window
           if (fromDate === toDate) {
             windowStartISO = eatToISO(fromDate, tf)
             windowEndISO = eatToISO(addDaysEAT(toDate, 1), tt)
@@ -516,7 +514,19 @@ export default function FuelCards({ profile }) {
           profile={profile}
           fileType={openUpload}
           onClose={() => setOpenUpload(null)}
-          onSaved={async () => { setOpenUpload(null); await loadAll() }}
+          onSaved={async (dateFrom, dateTo) => { 
+            setOpenUpload(null)
+            // Force the filter to jump to the uploaded file's full date range
+            if (dateFrom && dateTo) {
+              setFilters({ 
+                fromDate: dateFrom, 
+                toDate: dateTo, 
+                fromTime: '', 
+                toTime: '' 
+              })
+            }
+            await loadAll() 
+          }}
         />
       )}
 
@@ -831,30 +841,34 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
     if (v == null || v === '') return null
     const s = String(v).trim()
     
+    // 1. Try YYYY-MM-DD (e.g. 2026-11-06)
     const matchYMD = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
     if (matchYMD) {
       const [, y, mo, d, h, mi, sec] = matchYMD
-      const dt = new Date(Date.UTC(
-        Number(y), Number(mo) - 1, Number(d), 
-        Number(h || 0), Number(mi || 0), Number(sec || 0)
-      ))
+      const dt = new Date(Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h || 0), Number(mi || 0), Number(sec || 0)))
       if (!isNaN(dt.getTime())) return dt.toISOString()
     }
 
-    const matchMDY = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
-    if (matchMDY) {
-      let [, p1, p2, y, h, mi, sec] = matchMDY
+    // 2. Try DD/MM/YYYY or MM/DD/YYYY (e.g. 06/11/2026 or 11/06/2026)
+    const matchDMY = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
+    if (matchDMY) {
+      let [, p1, p2, y, h, mi, sec] = matchDMY
       p1 = Number(p1); p2 = Number(p2); y = Number(y)
       if (y < 100) y += 2000
-      const mo = p1 > 12 ? p2 : p1
-      const d = p1 > 12 ? p1 : p2
-      const dt = new Date(Date.UTC(
-        y, mo - 1, d, 
-        Number(h || 0), Number(mi || 0), Number(sec || 0)
-      ))
+
+      // If the first number is greater than 12, it MUST be the day (DD/MM/YYYY).
+      // If the second number is greater than 12, the first MUST be the month (MM/DD/YYYY).
+      // If both are <= 12, we assume DD/MM/YYYY (standard in Uganda/UK).
+      let d, mo
+      if (p1 > 12) { d = p1; mo = p2; }
+      else if (p2 > 12) { mo = p1; d = p2; }
+      else { d = p1; mo = p2; } // Default to DD/MM/YYYY
+
+      const dt = new Date(Date.UTC(y, mo - 1, d, Number(h || 0), Number(mi || 0), Number(sec || 0)))
       if (!isNaN(dt.getTime())) return dt.toISOString()
     }
 
+    // 3. Fallback to standard JS date parsing
     const iso = new Date(s)
     if (!isNaN(iso.getTime())) return iso.toISOString()
     
@@ -937,7 +951,8 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
         }
       }
 
-      onSaved()
+      // Pass BOTH dates back to the parent
+      onSaved(dateFrom, dateTo)
     } catch (e) {
       console.error(e)
       setErr(e.message || 'Save failed')
@@ -1125,20 +1140,28 @@ function ReconcileModal({ profile, onClose, onSaved }) {
   function parseDate(v) {
     if (v == null || v === '') return null
     const s = String(v).trim()
+    
     const matchYMD = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
     if (matchYMD) {
       const [, y, mo, d, h, mi, sec] = matchYMD
       const dt = new Date(Date.UTC(Number(y), Number(mo)-1, Number(d), Number(h||0), Number(mi||0), Number(sec||0)))
       if (!isNaN(dt.getTime())) return dt.toISOString()
     }
-    const matchMDY = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
-    if (matchMDY) {
-      let [, p1, p2, y, h, mi, sec] = matchMDY
+
+    const matchDMY = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/)
+    if (matchDMY) {
+      let [, p1, p2, y, h, mi, sec] = matchDMY
       p1 = Number(p1); p2 = Number(p2); y = Number(y); if(y<100) y+=2000
-      const mo = p1 > 12 ? p2 : p1; const d = p1 > 12 ? p1 : p2
+      
+      let d, mo
+      if (p1 > 12) { d = p1; mo = p2; }
+      else if (p2 > 12) { mo = p1; d = p2; }
+      else { d = p1; mo = p2; }
+
       const dt = new Date(Date.UTC(y, mo-1, d, Number(h||0), Number(mi||0), Number(sec||0)))
       if (!isNaN(dt.getTime())) return dt.toISOString()
     }
+
     const iso = new Date(s)
     if (!isNaN(iso.getTime())) return iso.toISOString()
     return null
