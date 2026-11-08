@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useCallback } from 'react'
 import { supabase } from '../supabase'
+import PumpBalanceModal from './PumpBalanceModal'
 
 export default function Balancing({ profile }) {
   const user = profile.user
@@ -9,19 +10,21 @@ export default function Balancing({ profile }) {
   const isAdminManagerSup = isManager || isSupervisor
   
   const canEditAll = isAdminManagerSup || powers.edit_balancing
-  const canApprove = isAdminManagerSup || powers.approve_balancing
-  const isAttendant = user.role === 'attendant' || user.role === 'ambassador'
-
+  
   const [shift, setShift] = useState(null)
   const [pumps, setPumps] = useState([])
   const [entries, setEntries] = useState({})      
   const [staff, setStaff] = useState([])
   const [expenses, setExpenses] = useState({})    
   const [loading, setLoading] = useState(true)
-  const [busy, setBusy] = useState(false)
+
+  // Prices State
+  const [prices, setPrices] = useState({ PMS: 6789, AGO: 7039 })
+  const [showPriceSettings, setShowPriceSettings] = useState(false)
+  const [editPrices, setEditPrices] = useState({ PMS: 0, AGO: 0 })
 
   const [liveData, setLiveData] = useState({})
-  const [openExpense, setOpenExpense] = useState(null)
+  const [openPumpModal, setOpenPumpModal] = useState(null)
   const [openAssign, setOpenAssign] = useState(null)
 
   const nameById = useMemo(() => {
@@ -30,7 +33,7 @@ export default function Balancing({ profile }) {
     return m
   }, [staff])
 
-  async function loadAll() {
+  const loadAll = useCallback(async () => {
     setLoading(true)
     try {
       const { data: shifts } = await supabase.from('shifts').select('*').eq('station_id', user.station_id).in('status', ['open','pending_close']).order('opened_at', { ascending: false }).limit(1)
@@ -39,6 +42,18 @@ export default function Balancing({ profile }) {
 
       const { data: pumpList } = await supabase.from('pumps').select('*').eq('station_id', user.station_id).eq('is_active', true).order('pump_number')
       setPumps(pumpList || [])
+
+      // Load Prices from station_prices table
+      const { data: priceData } = await supabase.from('station_prices').select('*').eq('station_id', user.station_id)
+      if (priceData && priceData.length > 0) {
+        const pObj = { PMS: 6789, AGO: 7039 }
+        priceData.forEach(p => { pObj[p.product_name.toUpperCase()] = Number(p.price) })
+        setPrices(pObj)
+        setEditPrices(pObj)
+      } else {
+        // If no prices exist yet, set defaults for editing
+        setEditPrices(prices)
+      }
 
       const { data: us } = await supabase.from('users').select('id, name, role').eq('station_id', user.station_id).eq('is_active', true).in('role', ['attendant','ambassador','supervisor']).order('name')
       setStaff(us || [])
@@ -53,43 +68,21 @@ export default function Balancing({ profile }) {
       visibleEntries.forEach(e => { if (e.pump_number) byPump[e.pump_number] = e })
       setEntries(byPump)
 
-      // Fetch Live DB Data for current shift
       const startTime = cur.opened_at
       const endTime = cur.closed_at || new Date().toISOString()
 
-      const [txnsRes, appUsersRes, dropsRes, cardsRes] = await Promise.all([
+      const [txnsRes, appUsersRes, dropsRes] = await Promise.all([
         supabase.from('transactions').select('*').eq('station_id', user.station_id).eq('status', 'claimed').gte('received_at', startTime).lte('received_at', endTime),
         supabase.from('app_users').select('*').eq('station_id', user.station_id).gte('txn_at', startTime).lte('txn_at', endTime),
-        supabase.from('money_drops').select('*').eq('shift_id', cur.id).eq('status', 'active'),
-        supabase.from('card_sales').select('*').eq('station_id', user.station_id).gte('txn_at', startTime).lte('txn_at', endTime)
+        supabase.from('money_drops').select('*').eq('shift_id', cur.id).eq('status', 'active')
       ])
 
       const live = {}
-      const initLive = (id) => { if (!live[id]) live[id] = { momo: 0, app: 0, drops: 0, cardDiff: 0 } }
+      const initLive = (id) => { if (!live[id]) live[id] = { momo: 0, app: 0, drops: 0 } }
 
-      ;(txnsRes.data || []).forEach(t => {
-        if (!t.claimed_by) return
-        initLive(t.claimed_by)
-        if (t.provider === 'airtel' || t.provider === 'mtn') live[t.claimed_by].momo += Number(t.amount)
-      })
-      ;(appUsersRes.data || []).forEach(a => {
-        if (!a.claimed_by) return
-        initLive(a.claimed_by)
-        live[a.claimed_by].app += Number(a.amount)
-      })
-      ;(dropsRes.data || []).forEach(d => {
-        if (!d.attendant_id) return
-        initLive(d.attendant_id)
-        live[d.attendant_id].drops += Number(d.amount)
-      })
-      ;(cardsRes.data || []).forEach(c => {
-        if (!c.staff_name) return
-        const u = staff.find(x => x.name === c.staff_name)
-        if (u) {
-          initLive(u.id)
-          live[u.id].cardDiff += (Number(c.discounted_amount || c.original_amount || 0) - Number(c.original_amount || 0))
-        }
-      })
+      ;(txnsRes.data || []).forEach(t => { if (t.claimed_by) { initLive(t.claimed_by); if (['airtel','mtn'].includes(t.provider)) live[t.claimed_by].momo += Number(t.amount) } })
+      ;(appUsersRes.data || []).forEach(a => { if (a.claimed_by) { initLive(a.claimed_by); live[a.claimed_by].app += Number(a.amount) } })
+      ;(dropsRes.data || []).forEach(d => { if (d.attendant_id) { initLive(d.attendant_id); live[d.attendant_id].drops += Number(d.amount) } })
       setLiveData(live)
 
       const ids = visibleEntries.map(e => e.id)
@@ -106,70 +99,91 @@ export default function Balancing({ profile }) {
         })
       }
       setExpenses(expMap)
-
     } catch (e) {
       console.error('Load error:', e)
     }
     setLoading(false)
-  }
+  }, [user.station_id, canEditAll, user.id]) // Removed prices from dependency to stop loops
 
-  useEffect(() => { loadAll() }, [user.station_id])
+  useEffect(() => {
+    loadAll()
+  }, [loadAll])
 
   async function assignPump(pumpNumber, userId) {
     if (!shift) return
-    setBusy(true)
-    const { data: existing } = await supabase.from('balance_entries').select('id').eq('shift_id', shift.id).eq('pump_number', pumpNumber).maybeSingle()
-    if (existing) {
-      await supabase.from('balance_entries').update({ user_id: userId }).eq('id', existing.id)
-    } else {
-      await supabase.from('balance_entries').insert({ shift_id: shift.id, station_id: user.station_id, pump_number: pumpNumber, user_id: userId })
+    try {
+      // Check if entry exists
+      const { data: existing } = await supabase
+        .from('balance_entries')
+        .select('id')
+        .eq('shift_id', shift.id)
+        .eq('pump_number', pumpNumber)
+        .maybeSingle()
+
+      if (existing) {
+        // Update
+        await supabase.from('balance_entries').update({ user_id: userId }).eq('id', existing.id)
+      } else {
+        // Insert
+        await supabase.from('balance_entries').insert({ 
+          shift_id: shift.id, 
+          station_id: user.station_id, 
+          pump_number: pumpNumber, 
+          user_id: userId 
+        })
+      }
+      
+      // Close modal and immediately reload data
+      setOpenAssign(null)
+      await loadAll()
+    } catch (err) {
+      console.error("Assign error:", err)
+      alert("Failed to assign: " + err.message)
     }
-    setBusy(false)
-    setOpenAssign(null)
-    await loadAll()
   }
 
-  async function saveField(pumpNumber, field, value) {
-    const entry = entries[pumpNumber]
-    if (!entry) return
-    setEntries(prev => ({ ...prev, [pumpNumber]: { ...prev[pumpNumber], [field]: Number(value) || 0 } }))
-    await supabase.from('balance_entries').update({ [field]: Number(value) || 0 }).eq('id', entry.id)
-  }
+  async function savePrices() {
+    try {
+      // Using upsert requires the unique constraint to exist on (station_id, product_name)
+      const updates = Object.keys(editPrices).map(product => ({
+        station_id: user.station_id,
+        product_name: product,
+        price: Number(editPrices[product]),
+        updated_at: new Date().toISOString()
+      }))
+      
+      const { error } = await supabase.from('station_prices').upsert(updates, { onConflict: 'station_id,product_name' })
+      if (error) throw error
 
-  async function approveExpense(id) {
-    await supabase.from('balance_expenses').update({ status: 'approved', approved_by: user.id, approved_at: new Date().toISOString() }).eq('id', id)
-    await loadAll()
+      setShowPriceSettings(false)
+      await loadAll()
+    } catch (err) {
+      alert("Failed to save prices. Ensure SQL is run correctly. " + err.message)
+    }
   }
 
   function calcRow(pumpNumber) {
     const e = entries[pumpNumber]
-    if (!e) return { pmsLiters: 0, agoLiters: 0, pmsSales: 0, agoSales: 0, totalSales: 0, netBalance: 0 }
+    if (!e) return { pmsLiters: 0, agoLiters: 0, totalSales: 0, netBalance: 0, momo: 0, drops: 0, app: 0, totalExp: 0, cash: 0, visa: 0, salesDiff: 0 }
 
-    // Meters
     const pmsL = Math.max(0, Number(e.pms_close || 0) - Number(e.pms_open || 0))
     const agoL = Math.max(0, Number(e.ago_close || 0) - Number(e.ago_open || 0))
-    const pmsS = pmsL * Number(e.pms_price || 6789)
-    const agoS = agoL * Number(e.ago_price || 7039)
     
-    // Total Sales
+    const pmsS = pmsL * prices.PMS
+    const agoS = agoL * prices.AGO
     const totalSales = pmsS + agoS
 
-    // Auto
-    const live = liveData[e.user_id] || { momo: 0, app: 0, drops: 0, cardDiff: 0 }
+    const live = liveData[e.user_id] || { momo: 0, app: 0, drops: 0 }
     const momo = Number(e.momo) || live.momo
     const drops = Number(e.drops) || live.drops
     const app = Number(e.app_users) || live.app
-    const salesDiff = Number(e.sales_difference) || live.cardDiff
-
-    // Manual
+    const salesDiff = Number(e.sales_difference || 0)
     const cash = Number(e.cash || 0)
     const visa = Number(e.visa || 0)
 
-    // Expenses
     const expList = (expenses[pumpNumber] || []).filter(x => x.status === 'approved')
     const totalExp = expList.reduce((a, x) => a + Number(x.amount || 0), 0)
 
-    // Formula
     const deductions = totalExp + drops + momo + salesDiff + app + cash + visa
     const netBalance = totalSales - deductions
 
@@ -183,215 +197,232 @@ export default function Balancing({ profile }) {
 
   return (
     <div className="balancing-screen">
-      <div className="balance-sheet-head">
+      <div className="balance-sheet-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <h3>TEXOL LEGACY — {shift.shift_date}</h3>
           <div className="sub">{shift.shift_type.toUpperCase()} SHIFT</div>
         </div>
+        {canEditAll && (
+          <button className="btn-primary" onClick={() => setShowPriceSettings(true)} style={{ padding: '8px 16px', borderRadius: '4px' }}>
+            <i className="fas fa-cog" style={{ marginRight: 6 }} /> Price Settings
+          </button>
+        )}
+      </div>
+
+      {/* VISIBLE PRICES BANNER */}
+      <div style={{ padding: '0 32px', marginBottom: '16px', display: 'flex', gap: '20px', fontSize: '13px', fontWeight: 'bold', color: '#475569' }}>
+        <div style={{ background: '#e0e7ff', padding: '6px 12px', borderRadius: '4px' }}>
+          PMS Price: <span style={{ color: '#1d4ed8' }}>{prices.PMS.toLocaleString()}</span>
+        </div>
+        <div style={{ background: '#e0e7ff', padding: '6px 12px', borderRadius: '4px' }}>
+          AGO Price: <span style={{ color: '#1d4ed8' }}>{prices.AGO.toLocaleString()}</span>
+        </div>
       </div>
 
       <div style={{ overflowX: 'auto', padding: '0 32px 32px' }}>
-        <table className="balance-sheet">
+        <table className="balance-sheet" style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr>
-              <th className="sticky-col">NAMES</th>
+              <th className="sticky-col" style={{ minWidth: '150px' }}>NAMES</th>
               {visiblePumps.map(p => (
-                <th key={p.id} className="staff-head" onClick={() => canEditAll && setOpenAssign(p.pump_number)} style={{ cursor: 'pointer' }}>
-                  <div className="staff-name">PUMP {p.pump_number}</div>
-                  <div style={{ fontSize: 9 }}>{p.product}</div>
+                <th key={p.id} className="staff-head" style={{ minWidth: '130px', padding: '10px' }}>
+                  <div className="staff-name" style={{ fontWeight: 700, marginBottom: 4 }}>PUMP {p.pump_number}</div>
+                  <div style={{ fontSize: 10, color: '#64748b', marginBottom: 8 }}>{p.product}</div>
+                  
+                  {entries[p.pump_number] && (canEditAll || entries[p.pump_number].user_id === user.id) && (
+                    <button className="btn-tiny" onClick={() => setOpenPumpModal(p)} style={{ background: '#3b82f6', color: 'white', padding: '4px 10px', borderRadius: 4, width: '100%', fontSize: 11, fontWeight: 'bold' }}>
+                      <i className="fas fa-edit" style={{ marginRight: 4 }} /> Edit Data
+                    </button>
+                  )}
+                  {canEditAll && !entries[p.pump_number] && (
+                    <button className="btn-tiny" onClick={() => setOpenAssign(p.pump_number)} style={{ background: '#f8fafc', border: '1px dashed #cbd5e1', color: '#64748b', padding: '4px 10px', borderRadius: 4, width: '100%', fontSize: 11 }}>
+                      + Assign
+                    </button>
+                  )}
                 </th>
               ))}
+              {canEditAll && <th className="total-col">TOTAL</th>}
             </tr>
             <tr>
               <th className="sticky-col" style={{ fontSize: 10 }}>ATTENDANT</th>
               {visiblePumps.map(p => (
-                <th key={p.id} style={{ fontSize: 11 }}>{entries[p.pump_number] ? nameById[entries[p.pump_number].user_id] : '—'}</th>
+                <th key={p.id} style={{ fontSize: 11, color: entries[p.pump_number] ? '#92400e' : '#8ba0b9', padding: '8px' }}>
+                  {/* Use the nameById map to show the name */}
+                  {entries[p.pump_number] ? (nameById[entries[p.pump_number].user_id] || 'Loading...') : 'Unassigned'}
+                </th>
               ))}
+              {canEditAll && <th className="total-col"></th>}
             </tr>
           </thead>
           <tbody>
             
             {/* PMS METERS */}
-            <tr className="section-head"><td className="sticky-col" colSpan={visiblePumps.length + 1}>PMS</td></tr>
-            <SimpleEditRow label="PMS OPEN" field="pms_open" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} />
-            <SimpleEditRow label="PMS CLOSE" field="pms_close" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} />
-            <SimpleEditRow label="PMS PRICE" field="pms_price" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} />
+            <tr className="section-head"><td className="sticky-col" colSpan={visiblePumps.length + (canEditAll ? 2 : 1)}>PMS</td></tr>
             <ReadonlyRow label="PMS LITERS" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).pmsLiters} />
             <ReadonlyRow label="PMS SALES" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).pmsSales} />
 
             {/* AGO METERS */}
-            <tr className="section-head"><td className="sticky-col" colSpan={visiblePumps.length + 1}>AGO</td></tr>
-            <SimpleEditRow label="AGO OPEN" field="ago_open" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} />
-            <SimpleEditRow label="AGO CLOSE" field="ago_close" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} />
-            <SimpleEditRow label="AGO PRICE" field="ago_price" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} />
+            <tr className="section-head"><td className="sticky-col" colSpan={visiblePumps.length + (canEditAll ? 2 : 1)}>AGO</td></tr>
             <ReadonlyRow label="AGO LITERS" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).agoLiters} />
             <ReadonlyRow label="AGO SALES" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).agoSales} />
 
-            {/* TOTAL SALES */}
             <ReadonlyRow label="TOTAL SALES" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).totalSales} highlight />
 
-            {/* AUTO DATA */}
-            <SimpleEditRow label="DROPS" field="drops" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} placeholder={(p) => calcRow(p.pump_number).drops} />
-            <SimpleEditRow label="MOMO/AIRTEL" field="momo" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} placeholder={(p) => calcRow(p.pump_number).momo} />
-            <SimpleEditRow label="APP USERS" field="app_users" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} placeholder={(p) => calcRow(p.pump_number).app} />
-            <SimpleEditRow label="SALES DIFF" field="sales_difference" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} placeholder={(p) => calcRow(p.pump_number).salesDiff} />
+            <tr className="section-head"><td className="sticky-col" colSpan={visiblePumps.length + (canEditAll ? 2 : 1)}>DEDUCTIONS & PAYMENTS</td></tr>
+            <ReadonlyRow label="DROPS" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).drops} />
+            <ReadonlyRow label="MOMO/AIRTEL" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).momo} />
+            <ReadonlyRow label="APP USERS" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).app} />
+            <ReadonlyRow label="SALES DIFF" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).salesDiff} />
+            <ReadonlyRow label="VISA" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).visa} />
+            <ReadonlyRow label="CASH" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).cash} />
 
-            {/* MANUAL DATA */}
-            <SimpleEditRow label="VISA" field="visa" pumps={visiblePumps} entries={entries} canEdit={canEditAll} onSave={saveField} />
-            <SimpleEditRow label="CASH" field="cash" pumps={visiblePumps} entries={entries} canEdit={canEditAll || isAttendant} onSave={saveField} />
+            <tr className="section-head"><td className="sticky-col" colSpan={visiblePumps.length + (canEditAll ? 2 : 1)}>TOTAL EXPENSES (Approved)</td></tr>
+            <ReadonlyRow label="TOTAL EXPENSES" pumps={visiblePumps} getValue={(p) => calcRow(p.pump_number).totalExp} />
 
-            {/* EXPENSES */}
-            <tr className="section-head"><td className="sticky-col" colSpan={visiblePumps.length + 1}>EXPENSES (Approved only count towards balance)</td></tr>
-            {visiblePumps.map(p => {
-              const list = (expenses[p.pump_number] || [])
-              const approvedTotal = list.filter(x => x.status === 'approved').reduce((a,x) => a + Number(x.amount||0), 0)
-              const entry = entries[p.pump_number]
-              return (
-                <tr key={p.id}>
-                  <td className="sticky-col">
-                    EXPENSES (Pump {p.pump_number})
-                    {entry && <button className="btn-tiny" onClick={() => setOpenExpense({ pumpNumber: p.pump_number, type: 'Expense' })}><i className="fas fa-plus" /></button>}
-                  </td>
-                  <td colSpan={visiblePumps.length} style={{ textAlign: 'right', fontWeight: 700 }}>UGX {approvedTotal.toLocaleString()}</td>
-                </tr>
-              )
-            })}
-
-            {/* FINAL BALANCE */}
             <tr className="balance-row">
-              <td className="sticky-col">BALANCE</td>
+              <td className="sticky-col" style={{ fontSize: 14, fontWeight: 800 }}>NET BALANCE</td>
               {visiblePumps.map(p => {
                 const val = calcRow(p.pump_number).netBalance
                 let cls = 'balance-zero'
-                if (val > 300) cls = 'balance-short'
-                else if (val < -300) cls = 'balance-excess'
+                let textColor = '#0f172a'
+                if (val > 300) { cls = 'balance-short'; textColor = '#dc2626' } 
+                else if (val < -300) { cls = 'balance-excess'; textColor = '#16a34a' } 
 
                 return (
-                  <td key={p.id} className={cls} style={{ textAlign: 'right', fontWeight: 800 }}>
+                  <td key={p.id} className={cls} style={{ textAlign: 'right', fontWeight: 800, color: textColor, padding: '12px 8px' }}>
                     {val.toLocaleString()}
                   </td>
                 )
               })}
+              {canEditAll && (
+                <td className="total-col" style={{ fontSize: 14, fontWeight: 800 }}>
+                  {visiblePumps.reduce((s, p) => s + calcRow(p.pump_number).netBalance, 0).toLocaleString()}
+                </td>
+              )}
             </tr>
-
           </tbody>
         </table>
       </div>
 
-      {openAssign !== null && <AssignPumpModal profile={profile} pumpNumber={openAssign} currentEntry={entries[openAssign]} pumps={pumps} onClose={() => setOpenAssign(null)} onSave={assignPump} />}
-      {openExpense && <ExpenseModal profile={profile} onClose={() => setOpenExpense(null)} onSaved={async () => { setOpenExpense(null); await loadAll() }} {...openExpense} />}
-    </div>
-  )
-}
+      {/* PRICE SETTINGS MODAL */}
+      {showPriceSettings && (
+        <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) setShowPriceSettings(false) }}>
+          <div className="modal" style={{ maxWidth: '400px' }}>
+            <h3>Station Prices</h3>
+            <p style={{ fontSize: 12, color: '#64748b', marginBottom: 16 }}>These prices apply to all pumps in the current shift.</p>
+            
+            <label>PMS Price</label>
+            <input 
+              type="number" 
+              value={editPrices.PMS} 
+              onChange={e => setEditPrices({ ...editPrices, PMS: e.target.value })} 
+              style={{ width: '100%', padding: '8px', marginBottom: 16 }} 
+            />
+            
+            <label>AGO Price</label>
+            <input 
+              type="number" 
+              value={editPrices.AGO} 
+              onChange={e => setEditPrices({ ...editPrices, AGO: e.target.value })} 
+              style={{ width: '100%', padding: '8px', marginBottom: 16 }} 
+            />
 
-function SimpleEditRow({ label, field, pumps, entries, canEdit, onSave, highlight, placeholder }) {
-  return (
-    <tr className={highlight ? 'highlight-row' : ''}>
-      <td className="sticky-col">{label}</td>
-      {pumps.map(p => {
-        const e = entries[p.pump_number]
-        const val = e?.[field] ?? 0
-        const liveVal = placeholder ? placeholder(p) : null
-        const displayVal = (Number(val) === 0 && liveVal !== null) ? liveVal : val
-        const isLive = (Number(val) === 0 && liveVal !== null && liveVal !== 0)
-        return (
-          <td key={p.id}>
-            {isLive ? (
-              <div style={{ textAlign: 'right', color: '#8ba0b9', fontStyle: 'italic', fontSize: 13, paddingRight: 8 }}>
-                {Number(displayVal).toLocaleString()}
-              </div>
-            ) : (
-              <CellInput value={val} canEdit={canEdit && e} onSave={(v) => onSave(p.pump_number, field, v)} />
-            )}
-          </td>
-        )
-      })}
-    </tr>
+            <div className="modal-actions">
+              <button className="btn-ghost-full" onClick={() => setShowPriceSettings(false)}>Cancel</button>
+              <button className="btn-primary-full" onClick={savePrices}>Save Prices</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {openAssign !== null && (
+        <AssignPumpModal 
+          profile={profile} 
+          pumpNumber={openAssign} 
+          currentEntry={entries[openAssign]} 
+          onClose={() => setOpenAssign(null)} 
+          onSave={assignPump} 
+        />
+      )}
+
+      {openPumpModal && (
+        <PumpBalanceModal 
+          profile={profile}
+          pump={openPumpModal}
+          entry={entries[openPumpModal.pump_number]}
+          liveData={liveData[entries[openPumpModal.pump_number]?.user_id]}
+          globalPrices={prices}
+          onClose={() => setOpenPumpModal(null)}
+          onSaved={loadAll} 
+        />
+      )}
+    </div>
   )
 }
 
 function ReadonlyRow({ label, pumps, getValue, highlight }) {
   return (
     <tr className={highlight ? 'highlight-row' : ''}>
-      <td className="sticky-col">{label}</td>
+      <td className="sticky-col" style={{ fontSize: 12, color: '#475569' }}>{label}</td>
       {pumps.map(p => (
-        <td key={p.id} style={{ textAlign: 'right', fontWeight: highlight ? 700 : 400 }}>
+        <td key={p.id} style={{ textAlign: 'right', fontWeight: highlight ? 700 : 500, fontSize: 13, padding: '8px' }}>
           {Number(getValue(p) || 0).toLocaleString()}
         </td>
       ))}
+      {highlight && <td className="total-col"></td>} 
     </tr>
   )
 }
 
-function CellInput({ value, canEdit, onSave }) {
-  const [v, setV] = useState(value || '')
-  const [saved, setSaved] = useState(false)
-  useEffect(() => { setV(value || '') }, [value])
-  if (!canEdit) return <span style={{ textAlign: 'right', display: 'block' }}>{Number(value || 0).toLocaleString()}</span>
-  return (
-    <input type="number" value={v} onChange={e => setV(e.target.value)} onBlur={() => {
-      if (Number(v) !== Number(value)) { onSave(v); setSaved(true); setTimeout(() => setSaved(false), 800) }
-    }} style={{ width: '100%', padding: '6px', border: saved ? '2px solid #10b981' : '1px solid #e2e8f0', borderRadius: 4, textAlign: 'right', fontSize: 13 }} />
-  )
-}
-
-function AssignPumpModal({ profile, pumpNumber, currentEntry, pumps, onClose, onSave }) {
+function AssignPumpModal({ profile, pumpNumber, currentEntry, onClose, onSave }) {
   const user = profile.user
   const [staffList, setStaffList] = useState([])
   const [selectedUserId, setSelectedUserId] = useState(currentEntry?.user_id || '')
+  const [saving, setSaving] = useState(false)
+
   useEffect(() => {
+    let mounted = true
     async function load() {
-      const { data } = await supabase.from('users').select('id, name, role').eq('station_id', user.station_id).in('role', ['attendant','ambassador']).order('name')
-      setStaffList(data || [])
+      const { data } = await supabase.from('users')
+        .select('id, name, role')
+        .eq('station_id', user.station_id)
+        .eq('is_active', true)
+        .in('role', ['attendant', 'ambassador', 'supervisor'])
+        .order('name')
+      if (mounted) setStaffList(data || [])
     }
     load()
+    return () => { mounted = false }
   }, [user.station_id])
+
+  const handleSave = async () => {
+    setSaving(true)
+    const userIdToSave = selectedUserId === '' ? null : selectedUserId
+    await onSave(pumpNumber, userIdToSave)
+    setSaving(false)
+  }
+
   return (
     <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="modal">
         <h3>Assign Pump {pumpNumber}</h3>
         <label>Attendant</label>
-        <select value={selectedUserId} onChange={e => setSelectedUserId(e.target.value)}>
-          <option value="">— None —</option>
-          {staffList.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+        <select 
+          value={selectedUserId} 
+          onChange={e => setSelectedUserId(e.target.value)}
+          style={{ width: '100%', padding: '8px', marginBottom: '16px', borderRadius: '4px', border: '1px solid #ccc' }}
+        >
+          <option value="">— None (Unassign) —</option>
+          {staffList.map(s => (
+            <option key={s.id} value={s.id}>{s.name} ({s.role})</option>
+          ))}
         </select>
+        
         <div className="modal-actions">
-          <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
-          <button className="btn-primary-full" onClick={() => onSave(pumpNumber, selectedUserId)}>Save</button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function ExpenseModal({ profile, pumpNumber, type, onClose, onSaved }) {
-  const user = profile.user
-  const isManager = ['admin','manager','supervisor'].includes(user.role)
-  const [amount, setAmount] = useState('')
-  const [note, setNote] = useState('')
-  async function save() {
-    if (!amount) return
-    const { data: entry } = await supabase.from('balance_entries').select('id').eq('pump_number', pumpNumber).eq('station_id', user.station_id).order('created_at', { ascending: false }).limit(1).single()
-    if (!entry) return
-    await supabase.from('balance_expenses').insert({
-      entry_id: entry.id, expense_type: type, amount: Number(amount), note,
-      status: isManager ? 'approved' : 'pending',
-      approved_by: isManager ? user.id : null, approved_at: isManager ? new Date().toISOString() : null,
-    })
-    onSaved()
-  }
-  return (
-    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-      <div className="modal">
-        <h3>Add Expense — {type}</h3>
-        <div className="modal-sub">Pump {pumpNumber} · {isManager ? 'Auto-approved' : 'Pending Approval'}</div>
-        <label>Amount</label>
-        <input type="number" value={amount} onChange={e => setAmount(e.target.value)} autoFocus />
-        <label>Note</label>
-        <input value={note} onChange={e => setNote(e.target.value)} />
-        <div className="modal-actions">
-          <button className="btn-ghost-full" onClick={onClose}>Cancel</button>
-          <button className="btn-primary-full" onClick={save}>Save</button>
+          <button className="btn-ghost-full" onClick={onClose} disabled={saving}>Cancel</button>
+          <button className="btn-primary-full" onClick={handleSave} disabled={saving}>
+            {saving ? 'Saving...' : 'Save'}
+          </button>
         </div>
       </div>
     </div>
