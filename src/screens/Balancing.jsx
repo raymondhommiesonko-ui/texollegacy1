@@ -18,7 +18,6 @@ function isPartnerOfPump(pumpA, pumpB) {
   return pa.includes(Number(pumpB))
 }
 
-// ---- Lighter colour tokens (soft slate instead of dark) ----
 const C = {
   bg: '#f8fafc',
   card: '#ffffff',
@@ -45,21 +44,22 @@ export default function Balancing({ profile }) {
   const isSupervisor = user.role === 'supervisor'
   const isAdminManagerSup = isManager || isSupervisor
   const isAttendant = user.role === 'attendant' || user.role === 'ambassador'
+  
+  // NEW: Only Admin can edit opening meters
+  const isAdmin = user.role === 'admin'
 
   const canEditAll = isAdminManagerSup || powers.edit_balancing
   const canEditFinances = isAdminManagerSup
   const canApproveExpenses = isAdminManagerSup
   const canAddExpenses = isAttendant || isAdminManagerSup
 
-  // ------------ view / search state ------------
-  // viewDate defaults to today (YYYY-MM-DD), viewShiftType defaults to any
   const today = new Date().toISOString().slice(0, 10)
   const [viewDate, setViewDate] = useState(today)
   const [viewShiftType, setViewShiftType] = useState('') // '' = any
   const [searched, setSearched] = useState(false)
 
   const [shift, setShift] = useState(null)
-  const [shiftLocked, setShiftLocked] = useState(false) // true if status != open
+  const [shiftLocked, setShiftLocked] = useState(false) 
 
   const [pumps, setPumps] = useState([])
   const [entries, setEntries] = useState({})
@@ -94,12 +94,10 @@ export default function Balancing({ profile }) {
     return m
   }, [entries])
 
-  // -------- load a shift (open or closed) --------
   const loadShift = useCallback(async (dateStr, shiftType, opts = {}) => {
     const { silent = false } = opts
     if (!silent) setLoading(true)
     try {
-      // Find the shift for the requested date + optional type
       let q = supabase.from('shifts')
         .select('*')
         .eq('station_id', user.station_id)
@@ -155,7 +153,6 @@ export default function Balancing({ profile }) {
       const { data: existing } = await supabase
         .from('balance_entries').select('*').eq('shift_id', cur.id)
       let visibleEntries = existing || []
-      // Visibility rule: managers/supervisors see all; others see their own
       if (!canEditAll) visibleEntries = visibleEntries.filter(e => e.user_id === user.id)
 
       const byPump = {}
@@ -213,9 +210,8 @@ export default function Balancing({ profile }) {
       console.error('Load error:', e)
     }
     if (!silent) setLoading(false)
-  }, [user.station_id, canEditAll, user.id]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [user.station_id, canEditAll, user.id]) 
 
-  // On mount, find the open shift automatically
   useEffect(() => {
     (async () => {
       const { data } = await supabase.from('shifts')
@@ -232,14 +228,11 @@ export default function Balancing({ profile }) {
         setLoading(false)
       }
     })()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Reload whenever date or shift type changes AND we've already searched at least once
   useEffect(() => {
     if (!searched) return
     loadShift(viewDate, viewShiftType)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewDate, viewShiftType, searched])
 
   async function doSearch() {
@@ -559,7 +552,6 @@ export default function Balancing({ profile }) {
     return Number(value || 0).toLocaleString()
   }
 
-  // Empty-shift screen: still show the search bar so user can try another date
   if (!shift) {
     return (
       <div style={{ padding: 24, background: C.bg, minHeight: '100%' }}>
@@ -670,22 +662,26 @@ export default function Balancing({ profile }) {
                     </div>
                     <div style={{ fontSize: 10, color: C.muted, marginBottom: 8 }}>{p.product}</div>
 
-                    {entry && !shiftLocked && (canEditAll || entry.user_id === user.id) && (
-                      <button onClick={() => setOpenPumpModal(p)}
-                        style={{ ...btn(C.accent), width: '100%', padding: '4px 10px',
-                          fontSize: 11, marginBottom: 6 }}>
-                        <i className="fas fa-edit" style={{ marginRight: 4 }} /> Edit Data
-                      </button>
-                    )}
+                    {/* FIXED BUTTON LAYOUT HERE */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {entry && !shiftLocked && (canEditAll || entry.user_id === user.id) && (
+                        <button onClick={() => setOpenPumpModal(p)}
+                          style={{ ...btn(C.accent), width: '100%', padding: '4px 10px',
+                            fontSize: 11 }}>
+                          <i className="fas fa-edit" style={{ marginRight: 4 }} /> Edit Data
+                        </button>
+                      )}
 
-                    {canEditAll && !shiftLocked && (
-                      <button onClick={() => setOpenAssign(pn)}
-                        style={{
-                          ...btn(null, true), width: '100%', padding: '4px 10px', fontSize: 11,
-                        }}>
-                        {entry ? '↻ Reassign' : '+ Assign'}
-                      </button>
-                    )}
+                      {canEditAll && !shiftLocked && (
+                        <button onClick={() => setOpenAssign(pn)}
+                          style={{
+                            ...btn(null, true), width: '100%', padding: '4px 10px', fontSize: 11,
+                            background: '#fff', borderColor: C.accent, color: C.accent
+                          }}>
+                          {entry ? '↻ Reassign' : '+ Assign'}
+                        </button>
+                      )}
+                    </div>
 
                     {canApproveExpenses && !shiftLocked && hasPendingExp && (
                       <div style={{
@@ -900,6 +896,7 @@ export default function Balancing({ profile }) {
           canEditFinances={canEditFinances}
           canApproveExpenses={canApproveExpenses}
           canAddExpenses={canAddExpenses}
+          isAdmin={isAdmin} // <-- NEW: Passed to modal
           locked={shiftLocked}
           onClose={() => setOpenPumpModal(null)}
           onSaved={() => loadShift(viewDate, viewShiftType, { silent: true })}
@@ -910,7 +907,6 @@ export default function Balancing({ profile }) {
   )
 }
 
-// ---------- small styled subcomponents ----------
 function SearchBar({ viewDate, setViewDate, viewShiftType, setViewShiftType, onSearch, locked }) {
   return (
     <div style={{
@@ -1036,7 +1032,6 @@ function AssignPumpModal({ profile, pumpNumber, currentEntry, userPumps, onClose
   )
 }
 
-// ---- inline style helpers (light theme) ----
 function btn(color, outline = false, wide = false) {
   return {
     background: outline ? 'transparent' : (color || C.accent),

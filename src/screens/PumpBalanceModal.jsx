@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, memo } from 'react'
 import { supabase } from '../supabase'
 
 const C = {
@@ -17,6 +17,38 @@ const C = {
   successBg: '#dcfce7',
 }
 
+// 1. Isolated Input Component to prevent focus loss and typing glitches
+const NumberInput = memo(({ label, value, onChange, disabled, isLive, liveValue }) => {
+  return (
+    <div>
+      <label style={{ fontSize: 11, color: C.muted }}>
+        {label}{isLive && liveValue != null ? ` (live: ${Number(liveValue).toLocaleString()})` : ''}
+      </label>
+      {disabled ? (
+        <div style={{
+          padding: '8px 10px', background: C.soft, borderRadius: 6,
+          fontSize: 13, fontWeight: 600, color: C.text,
+          border: `1px solid ${C.border}`,
+        }}>
+          {Number(value || 0).toLocaleString()}
+        </div>
+      ) : (
+        <input 
+          type="text" 
+          inputMode="numeric"
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          style={{
+            width: '100%', padding: '8px 10px', borderRadius: 6,
+            border: `1px solid ${C.border}`, background: C.card,
+            color: C.text, fontSize: 13,
+          }} 
+        />
+      )}
+    </div>
+  )
+})
+
 export default function PumpBalanceModal({
   profile,
   pump,
@@ -26,6 +58,7 @@ export default function PumpBalanceModal({
   canEditFinances,
   canApproveExpenses,
   canAddExpenses,
+  isAdmin,
   locked,
   onClose,
   onSaved,
@@ -34,35 +67,36 @@ export default function PumpBalanceModal({
   const user = profile.user
   const pumpNumber = Number(pump?.pump_number)
 
-  const isAdminManagerSup = ['admin', 'manager', 'supervisor'].includes(user.role)
-  const editFinances = !locked && (canEditFinances ?? isAdminManagerSup)
-  const approveExpenses = !locked && (canApproveExpenses ?? isAdminManagerSup)
-  const addExpenses = !locked && (canAddExpenses ?? (isAdminManagerSup || entry?.user_id === user.id))
+  const editFinances = !locked && (canEditFinances ?? false)
+  const approveExpenses = !locked && (canApproveExpenses ?? false)
+  const addExpenses = !locked && (canAddExpenses ?? false)
+  
+  const editOpenMeters = editFinances && isAdmin 
 
   const [form, setForm] = useState({
-    pms_open: 0, pms_close: 0, ago_open: 0, ago_close: 0,
-    cash: 0, visa: 0, sales_difference: 0, drops: 0, momo: 0, app_users: 0,
+    pms_open: '0', pms_close: '0', ago_open: '0', ago_close: '0',
+    cash: '0', visa: '0', sales_difference: '0', drops: '0', momo: '0', app_users: '0',
   })
 
   const [expenses, setExpenses] = useState([])
-  const [newExpense, setNewExpense] = useState({ type: 'Lunch', amount: '', note: '' })
-  const customExpenseTypes = ['LUNCH', 'OFFLOADING MILK', 'STA CAFE','KAMED SECURITY','GREAT AMBASSADOR SCHOOL','INSIGHT SECURITY', 'GENERATOR FUEL', 'KPI', 'RTT', 'DIVINE Cottages', 'KIBULI MUSLIM HOSPITAL','KIBULI NURSING SHOOL']
+  const [newExpense, setNewExpense] = useState({ type: 'LUNCH', amount: '', note: '' })
+  const customExpenseTypes = ['LUNCH', 'OFFLOADING MILK', 'STA CAFE','KAMED SECURITY','GREAT AMBASSADOR SCHOOL','INSIGHT SECURITY', 'GENERATOR FUEL', 'KPI', 'RTT', 'DIVINE Cottages', 'KIBULI MUSLIM HOSPITAL','KIBULI NURSING SCHOOL']
   const [saving, setSaving] = useState(false)
   const [busyExpenseId, setBusyExpenseId] = useState(null)
 
   useEffect(() => {
     if (entry) {
       setForm({
-        pms_open: entry.pms_open || 0,
-        pms_close: entry.pms_close || 0,
-        ago_open: entry.ago_open || 0,
-        ago_close: entry.ago_close || 0,
-        cash: entry.cash || 0,
-        visa: entry.visa || 0,
-        sales_difference: entry.sales_difference || 0,
-        drops: entry.drops || liveData?.drops || 0,
-        momo: entry.momo || liveData?.momo || 0,
-        app_users: entry.app_users || liveData?.app || 0,
+        pms_open: String(entry.pms_open || 0),
+        pms_close: String(entry.pms_close || 0),
+        ago_open: String(entry.ago_open || 0),
+        ago_close: String(entry.ago_close || 0),
+        cash: String(entry.cash || 0),
+        visa: String(entry.visa || 0),
+        sales_difference: String(entry.sales_difference || 0),
+        drops: String(entry.drops || liveData?.drops || 0),
+        momo: String(entry.momo || liveData?.momo || 0),
+        app_users: String(entry.app_users || liveData?.app || 0),
       })
       loadExpenses(entry.id)
     }
@@ -79,7 +113,11 @@ export default function PumpBalanceModal({
   }
 
   const handleChange = (field, value) => {
-    if (!editFinances) return
+    if (field === 'pms_open' || field === 'ago_open') {
+      if (!editOpenMeters) return
+    } else {
+      if (!editFinances) return
+    }
     setForm(prev => ({ ...prev, [field]: value }))
   }
 
@@ -87,9 +125,10 @@ export default function PumpBalanceModal({
   const closeMeterInvalid =
     editFinances && (digitCount(form.pms_close) < 2 || digitCount(form.ago_close) < 2)
 
+  // Memoized calculations to prevent unnecessary recalculation on re-render
   const calc = useMemo(() => {
-    const pmsL = Math.max(0, Number(form.pms_close) - Number(form.pms_open))
-    const agoL = Math.max(0, Number(form.ago_close) - Number(form.ago_open))
+    const pmsL = Math.max(0, Number(form.pms_close || 0) - Number(form.pms_open || 0))
+    const agoL = Math.max(0, Number(form.ago_close || 0) - Number(form.ago_open || 0))
 
     const pmsSales = pmsL * Number(globalPrices?.PMS || globalPrices?.pms || 0)
     const agoSales = agoL * Number(globalPrices?.AGO || globalPrices?.ago || 0)
@@ -101,8 +140,8 @@ export default function PumpBalanceModal({
 
     const deductions =
       totalApprovedExpenses +
-      Number(form.drops) + Number(form.momo) + Number(form.sales_difference) +
-      Number(form.app_users) + Number(form.cash) + Number(form.visa)
+      Number(form.drops || 0) + Number(form.momo || 0) + Number(form.sales_difference || 0) +
+      Number(form.app_users || 0) + Number(form.cash || 0) + Number(form.visa || 0)
 
     const netBalance = totalSales - deductions
 
@@ -122,16 +161,16 @@ export default function PumpBalanceModal({
     setSaving(true)
     try {
       const { error } = await supabase.from('balance_entries').update({
-        pms_open: Number(form.pms_open),
-        pms_close: Number(form.pms_close),
-        ago_open: Number(form.ago_open),
-        ago_close: Number(form.ago_close),
-        cash: Number(form.cash),
-        visa: Number(form.visa),
-        sales_difference: Number(form.sales_difference),
-        drops: Number(form.drops),
-        momo: Number(form.momo),
-        app_users: Number(form.app_users),
+        pms_open: Number(form.pms_open || 0),
+        pms_close: Number(form.pms_close || 0),
+        ago_open: Number(form.ago_open || 0),
+        ago_close: Number(form.ago_close || 0),
+        cash: Number(form.cash || 0),
+        visa: Number(form.visa || 0),
+        sales_difference: Number(form.sales_difference || 0),
+        drops: Number(form.drops || 0),
+        momo: Number(form.momo || 0),
+        app_users: Number(form.app_users || 0),
       }).eq('id', entry.id)
 
       if (error) throw error
@@ -204,31 +243,6 @@ export default function PumpBalanceModal({
 
   const financesLocked = !editFinances
 
-  const Field = ({ label, field, live }) => (
-    <div>
-      <label style={{ fontSize: 11, color: C.muted }}>
-        {label}{live != null ? ` (live: ${Number(live).toLocaleString()})` : ''}
-      </label>
-      {financesLocked ? (
-        <div style={{
-          padding: '8px 10px', background: C.soft, borderRadius: 6,
-          fontSize: 13, fontWeight: 600, color: C.text,
-          border: `1px solid ${C.border}`,
-        }}>
-          {Number(form[field] || 0).toLocaleString()}
-        </div>
-      ) : (
-        <input type="number" value={form[field]}
-          onChange={e => handleChange(field, e.target.value)}
-          style={{
-            width: '100%', padding: '8px 10px', borderRadius: 6,
-            border: `1px solid ${C.border}`, background: C.card,
-            color: C.text, fontSize: 13,
-          }} />
-      )}
-    </div>
-  )
-
   return (
     <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="modal" style={{
@@ -287,23 +301,21 @@ export default function PumpBalanceModal({
                   textTransform: 'uppercase', letterSpacing: 0.5 }}>
                   PMS (Price: {Number(globalPrices?.PMS || globalPrices?.pms || 0).toLocaleString()})
                 </h4>
-                <label style={{ fontSize: 11, color: C.muted }}>Open Meter (auto)</label>
-                <input type="number" disabled value={form.pms_open}
-                  style={{
-                    width: '100%', padding: '8px 10px', marginBottom: 8,
-                    borderRadius: 6, border: `1px solid ${C.border}`,
-                    background: '#e2e8f0', color: C.text, fontSize: 13,
-                  }} />
-                <label style={{ fontSize: 11, color: C.muted }}>Close Meter</label>
-                <input type="number" disabled={financesLocked} value={form.pms_close}
-                  onChange={e => handleChange('pms_close', e.target.value)}
-                  style={{
-                    width: '100%', padding: '8px 10px', marginBottom: 8,
-                    borderRadius: 6, border: `1px solid ${C.border}`,
-                    background: C.card, color: C.text, fontSize: 13,
-                  }} />
+                <NumberInput
+                  label={`Open Meter ${isAdmin ? '' : '(auto)'}`}
+                  value={form.pms_open}
+                  onChange={val => handleChange('pms_open', val)}
+                  disabled={!editOpenMeters}
+                />
+                <div style={{ height: 8 }} />
+                <NumberInput
+                  label="Close Meter"
+                  value={form.pms_close}
+                  onChange={val => handleChange('pms_close', val)}
+                  disabled={financesLocked}
+                />
                 <div style={{ display: 'flex', justifyContent: 'space-between',
-                  fontSize: 12, marginTop: 4, color: C.text }}>
+                  fontSize: 12, marginTop: 8, color: C.text }}>
                   <span>Liters: <b>{calc.pmsL.toLocaleString()}</b></span>
                   <span>Sales: <b>{calc.pmsSales.toLocaleString()}</b></span>
                 </div>
@@ -315,23 +327,21 @@ export default function PumpBalanceModal({
                   textTransform: 'uppercase', letterSpacing: 0.5 }}>
                   AGO (Price: {Number(globalPrices?.AGO || globalPrices?.ago || 0).toLocaleString()})
                 </h4>
-                <label style={{ fontSize: 11, color: C.muted }}>Open Meter (auto)</label>
-                <input type="number" disabled value={form.ago_open}
-                  style={{
-                    width: '100%', padding: '8px 10px', marginBottom: 8,
-                    borderRadius: 6, border: `1px solid ${C.border}`,
-                    background: '#e2e8f0', color: C.text, fontSize: 13,
-                  }} />
-                <label style={{ fontSize: 11, color: C.muted }}>Close Meter</label>
-                <input type="number" disabled={financesLocked} value={form.ago_close}
-                  onChange={e => handleChange('ago_close', e.target.value)}
-                  style={{
-                    width: '100%', padding: '8px 10px', marginBottom: 8,
-                    borderRadius: 6, border: `1px solid ${C.border}`,
-                    background: C.card, color: C.text, fontSize: 13,
-                  }} />
+                <NumberInput
+                  label={`Open Meter ${isAdmin ? '' : '(auto)'}`}
+                  value={form.ago_open}
+                  onChange={val => handleChange('ago_open', val)}
+                  disabled={!editOpenMeters}
+                />
+                <div style={{ height: 8 }} />
+                <NumberInput
+                  label="Close Meter"
+                  value={form.ago_close}
+                  onChange={val => handleChange('ago_close', val)}
+                  disabled={financesLocked}
+                />
                 <div style={{ display: 'flex', justifyContent: 'space-between',
-                  fontSize: 12, marginTop: 4, color: C.text }}>
+                  fontSize: 12, marginTop: 8, color: C.text }}>
                   <span>Liters: <b>{calc.agoL.toLocaleString()}</b></span>
                   <span>Sales: <b>{calc.agoSales.toLocaleString()}</b></span>
                 </div>
@@ -358,12 +368,48 @@ export default function PumpBalanceModal({
               textTransform: 'uppercase', letterSpacing: 0.5 }}>Deductions & Payments</h4>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr',
               gap: 12, marginBottom: 16 }}>
-              <Field label="Drops" field="drops" />
-              <Field label="MOMO/Airtel" field="momo" />
-              <Field label="App Users" field="app_users" />
-              <Field label="Sales Diff" field="sales_difference" />
-              <Field label="Visa" field="visa" />
-              <Field label="Cash" field="cash" />
+              <NumberInput
+                label="Drops"
+                value={form.drops}
+                onChange={val => handleChange('drops', val)}
+                disabled={financesLocked}
+                isLive
+                liveValue={liveData?.drops}
+              />
+              <NumberInput
+                label="MOMO/Airtel"
+                value={form.momo}
+                onChange={val => handleChange('momo', val)}
+                disabled={financesLocked}
+                isLive
+                liveValue={liveData?.momo}
+              />
+              <NumberInput
+                label="App Users"
+                value={form.app_users}
+                onChange={val => handleChange('app_users', val)}
+                disabled={financesLocked}
+                isLive
+                liveValue={liveData?.app}
+              />
+              <NumberInput
+                label="Sales Diff"
+                value={form.sales_difference}
+                onChange={val => handleChange('sales_difference', val)}
+                disabled={financesLocked}
+              />
+              <NumberInput
+                label="Visa"
+                value={form.visa}
+                onChange={val => handleChange('visa', val)}
+                disabled={financesLocked}
+              />
+              <NumberInput
+                label="Cash"
+                value={form.cash}
+                onChange={val => handleChange('cash', val)}
+                disabled={financesLocked}
+              />
             </div>
 
             {editFinances && (
@@ -459,12 +505,17 @@ export default function PumpBalanceModal({
                       color: C.text, fontSize: 13 }}>
                     {customExpenseTypes.map(t => <option key={t} value={t}>{t}</option>)}
                   </select>
-                  <input type="number" placeholder="Amount"
+                  
+                  <input 
+                    type="text" 
+                    inputMode="numeric"
+                    placeholder="Amount"
                     value={newExpense.amount}
                     onChange={e => setNewExpense({ ...newExpense, amount: e.target.value })}
                     style={{ width: 110, padding: '8px 10px', borderRadius: 6,
                       border: `1px solid ${C.border}`, background: C.card,
-                      color: C.text, fontSize: 13 }} />
+                      color: C.text, fontSize: 13 }} 
+                  />
                 </div>
                 <div style={{ display: 'flex', gap: 8 }}>
                   <input placeholder="Note (optional)"
