@@ -2,6 +2,41 @@ import { useEffect, useMemo, useState, useCallback } from 'react'
 import { supabase } from '../supabase'
 import PumpBalanceModal from './PumpBalanceModal'
 
+const PAIRS = [[1, 2], [3, 4], [5, 6]]
+
+function pairOf(pumpNumber) {
+  const n = Number(pumpNumber)
+  for (const [a, b] of PAIRS) {
+    if (n === a || n === b) return [a, b]
+  }
+  return null
+}
+
+function isPartnerOfPump(pumpA, pumpB) {
+  const pa = pairOf(pumpA)
+  if (!pa) return false
+  return pa.includes(Number(pumpB))
+}
+
+// ---- Lighter colour tokens (soft slate instead of dark) ----
+const C = {
+  bg: '#f8fafc',
+  card: '#ffffff',
+  border: '#e2e8f0',
+  text: '#1e293b',
+  muted: '#64748b',
+  soft: '#eef2f7',
+  band: '#e8eefb',
+  accent: '#3b82f6',
+  accentSoft: '#dbeafe',
+  danger: '#dc2626',
+  dangerBg: '#fee2e2',
+  warn: '#92400e',
+  warnBg: '#fef3c7',
+  success: '#16a34a',
+  successBg: '#dcfce7',
+}
+
 export default function Balancing({ profile }) {
   const user = profile.user
   const powers = profile.powers || {}
@@ -16,7 +51,16 @@ export default function Balancing({ profile }) {
   const canApproveExpenses = isAdminManagerSup
   const canAddExpenses = isAttendant || isAdminManagerSup
 
+  // ------------ view / search state ------------
+  // viewDate defaults to today (YYYY-MM-DD), viewShiftType defaults to any
+  const today = new Date().toISOString().slice(0, 10)
+  const [viewDate, setViewDate] = useState(today)
+  const [viewShiftType, setViewShiftType] = useState('') // '' = any
+  const [searched, setSearched] = useState(false)
+
   const [shift, setShift] = useState(null)
+  const [shiftLocked, setShiftLocked] = useState(false) // true if status != open
+
   const [pumps, setPumps] = useState([])
   const [entries, setEntries] = useState({})
   const [staff, setStaff] = useState([])
@@ -31,56 +75,68 @@ export default function Balancing({ profile }) {
   const [openPumpModal, setOpenPumpModal] = useState(null)
   const [openAssign, setOpenAssign] = useState(null)
 
+  const [showPms, setShowPms] = useState(false)
+  const [showAgo, setShowAgo] = useState(false)
+
   const nameById = useMemo(() => {
     const m = {}
     staff.forEach(s => { m[s.id] = s.name })
     return m
   }, [staff])
 
-  const loadAll = useCallback(async (silent = false) => {
+  const userPumps = useMemo(() => {
+    const m = {}
+    Object.values(entries).forEach(e => {
+      if (!e?.user_id) return
+      if (!m[e.user_id]) m[e.user_id] = []
+      m[e.user_id].push(Number(e.pump_number))
+    })
+    return m
+  }, [entries])
+
+  // -------- load a shift (open or closed) --------
+  const loadShift = useCallback(async (dateStr, shiftType, opts = {}) => {
+    const { silent = false } = opts
     if (!silent) setLoading(true)
     try {
-      const { data: shifts } = await supabase
-        .from('shifts')
+      // Find the shift for the requested date + optional type
+      let q = supabase.from('shifts')
         .select('*')
         .eq('station_id', user.station_id)
-        .in('status', ['open', 'pending_close'])
+        .eq('shift_date', dateStr)
         .order('opened_at', { ascending: false })
         .limit(1)
+      if (shiftType) q = q.eq('shift_type', shiftType)
+      const { data: shifts } = await q
       const cur = shifts?.[0] || null
       setShift(cur)
+      const locked = !!cur && cur.status !== 'open'
+      setShiftLocked(locked)
 
-      const { data: pumpList } = await supabase
-        .from('pumps')
+      const { data: pumpList } = await supabase.from('pumps')
         .select('*')
         .eq('station_id', user.station_id)
         .eq('is_active', true)
         .order('pump_number')
-
       const normalizedPumps = (pumpList || []).map(p => ({
         ...p,
         pump_number: Number(p.pump_number),
       }))
       setPumps(normalizedPumps)
 
-      const { data: priceData } = await supabase
-        .from('station_prices')
+      const { data: priceData } = await supabase.from('station_prices')
         .select('*')
         .eq('station_id', user.station_id)
-
       if (priceData && priceData.length > 0) {
         const pObj = { PMS: 6789, AGO: 7039 }
-        priceData.forEach(p => {
-          pObj[p.product_name.toUpperCase()] = Number(p.price)
-        })
+        priceData.forEach(p => { pObj[p.product_name.toUpperCase()] = Number(p.price) })
         setPrices(pObj)
         setEditPrices(pObj)
       } else {
         setEditPrices(prev => (prev.PMS || prev.AGO ? prev : prices))
       }
 
-      const { data: us } = await supabase
-        .from('users')
+      const { data: us } = await supabase.from('users')
         .select('id, name, role')
         .eq('station_id', user.station_id)
         .eq('is_active', true)
@@ -89,16 +145,17 @@ export default function Balancing({ profile }) {
       setStaff(us || [])
 
       if (!cur) {
+        setEntries({})
+        setLiveData({})
+        setExpenses({})
         if (!silent) setLoading(false)
         return
       }
 
       const { data: existing } = await supabase
-        .from('balance_entries')
-        .select('*')
-        .eq('shift_id', cur.id)
-
+        .from('balance_entries').select('*').eq('shift_id', cur.id)
       let visibleEntries = existing || []
+      // Visibility rule: managers/supervisors see all; others see their own
       if (!canEditAll) visibleEntries = visibleEntries.filter(e => e.user_id === user.id)
 
       const byPump = {}
@@ -112,8 +169,7 @@ export default function Balancing({ profile }) {
 
       const [txnsRes, appUsersRes, dropsRes] = await Promise.all([
         supabase.from('transactions').select('*')
-          .eq('station_id', user.station_id)
-          .eq('status', 'claimed')
+          .eq('station_id', user.station_id).eq('status', 'claimed')
           .gte('received_at', startTime).lte('received_at', endTime),
         supabase.from('app_users').select('*')
           .eq('station_id', user.station_id)
@@ -124,7 +180,6 @@ export default function Balancing({ profile }) {
 
       const live = {}
       const initLive = id => { if (!live[id]) live[id] = { momo: 0, app: 0, drops: 0 } }
-
       ;(txnsRes.data || []).forEach(t => {
         if (t.claimed_by) {
           initLive(t.claimed_by)
@@ -132,16 +187,10 @@ export default function Balancing({ profile }) {
         }
       })
       ;(appUsersRes.data || []).forEach(a => {
-        if (a.claimed_by) {
-          initLive(a.claimed_by)
-          live[a.claimed_by].app += Number(a.amount)
-        }
+        if (a.claimed_by) { initLive(a.claimed_by); live[a.claimed_by].app += Number(a.amount) }
       })
       ;(dropsRes.data || []).forEach(d => {
-        if (d.attendant_id) {
-          initLive(d.attendant_id)
-          live[d.attendant_id].drops += Number(d.amount)
-        }
+        if (d.attendant_id) { initLive(d.attendant_id); live[d.attendant_id].drops += Number(d.amount) }
       })
       setLiveData(live)
 
@@ -164,15 +213,89 @@ export default function Balancing({ profile }) {
       console.error('Load error:', e)
     }
     if (!silent) setLoading(false)
-  }, [user.station_id, canEditAll, user.id])
+  }, [user.station_id, canEditAll, user.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => { loadAll() }, [loadAll])
+  // On mount, find the open shift automatically
+  useEffect(() => {
+    (async () => {
+      const { data } = await supabase.from('shifts')
+        .select('*')
+        .eq('station_id', user.station_id)
+        .in('status', ['open', 'pending_close'])
+        .order('opened_at', { ascending: false })
+        .limit(1)
+      if (data?.[0]) {
+        setViewDate(data[0].shift_date)
+        setViewShiftType(data[0].shift_type)
+        loadShift(data[0].shift_date, data[0].shift_type)
+      } else {
+        setLoading(false)
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Reload whenever date or shift type changes AND we've already searched at least once
+  useEffect(() => {
+    if (!searched) return
+    loadShift(viewDate, viewShiftType)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewDate, viewShiftType, searched])
+
+  async function doSearch() {
+    setSearched(true)
+    await loadShift(viewDate, viewShiftType)
+  }
+
+  async function getAutoOpenMeters(pumpNumber) {
+    const { data, error } = await supabase
+      .from('balance_entries')
+      .select('pms_close, ago_close, shifts!inner(status)')
+      .eq('station_id', user.station_id)
+      .eq('pump_number', Number(pumpNumber))
+      .eq('shifts.status', 'closed')
+      .order('shift_id', { ascending: false })
+      .limit(1)
+    if (error) {
+      console.warn('auto-open lookup failed', error)
+      return { pms_open: 0, ago_open: 0 }
+    }
+    const row = data?.[0]
+    return {
+      pms_open: Number(row?.pms_close || 0),
+      ago_open: Number(row?.ago_close || 0),
+    }
+  }
 
   async function assignPump(pumpNumber, userId) {
-    if (!shift) return
+    if (!shift || shiftLocked) return
     try {
       const pumpNum = Number(pumpNumber)
       const userIdToSave = userId === '' || userId === undefined ? null : userId
+
+      if (userIdToSave) {
+        const theirPumps = (userPumps[userIdToSave] || []).filter(pn => pn !== pumpNum)
+        if (theirPumps.length > 0) {
+          const partner = isPartnerOfPump(pumpNum, theirPumps[0])
+          if (!partner || theirPumps.length > 1) {
+            alert(
+              `This attendant is already assigned to pump ${theirPumps.join(', ')}.\n` +
+              `An attendant can only be on a pair like 1+2, 3+4, or 5+6.\n` +
+              `Pump ${pumpNum} is not in the same pair.`
+            )
+            return
+          }
+          const [a, b] = pairOf(pumpNum)
+          const allowed = new Set([a, b])
+          if (theirPumps.some(p => !allowed.has(Number(p)))) {
+            alert(
+              `An attendant can only be assigned to pumps ${a} and ${b}. ` +
+              `They are already on ${theirPumps.join(', ')}.`
+            )
+            return
+          }
+        }
+      }
 
       const { data: existingRows, error: findErr } = await supabase
         .from('balance_entries').select('id')
@@ -186,7 +309,7 @@ export default function Balancing({ profile }) {
         if (error) throw error
         setEntries(prev => { const n = { ...prev }; delete n[pumpNum]; return n })
         setOpenAssign(null)
-        await loadAll(true)
+        await loadShift(viewDate, viewShiftType, { silent: true })
         return
       }
 
@@ -197,12 +320,16 @@ export default function Balancing({ profile }) {
           .eq('id', existing.id).select('*').single()
         savedRow = r.data; writeErr = r.error
       } else {
+        const auto = await getAutoOpenMeters(pumpNum)
         const r = await supabase.from('balance_entries').insert({
           shift_id: shift.id,
           station_id: user.station_id,
           pump_number: pumpNum,
           user_id: userIdToSave,
-          pms_open: 0, pms_close: 0, ago_open: 0, ago_close: 0,
+          pms_open: auto.pms_open,
+          pms_close: auto.pms_open,
+          ago_open: auto.ago_open,
+          ago_close: auto.ago_open,
         }).select('*').single()
         savedRow = r.data; writeErr = r.error
       }
@@ -210,7 +337,7 @@ export default function Balancing({ profile }) {
 
       if (savedRow) setEntries(prev => ({ ...prev, [pumpNum]: savedRow }))
       setOpenAssign(null)
-      await loadAll(true)
+      await loadShift(viewDate, viewShiftType, { silent: true })
     } catch (err) {
       console.error('Assign error:', err)
       alert('Failed to assign: ' + err.message)
@@ -229,23 +356,22 @@ export default function Balancing({ profile }) {
         .from('station_prices').upsert(updates, { onConflict: 'station_id,product_name' })
       if (error) throw error
       setShowPriceSettings(false)
-      await loadAll(true)
+      await loadShift(viewDate, viewShiftType, { silent: true })
     } catch (err) {
       alert('Failed to save prices. ' + err.message)
     }
   }
 
-  // Called by PumpBalanceModal after each expense mutation.
-  // Pure state update — no DB round-trip, no full reload.
   function handleExpensesChanged(pumpNum, list) {
     setExpenses(prev => ({ ...prev, [Number(pumpNum)]: list }))
   }
 
-  function calcRow(pumpNumber) {
+  function calcPump(pumpNumber) {
     const e = entries[Number(pumpNumber)]
     if (!e) return {
       pmsLiters: 0, agoLiters: 0, totalSales: 0, netBalance: 0,
       momo: 0, drops: 0, app: 0, totalExp: 0, cash: 0, visa: 0, salesDiff: 0,
+      pms_open: 0, pms_close: 0, ago_open: 0, ago_close: 0, pmsSales: 0, agoSales: 0,
     }
 
     const pmsL = Math.max(0, Number(e.pms_close || 0) - Number(e.pms_open || 0))
@@ -269,92 +395,314 @@ export default function Balancing({ profile }) {
     const netBalance = totalSales - deductions
 
     return {
+      pms_open: Number(e.pms_open || 0), pms_close: Number(e.pms_close || 0),
+      ago_open: Number(e.ago_open || 0), ago_close: Number(e.ago_close || 0),
       pmsLiters: pmsL, agoLiters: agoL, pmsSales: pmsS, agoSales: agoS,
       totalSales, momo, drops, app, salesDiff, totalExp, cash, visa, netBalance,
     }
   }
 
+  function calcRow(pumpNumber) {
+    const n = Number(pumpNumber)
+    const pair = pairOf(n)
+    const primary = pair?.[0]
+    const partner = pair?.find(x => x !== n)
+    const own = calcPump(n)
+
+    if (!pair || n !== primary) return { ...own, aggregated: false }
+
+    const partnerEntry = partner ? entries[partner] : null
+    const ownEntry = entries[n]
+    const sameAttendant = partnerEntry?.user_id && ownEntry?.user_id &&
+                          partnerEntry.user_id === ownEntry.user_id
+
+    if (!sameAttendant) return { ...own, aggregated: false }
+
+    const other = calcPump(partner)
+    return {
+      pms_open: own.pms_open, pms_close: own.pms_close,
+      ago_open: own.ago_open, ago_close: own.ago_close,
+      pmsLiters: own.pmsLiters + other.pmsLiters,
+      agoLiters: own.agoLiters + other.agoLiters,
+      pmsSales: own.pmsSales + other.pmsSales,
+      agoSales: own.agoSales + other.agoSales,
+      totalSales: own.totalSales + other.totalSales,
+      momo: own.momo + other.momo,
+      drops: own.drops + other.drops,
+      app: own.app + other.app,
+      salesDiff: own.salesDiff + other.salesDiff,
+      totalExp: own.totalExp + other.totalExp,
+      cash: own.cash + other.cash,
+      visa: own.visa + other.visa,
+      netBalance: own.netBalance + other.netBalance,
+      aggregated: true,
+    }
+  }
+
+  function pumpDisplay(pumpNumber, key) {
+    const n = Number(pumpNumber)
+    const pair = pairOf(n)
+    if (!pair) return calcPump(n)[key]
+    const primary = pair[0]
+    if (n === primary) return calcRow(n)[key]
+    const partnerEntry = entries[pair[0]]
+    const ownEntry = entries[n]
+    if (partnerEntry?.user_id && ownEntry?.user_id &&
+        partnerEntry.user_id === ownEntry.user_id) {
+      return null
+    }
+    return calcPump(n)[key]
+  }
+
+  function downloadCSV(filename, rows) {
+    const csv = rows.map(r =>
+      r.map(cell => {
+        const s = String(cell ?? '')
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+      }).join(',')
+    ).join('\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }
+
+  function exportMeters() {
+    if (!visiblePumps.length) return alert('Nothing to export.')
+    const header = [
+      'Pump', 'Product', 'Attendant',
+      'PMS Open', 'PMS Close', 'PMS Liters', 'PMS Sales',
+      'AGO Open', 'AGO Close', 'AGO Liters', 'AGO Sales',
+      'TOTAL SALES',
+    ]
+    const rows = [header]
+    visiblePumps.forEach(p => {
+      const r = calcPump(p.pump_number)
+      const entry = entries[Number(p.pump_number)]
+      rows.push([
+        p.pump_number, p.product,
+        entry?.user_id ? (nameById[entry.user_id] || 'Unknown') : 'Unassigned',
+        r.pms_open, r.pms_close, r.pmsLiters, r.pmsSales,
+        r.ago_open, r.ago_close, r.agoLiters, r.agoSales,
+        r.totalSales,
+      ])
+    })
+    const stamp = shift ? `${shift.shift_date}_${shift.shift_type}` : 'shift'
+    downloadCSV(`meters_${stamp}.csv`, rows)
+  }
+
+  function exportFullSheet() {
+    if (!visiblePumps.length) return alert('Nothing to export.')
+    const header = ['', ...visiblePumps.map(p => `Pump ${p.pump_number}`)]
+    const rows = [header]
+
+    const pushRow = (label, getValue, isTotal = false) => {
+      const row = [label, ...visiblePumps.map(p => {
+        const v = getValue(p)
+        return v === null ? '' : v
+      })]
+      if (isTotal) {
+        row.push(visiblePumps.reduce((s, p) => {
+          const v = getValue(p)
+          return s + (v === null ? 0 : Number(v) || 0)
+        }, 0))
+      }
+      rows.push(row)
+    }
+
+    pushRow('ATTENDANT', p => {
+      const entry = entries[Number(p.pump_number)]
+      return entry?.user_id ? (nameById[entry.user_id] || 'Unknown') : 'Unassigned'
+    })
+    pushRow('PMS LITERS', p => pumpDisplay(p.pump_number, 'pmsLiters'))
+    pushRow('PMS SALES', p => pumpDisplay(p.pump_number, 'pmsSales'))
+    pushRow('AGO LITERS', p => pumpDisplay(p.pump_number, 'agoLiters'))
+    pushRow('AGO SALES', p => pumpDisplay(p.pump_number, 'agoSales'))
+    pushRow('TOTAL SALES', p => pumpDisplay(p.pump_number, 'totalSales'), true)
+    pushRow('DROPS', p => pumpDisplay(p.pump_number, 'drops'))
+    pushRow('MOMO/AIRTEL', p => pumpDisplay(p.pump_number, 'momo'))
+    pushRow('APP USERS', p => pumpDisplay(p.pump_number, 'app'))
+    pushRow('SALES DIFF', p => pumpDisplay(p.pump_number, 'salesDiff'))
+    pushRow('VISA', p => pumpDisplay(p.pump_number, 'visa'))
+    pushRow('CASH', p => pumpDisplay(p.pump_number, 'cash'))
+    pushRow('TOTAL EXPENSES', p => pumpDisplay(p.pump_number, 'totalExp'))
+    pushRow('NET BALANCE', p => pumpDisplay(p.pump_number, 'netBalance'), true)
+
+    const stamp = shift ? `${shift.shift_date}_${shift.shift_type}` : 'shift'
+    downloadCSV(`balance_sheet_${stamp}.csv`, rows)
+  }
+
   if (loading) return <div className="drops-empty">Loading…</div>
-  if (!shift) return <div className="drops-empty">No open shift.</div>
 
   const visiblePumps = canEditAll
     ? pumps
     : pumps.filter(p => entries[Number(p.pump_number)]?.user_id === user.id)
 
-  return (
-    <div className="balancing-screen">
-      <div className="balance-sheet-head"
-        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <h3>TEXOL LEGACY — {shift.shift_date}</h3>
-          <div className="sub">{shift.shift_type.toUpperCase()} SHIFT</div>
+  const isAggregatedSecondary = (pumpNumber) => {
+    const n = Number(pumpNumber)
+    const pair = pairOf(n)
+    if (!pair || n === pair[0]) return false
+    const own = entries[n]
+    const partner = entries[pair[0]]
+    return !!(own?.user_id && partner?.user_id && own.user_id === partner.user_id)
+  }
+
+  const renderAggregatedCell = (pumpNumber, value) => {
+    if (value === null || isAggregatedSecondary(pumpNumber)) {
+      return <span style={{ color: C.muted }}>—</span>
+    }
+    return Number(value || 0).toLocaleString()
+  }
+
+  // Empty-shift screen: still show the search bar so user can try another date
+  if (!shift) {
+    return (
+      <div style={{ padding: 24, background: C.bg, minHeight: '100%' }}>
+        <SearchBar
+          viewDate={viewDate} setViewDate={setViewDate}
+          viewShiftType={viewShiftType} setViewShiftType={setViewShiftType}
+          onSearch={doSearch}
+          locked={false}
+        />
+        <div style={{
+          marginTop: 32, padding: 48, background: C.card, borderRadius: 12,
+          border: `1px solid ${C.border}`, textAlign: 'center', color: C.muted,
+        }}>
+          <i className="fas fa-calendar-times" style={{ fontSize: 32, opacity: 0.4 }} />
+          <div style={{ marginTop: 12, fontSize: 15 }}>
+            No shift found for <b>{viewDate}</b>{viewShiftType ? ` — ${viewShiftType} shift` : ''}.
+          </div>
+          <div style={{ marginTop: 6, fontSize: 12 }}>Try another date or shift type.</div>
         </div>
-        {canEditAll && (
-          <button className="btn-primary" onClick={() => setShowPriceSettings(true)}
-            style={{ padding: '8px 16px', borderRadius: '4px' }}>
-            <i className="fas fa-cog" style={{ marginRight: 6 }} /> Price Settings
+      </div>
+    )
+  }
+
+  return (
+    <div className="balancing-screen" style={{ background: C.bg, minHeight: '100%' }}>
+      <div style={{
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        gap: 12, padding: '20px 32px 8px', flexWrap: 'wrap',
+      }}>
+        <div>
+          <h3 style={{ margin: 0, color: C.text, fontSize: 20 }}>
+            TEXOL LEGACY — {shift.shift_date}
+            {shiftLocked && (
+              <span style={{
+                marginLeft: 10, padding: '2px 10px', borderRadius: 999,
+                background: C.warnBg, color: C.warn, fontSize: 11,
+                fontWeight: 700, verticalAlign: 'middle',
+              }}>
+                {String(shift.status).toUpperCase().replace('_', ' ')}
+              </span>
+            )}
+          </h3>
+          <div style={{ color: C.muted, fontSize: 12, letterSpacing: 0.5, marginTop: 2 }}>
+            {shift.shift_type.toUpperCase()} SHIFT
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button onClick={exportMeters} style={btn('#0ea5e9')}>
+            <i className="fas fa-file-export" style={{ marginRight: 6 }} /> Export Meters
           </button>
+          <button onClick={exportFullSheet} style={btn(C.accent)}>
+            <i className="fas fa-file-csv" style={{ marginRight: 6 }} /> Export Full Sheet
+          </button>
+          {canEditAll && !shiftLocked && (
+            <button onClick={() => setShowPriceSettings(true)} style={btn(C.muted)}>
+              <i className="fas fa-cog" style={{ marginRight: 6 }} /> Price Settings
+            </button>
+          )}
+        </div>
+      </div>
+
+      <SearchBar
+        viewDate={viewDate} setViewDate={setViewDate}
+        viewShiftType={viewShiftType} setViewShiftType={setViewShiftType}
+        onSearch={doSearch}
+        locked={shiftLocked}
+      />
+
+      <div style={{ padding: '0 32px', marginBottom: 16, display: 'flex',
+        gap: 12, fontSize: 13, fontWeight: 600, color: C.text }}>
+        <span style={pill()}>PMS: {Number(prices.PMS).toLocaleString()}</span>
+        <span style={pill()}>AGO: {Number(prices.AGO).toLocaleString()}</span>
+        {shiftLocked && (
+          <span style={{ ...pill(), background: C.warnBg, color: C.warn }}>
+            <i className="fas fa-lock" style={{ marginRight: 6 }} />
+            Sheet locked — shift is closed
+          </span>
         )}
       </div>
 
-      <div style={{ padding: '0 32px', marginBottom: '16px', display: 'flex',
-        gap: '20px', fontSize: '13px', fontWeight: 'bold', color: '#475569' }}>
-        <div style={{ background: '#e0e7ff', padding: '6px 12px', borderRadius: '4px' }}>
-          PMS Price: <span style={{ color: '#1d4ed8' }}>{Number(prices.PMS).toLocaleString()}</span>
-        </div>
-        <div style={{ background: '#e0e7ff', padding: '6px 12px', borderRadius: '4px' }}>
-          AGO Price: <span style={{ color: '#1d4ed8' }}>{Number(prices.AGO).toLocaleString()}</span>
-        </div>
-      </div>
-
       <div style={{ overflowX: 'auto', padding: '0 32px 32px' }}>
-        <table className="balance-sheet" style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <table className="balance-sheet" style={{
+          width: '100%', borderCollapse: 'separate', borderSpacing: 0,
+          background: C.card, borderRadius: 12, overflow: 'hidden',
+          border: `1px solid ${C.border}`, boxShadow: '0 1px 3px rgba(15,23,42,0.04)',
+        }}>
           <thead>
             <tr>
-              <th className="sticky-col" style={{ minWidth: '150px' }}>NAMES</th>
+              <th style={{ ...th(), minWidth: 150 }}>NAMES</th>
               {visiblePumps.map(p => {
                 const pn = Number(p.pump_number)
                 const entry = entries[pn]
                 const hasPendingExp = (expenses[pn] || []).some(x => x.status === 'pending')
+                const secondaryAgg = isAggregatedSecondary(pn)
                 return (
-                  <th key={p.id} className="staff-head" style={{ minWidth: '130px', padding: '10px' }}>
-                    <div className="staff-name" style={{ fontWeight: 700, marginBottom: 4 }}>
+                  <th key={p.id} style={{ ...th(), minWidth: 130 }}>
+                    <div style={{ fontWeight: 700, marginBottom: 4, color: C.text }}>
                       PUMP {pn}
+                      {secondaryAgg && (
+                        <span style={{
+                          marginLeft: 6, fontSize: 9, color: C.muted,
+                          background: C.soft, padding: '1px 5px', borderRadius: 3,
+                          textTransform: 'none', fontWeight: 600,
+                        }}>
+                          combined under {pairOf(pn)?.[0]}
+                        </span>
+                      )}
                     </div>
-                    <div style={{ fontSize: 10, color: '#64748b', marginBottom: 8 }}>{p.product}</div>
+                    <div style={{ fontSize: 10, color: C.muted, marginBottom: 8 }}>{p.product}</div>
 
-                    {entry && (canEditAll || entry.user_id === user.id) && (
-                      <button className="btn-tiny" onClick={() => setOpenPumpModal(p)}
-                        style={{ background: '#3b82f6', color: 'white', padding: '4px 10px',
-                          borderRadius: 4, width: '100%', fontSize: 11, fontWeight: 'bold',
-                          marginBottom: 6 }}>
+                    {entry && !shiftLocked && (canEditAll || entry.user_id === user.id) && (
+                      <button onClick={() => setOpenPumpModal(p)}
+                        style={{ ...btn(C.accent), width: '100%', padding: '4px 10px',
+                          fontSize: 11, marginBottom: 6 }}>
                         <i className="fas fa-edit" style={{ marginRight: 4 }} /> Edit Data
                       </button>
                     )}
 
-                    {canEditAll && (
-                      <button className="btn-tiny" onClick={() => setOpenAssign(pn)}
-                        style={{ background: '#f8fafc', border: '1px dashed #cbd5e1',
-                          color: '#64748b', padding: '4px 10px', borderRadius: 4,
-                          width: '100%', fontSize: 11 }}>
+                    {canEditAll && !shiftLocked && (
+                      <button onClick={() => setOpenAssign(pn)}
+                        style={{
+                          ...btn(null, true), width: '100%', padding: '4px 10px', fontSize: 11,
+                        }}>
                         {entry ? '↻ Reassign' : '+ Assign'}
                       </button>
                     )}
 
-                    {canApproveExpenses && hasPendingExp && (
-                      <div style={{ marginTop: 6, fontSize: 10, fontWeight: 700,
-                        background: '#fef3c7', color: '#92400e', padding: '2px 6px',
-                        borderRadius: 4, textAlign: 'center' }}>
+                    {canApproveExpenses && !shiftLocked && hasPendingExp && (
+                      <div style={{
+                        marginTop: 6, fontSize: 10, fontWeight: 700,
+                        background: C.warnBg, color: C.warn,
+                        padding: '2px 6px', borderRadius: 4, textAlign: 'center',
+                      }}>
                         PENDING EXPENSES
                       </div>
                     )}
                   </th>
                 )
               })}
-              {canEditAll && <th className="total-col">TOTAL</th>}
+              {canEditAll && <th style={{ ...th(), background: C.band }}>TOTAL</th>}
             </tr>
             <tr>
-              <th className="sticky-col" style={{ fontSize: 10 }}>ATTENDANT</th>
+              <th style={{ ...th(), fontSize: 10 }}>ATTENDANT</th>
               {visiblePumps.map(p => {
                 const pn = Number(p.pump_number)
                 const entry = entries[pn]
@@ -362,80 +710,144 @@ export default function Balancing({ profile }) {
                   ? nameById[entry.user_id] || 'Unknown user'
                   : 'Unassigned'
                 return (
-                  <th key={p.id} style={{ fontSize: 11,
-                    color: entry?.user_id ? '#92400e' : '#8ba0b9', padding: '8px' }}>
+                  <th key={p.id} style={{
+                    ...th(), fontSize: 11, padding: 8,
+                    color: entry?.user_id ? '#92400e' : C.muted,
+                  }}>
                     {label}
                   </th>
                 )
               })}
-              {canEditAll && <th className="total-col"></th>}
+              {canEditAll && <th style={{ ...th(), background: C.band }}></th>}
             </tr>
           </thead>
           <tbody>
-            <tr className="section-head">
-              <td className="sticky-col" colSpan={visiblePumps.length + (canEditAll ? 2 : 1)}>PMS</td>
-            </tr>
-            <ReadonlyRow label="PMS LITERS" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).pmsLiters} />
-            <ReadonlyRow label="PMS SALES" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).pmsSales} />
-
-            <tr className="section-head">
-              <td className="sticky-col" colSpan={visiblePumps.length + (canEditAll ? 2 : 1)}>AGO</td>
-            </tr>
-            <ReadonlyRow label="AGO LITERS" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).agoLiters} />
-            <ReadonlyRow label="AGO SALES" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).agoSales} />
-
-            <ReadonlyRow label="TOTAL SALES" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).totalSales} highlight />
-
-            <tr className="section-head">
-              <td className="sticky-col" colSpan={visiblePumps.length + (canEditAll ? 2 : 1)}>
-                DEDUCTIONS & PAYMENTS
+            <tr style={{ cursor: 'pointer' }} onClick={() => setShowPms(v => !v)}>
+              <td colSpan={visiblePumps.length + (canEditAll ? 2 : 1)}
+                style={sectionRow()}>
+                <span style={{ marginRight: 8 }}>{showPms ? '▾' : '▸'}</span>
+                PMS
+                <span style={{ marginLeft: 8, fontSize: 10, color: C.muted, fontWeight: 400 }}>
+                  {showPms ? '(click to hide meters)' : '(click to show meters)'}
+                </span>
               </td>
             </tr>
-            <ReadonlyRow label="DROPS" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).drops} />
-            <ReadonlyRow label="MOMO/AIRTEL" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).momo} />
-            <ReadonlyRow label="APP USERS" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).app} />
-            <ReadonlyRow label="SALES DIFF" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).salesDiff} />
-            <ReadonlyRow label="VISA" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).visa} />
-            <ReadonlyRow label="CASH" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).cash} />
+            {showPms && (
+              <>
+                <ReadonlyRow label="PMS OPEN" pumps={visiblePumps}
+                  getValue={p => pumpDisplay(p.pump_number, 'pms_open')} render={renderAggregatedCell} />
+                <ReadonlyRow label="PMS CLOSE" pumps={visiblePumps}
+                  getValue={p => pumpDisplay(p.pump_number, 'pms_close')} render={renderAggregatedCell} />
+                <ReadonlyRow label="PMS LITERS" pumps={visiblePumps}
+                  getValue={p => pumpDisplay(p.pump_number, 'pmsLiters')} render={renderAggregatedCell} />
+                <ReadonlyRow label="PMS SALES" pumps={visiblePumps}
+                  getValue={p => pumpDisplay(p.pump_number, 'pmsSales')} render={renderAggregatedCell} />
+              </>
+            )}
 
-            <tr className="section-head">
-              <td className="sticky-col" colSpan={visiblePumps.length + (canEditAll ? 2 : 1)}>
-                TOTAL EXPENSES (Approved only)
+            <tr style={{ cursor: 'pointer' }} onClick={() => setShowAgo(v => !v)}>
+              <td colSpan={visiblePumps.length + (canEditAll ? 2 : 1)}
+                style={sectionRow()}>
+                <span style={{ marginRight: 8 }}>{showAgo ? '▾' : '▸'}</span>
+                AGO
+                <span style={{ marginLeft: 8, fontSize: 10, color: C.muted, fontWeight: 400 }}>
+                  {showAgo ? '(click to hide meters)' : '(click to show meters)'}
+                </span>
               </td>
             </tr>
-            <ReadonlyRow label="TOTAL EXPENSES" pumps={visiblePumps}
-              getValue={p => calcRow(p.pump_number).totalExp} />
+            {showAgo && (
+              <>
+                <ReadonlyRow label="AGO OPEN" pumps={visiblePumps}
+                  getValue={p => pumpDisplay(p.pump_number, 'ago_open')} render={renderAggregatedCell} />
+                <ReadonlyRow label="AGO CLOSE" pumps={visiblePumps}
+                  getValue={p => pumpDisplay(p.pump_number, 'ago_close')} render={renderAggregatedCell} />
+                <ReadonlyRow label="AGO LITERS" pumps={visiblePumps}
+                  getValue={p => pumpDisplay(p.pump_number, 'agoLiters')} render={renderAggregatedCell} />
+                <ReadonlyRow label="AGO SALES" pumps={visiblePumps}
+                  getValue={p => pumpDisplay(p.pump_number, 'agoSales')} render={renderAggregatedCell} />
+              </>
+            )}
 
-            <tr className="balance-row">
-              <td className="sticky-col" style={{ fontSize: 14, fontWeight: 800 }}>
-                NET BALANCE
+            <tr style={{ background: C.accentSoft }}>
+              <td style={{ ...td(), fontSize: 15, fontWeight: 900, color: C.text, letterSpacing: 0.4 }}>
+                TOTAL SALES
               </td>
               {visiblePumps.map(p => {
-                const val = calcRow(p.pump_number).netBalance
-                let cls = 'balance-zero', textColor = '#0f172a'
-                if (val > 300) { cls = 'balance-short'; textColor = '#dc2626' }
-                else if (val < -300) { cls = 'balance-excess'; textColor = '#16a34a' }
+                const v = pumpDisplay(p.pump_number, 'totalSales')
                 return (
-                  <td key={p.id} className={cls}
-                    style={{ textAlign: 'right', fontWeight: 800, color: textColor, padding: '12px 8px' }}>
-                    {val.toLocaleString()}
+                  <td key={p.id} style={{
+                    ...td(), textAlign: 'right', fontSize: 15, fontWeight: 900, color: C.text,
+                  }}>
+                    {renderAggregatedCell(p.pump_number, v)}
                   </td>
                 )
               })}
               {canEditAll && (
-                <td className="total-col" style={{ fontSize: 14, fontWeight: 800 }}>
-                  {visiblePumps.reduce((s, p) => s + calcRow(p.pump_number).netBalance, 0).toLocaleString()}
+                <td style={{ ...td(), background: C.band, fontSize: 15, fontWeight: 900, color: C.text }}>
+                  {visiblePumps.reduce((s, p) => {
+                    const v = pumpDisplay(p.pump_number, 'totalSales')
+                    return s + (v === null ? 0 : Number(v) || 0)
+                  }, 0).toLocaleString()}
+                </td>
+              )}
+            </tr>
+
+            <tr>
+              <td colSpan={visiblePumps.length + (canEditAll ? 2 : 1)} style={sectionRow()}>
+                DEDUCTIONS & PAYMENTS
+              </td>
+            </tr>
+            <ReadonlyRow label="DROPS" pumps={visiblePumps}
+              getValue={p => pumpDisplay(p.pump_number, 'drops')} render={renderAggregatedCell} />
+            <ReadonlyRow label="MOMO/AIRTEL" pumps={visiblePumps}
+              getValue={p => pumpDisplay(p.pump_number, 'momo')} render={renderAggregatedCell} />
+            <ReadonlyRow label="APP USERS" pumps={visiblePumps}
+              getValue={p => pumpDisplay(p.pump_number, 'app')} render={renderAggregatedCell} />
+            <ReadonlyRow label="SALES DIFF" pumps={visiblePumps}
+              getValue={p => pumpDisplay(p.pump_number, 'salesDiff')} render={renderAggregatedCell} />
+            <ReadonlyRow label="VISA" pumps={visiblePumps}
+              getValue={p => pumpDisplay(p.pump_number, 'visa')} render={renderAggregatedCell} />
+            <ReadonlyRow label="CASH" pumps={visiblePumps}
+              getValue={p => pumpDisplay(p.pump_number, 'cash')} render={renderAggregatedCell} />
+
+            <tr>
+              <td colSpan={visiblePumps.length + (canEditAll ? 2 : 1)} style={sectionRow()}>
+                TOTAL EXPENSES (Approved only)
+              </td>
+            </tr>
+            <ReadonlyRow label="TOTAL EXPENSES" pumps={visiblePumps}
+              getValue={p => pumpDisplay(p.pump_number, 'totalExp')} render={renderAggregatedCell} />
+
+            <tr>
+              <td style={{ ...td(), fontSize: 14, fontWeight: 800, color: C.text }}>
+                NET BALANCE
+              </td>
+              {visiblePumps.map(p => {
+                const v = pumpDisplay(p.pump_number, 'netBalance')
+                if (v === null) {
+                  return (
+                    <td key={p.id} style={{ ...td(), textAlign: 'right', fontWeight: 800, color: C.muted }}>
+                      —
+                    </td>
+                  )
+                }
+                let textColor = C.text
+                if (v > 300) textColor = C.danger
+                else if (v < -300) textColor = C.success
+                return (
+                  <td key={p.id} style={{
+                    ...td(), textAlign: 'right', fontWeight: 800, color: textColor,
+                  }}>
+                    {Number(v || 0).toLocaleString()}
+                  </td>
+                )
+              })}
+              {canEditAll && (
+                <td style={{ ...td(), background: C.band, fontSize: 14, fontWeight: 800 }}>
+                  {visiblePumps.reduce((s, p) => {
+                    const v = pumpDisplay(p.pump_number, 'netBalance')
+                    return s + (v === null ? 0 : Number(v) || 0)
+                  }, 0).toLocaleString()}
                 </td>
               )}
             </tr>
@@ -446,19 +858,19 @@ export default function Balancing({ profile }) {
       {showPriceSettings && (
         <div className="modal-bg"
           onClick={e => { if (e.target === e.currentTarget) setShowPriceSettings(false) }}>
-          <div className="modal" style={{ maxWidth: '400px' }}>
-            <h3>Station Prices</h3>
-            <p style={{ fontSize: 12, color: '#64748b', marginBottom: 16 }}>
+          <div className="modal" style={{ maxWidth: 400, background: C.card }}>
+            <h3 style={{ color: C.text }}>Station Prices</h3>
+            <p style={{ fontSize: 12, color: C.muted, marginBottom: 16 }}>
               These prices apply to all pumps in the current shift.
             </p>
-            <label>PMS Price</label>
+            <label style={{ color: C.text }}>PMS Price</label>
             <input type="number" value={editPrices.PMS}
               onChange={e => setEditPrices({ ...editPrices, PMS: e.target.value })}
-              style={{ width: '100%', padding: '8px', marginBottom: 16 }} />
-            <label>AGO Price</label>
+              style={input()} />
+            <label style={{ color: C.text }}>AGO Price</label>
             <input type="number" value={editPrices.AGO}
               onChange={e => setEditPrices({ ...editPrices, AGO: e.target.value })}
-              style={{ width: '100%', padding: '8px', marginBottom: 16 }} />
+              style={input()} />
             <div className="modal-actions">
               <button className="btn-ghost-full" onClick={() => setShowPriceSettings(false)}>Cancel</button>
               <button className="btn-primary-full" onClick={savePrices}>Save Prices</button>
@@ -472,6 +884,7 @@ export default function Balancing({ profile }) {
           profile={profile}
           pumpNumber={openAssign}
           currentEntry={entries[Number(openAssign)]}
+          userPumps={userPumps}
           onClose={() => setOpenAssign(null)}
           onSave={assignPump}
         />
@@ -487,8 +900,9 @@ export default function Balancing({ profile }) {
           canEditFinances={canEditFinances}
           canApproveExpenses={canApproveExpenses}
           canAddExpenses={canAddExpenses}
+          locked={shiftLocked}
           onClose={() => setOpenPumpModal(null)}
-          onSaved={() => loadAll(true)}
+          onSaved={() => loadShift(viewDate, viewShiftType, { silent: true })}
           onExpensesChanged={handleExpensesChanged}
         />
       )}
@@ -496,22 +910,61 @@ export default function Balancing({ profile }) {
   )
 }
 
-function ReadonlyRow({ label, pumps, getValue, highlight }) {
+// ---------- small styled subcomponents ----------
+function SearchBar({ viewDate, setViewDate, viewShiftType, setViewShiftType, onSearch, locked }) {
   return (
-    <tr className={highlight ? 'highlight-row' : ''}>
-      <td className="sticky-col" style={{ fontSize: 12, color: '#475569' }}>{label}</td>
-      {pumps.map(p => (
-        <td key={p.id} style={{ textAlign: 'right', fontWeight: highlight ? 700 : 500,
-          fontSize: 13, padding: '8px' }}>
-          {Number(getValue(p) || 0).toLocaleString()}
-        </td>
-      ))}
-      {highlight && <td className="total-col"></td>}
+    <div style={{
+      display: 'flex', alignItems: 'flex-end', gap: 10, flexWrap: 'wrap',
+      padding: '0 32px 16px',
+    }}>
+      <div>
+        <label style={{ display: 'block', fontSize: 11, color: C.muted, marginBottom: 4 }}>Date</label>
+        <input type="date" value={viewDate}
+          onChange={e => setViewDate(e.target.value)}
+          style={{ ...input(), width: 160, marginBottom: 0 }} />
+      </div>
+      <div>
+        <label style={{ display: 'block', fontSize: 11, color: C.muted, marginBottom: 4 }}>Shift</label>
+        <select value={viewShiftType}
+          onChange={e => setViewShiftType(e.target.value)}
+          style={{ ...input(), width: 140, marginBottom: 0 }}>
+          <option value="day">Day</option>
+          <option value="night">Night</option>
+        </select>
+      </div>
+      <button onClick={onSearch} style={btn(C.accent, false, true)}>
+        <i className="fas fa-search" style={{ marginRight: 6 }} /> Search
+      </button>
+      {locked && (
+        <span style={{
+          fontSize: 12, color: C.muted, padding: '6px 12px',
+          background: C.soft, borderRadius: 6,
+        }}>
+          <i className="fas fa-lock" style={{ marginRight: 6 }} /> Read-only
+        </span>
+      )}
+    </div>
+  )
+}
+
+function ReadonlyRow({ label, pumps, getValue, render }) {
+  return (
+    <tr>
+      <td style={{ ...td(), fontSize: 12, color: C.text }}>{label}</td>
+      {pumps.map(p => {
+        const v = getValue(p)
+        return (
+          <td key={p.id} style={{ ...td(), textAlign: 'right', fontWeight: 500, fontSize: 13 }}>
+            {render ? render(p.pump_number, v) : (v === null ? '—' : Number(v || 0).toLocaleString())}
+          </td>
+        )
+      })}
+      {render && <td style={{ ...td(), background: C.band }}></td>}
     </tr>
   )
 }
 
-function AssignPumpModal({ profile, pumpNumber, currentEntry, onClose, onSave }) {
+function AssignPumpModal({ profile, pumpNumber, currentEntry, userPumps, onClose, onSave }) {
   const user = profile.user
   const [staffList, setStaffList] = useState([])
   const [selectedUserId, setSelectedUserId] = useState(currentEntry?.user_id || '')
@@ -539,19 +992,38 @@ function AssignPumpModal({ profile, pumpNumber, currentEntry, onClose, onSave })
     setSaving(false)
   }
 
+  const pair = pairOf(pumpNumber)
+  const pairLabel = pair ? `Pumps ${pair[0]} & ${pair[1]}` : `Pump ${pumpNumber}`
+
   return (
     <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-      <div className="modal">
-        <h3>{currentEntry ? `Reassign Pump ${pumpNumber}` : `Assign Pump ${pumpNumber}`}</h3>
-        <label>Attendant</label>
+      <div className="modal" style={{ background: C.card }}>
+        <h3 style={{ color: C.text }}>
+          {currentEntry ? `Reassign ${pairLabel}` : `Assign ${pairLabel}`}
+        </h3>
+        {pair && (
+          <p style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>
+            This pump is part of <b>Pumps {pair[0]} & {pair[1]}</b>. The same attendant must
+            operate both. Their figures will be combined on the main sheet under Pump {pair[0]}.
+          </p>
+        )}
+        <label style={{ color: C.text }}>Attendant</label>
         <select value={selectedUserId || ''}
           onChange={e => setSelectedUserId(e.target.value)}
-          style={{ width: '100%', padding: '8px', marginBottom: '16px',
-            borderRadius: '4px', border: '1px solid #ccc' }}>
+          style={input()}>
           <option value="">— None (Unassign) —</option>
-          {staffList.map(s => (
-            <option key={s.id} value={s.id}>{s.name} ({s.role})</option>
-          ))}
+          {staffList.map(s => {
+            const theirPumps = userPumps[s.id] || []
+            const conflict = theirPumps.length > 0 &&
+              theirPumps.some(pn => !isPartnerOfPump(pumpNumber, pn))
+            return (
+              <option key={s.id} value={s.id} disabled={conflict}>
+                {s.name} ({s.role})
+                {theirPumps.length > 0 ? ` — on pump ${theirPumps.join(', ')}` : ''}
+                {conflict ? ' [conflict]' : ''}
+              </option>
+            )
+          })}
         </select>
         <div className="modal-actions">
           <button className="btn-ghost-full" onClick={onClose} disabled={saving}>Cancel</button>
@@ -562,4 +1034,73 @@ function AssignPumpModal({ profile, pumpNumber, currentEntry, onClose, onSave })
       </div>
     </div>
   )
+}
+
+// ---- inline style helpers (light theme) ----
+function btn(color, outline = false, wide = false) {
+  return {
+    background: outline ? 'transparent' : (color || C.accent),
+    color: outline ? C.muted : '#fff',
+    border: outline ? `1px dashed ${C.border}` : 'none',
+    padding: wide ? '10px 18px' : '8px 14px',
+    borderRadius: 6,
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+    boxShadow: outline ? 'none' : '0 1px 2px rgba(15,23,42,0.06)',
+  }
+}
+function th() {
+  return {
+    background: C.soft,
+    color: C.text,
+    fontWeight: 700,
+    fontSize: 12,
+    padding: '10px 8px',
+    borderBottom: `1px solid ${C.border}`,
+    borderRight: `1px solid ${C.border}`,
+    textAlign: 'center',
+  }
+}
+function td() {
+  return {
+    padding: '8px 10px',
+    borderBottom: `1px solid ${C.border}`,
+    borderRight: `1px solid ${C.border}`,
+    color: C.text,
+  }
+}
+function sectionRow() {
+  return {
+    background: C.soft,
+    color: C.text,
+    fontWeight: 700,
+    fontSize: 12,
+    letterSpacing: 0.5,
+    padding: '8px 12px',
+    borderBottom: `1px solid ${C.border}`,
+  }
+}
+function pill() {
+  return {
+    background: C.card,
+    color: C.text,
+    padding: '6px 12px',
+    borderRadius: 6,
+    border: `1px solid ${C.border}`,
+    fontSize: 13,
+    fontWeight: 600,
+  }
+}
+function input() {
+  return {
+    width: '100%',
+    padding: '8px 10px',
+    borderRadius: 6,
+    border: `1px solid ${C.border}`,
+    background: C.card,
+    color: C.text,
+    fontSize: 13,
+    marginBottom: 12,
+  }
 }

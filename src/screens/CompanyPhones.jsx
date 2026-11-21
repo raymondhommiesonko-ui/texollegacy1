@@ -196,4 +196,4 @@ function getFingerprint() {
     localStorage.setItem(key, fp)
   }
   return fp
-}
+} ['LUNCH', 'OFFLOADING MILK', 'STA CAFE','KAMED SECURITY','GREAT AMBASSADOR SCHOOL','INSIGHT SECURITY', 'GENERATOR FUEL', 'KPI', 'RTT', 'DIVINE Cottages', 'KIBULI MUSLIM HOSPITAL','KIBULI NURSING SHOOL']
