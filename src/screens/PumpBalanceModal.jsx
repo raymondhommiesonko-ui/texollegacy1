@@ -17,7 +17,6 @@ const C = {
   successBg: '#dcfce7',
 }
 
-// 1. Isolated Input Component to prevent focus loss and typing glitches
 const NumberInput = memo(({ label, value, onChange, disabled, isLive, liveValue }) => {
   return (
     <div>
@@ -80,7 +79,7 @@ export default function PumpBalanceModal({
 
   const [expenses, setExpenses] = useState([])
   const [newExpense, setNewExpense] = useState({ type: 'LUNCH', amount: '', note: '' })
-  const customExpenseTypes = ['LUNCH', 'OFFLOADING MILK', 'STA CAFE','KAMED SECURITY','GREAT AMBASSADOR SCHOOL','INSIGHT SECURITY', 'GENERATOR FUEL', 'KPI', 'RTT', 'DIVINE Cottages', 'KIBULI MUSLIM HOSPITAL','KIBULI NURSING SCHOOL']
+  const customExpenseTypes = ['LUNCH', 'OFFLOADING MILK', 'REVERSAL', 'STA CAFE','KAMED SECURITY','GREAT AMBASSADOR SCHOOL','INSIGHT SECURITY', 'GENERATOR FUEL', 'KPI', 'RTT', 'DIVINE Cottages', 'KIBULI MUSLIM HOSPITAL','KIBULI NURSING SCHOOL']
   const [saving, setSaving] = useState(false)
   const [busyExpenseId, setBusyExpenseId] = useState(null)
 
@@ -125,7 +124,6 @@ export default function PumpBalanceModal({
   const closeMeterInvalid =
     editFinances && (digitCount(form.pms_close) < 2 || digitCount(form.ago_close) < 2)
 
-  // Memoized calculations to prevent unnecessary recalculation on re-render
   const calc = useMemo(() => {
     const pmsL = Math.max(0, Number(form.pms_close || 0) - Number(form.pms_open || 0))
     const agoL = Math.max(0, Number(form.ago_close || 0) - Number(form.ago_open || 0))
@@ -195,12 +193,15 @@ export default function PumpBalanceModal({
         status: editFinances ? 'approved' : 'pending',
         approved_by: editFinances ? user.id : null,
         approved_at: editFinances ? new Date().toISOString() : null,
+        created_by: user.id // FIXED: Removed user_id
       })
+      
       if (error) throw error
+      
       setNewExpense({ type: newExpense.type, amount: '', note: '' })
       await loadExpenses(entry.id)
     } catch (err) {
-      alert(err.message)
+      alert("Failed to add expense: " + err.message)
     }
     setSaving(false)
   }

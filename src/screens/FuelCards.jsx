@@ -28,7 +28,8 @@ export default function FuelCards({ profile }) {
     fromDate: today,
     toDate: today,
     fromTime: '',
-    toTime: ''
+    toTime: '',
+    uploadIds: null // NEW: Stores the specific upload files for the shift
   })
 
   const [salesRows, setSalesRows] = useState([])
@@ -41,6 +42,8 @@ export default function FuelCards({ profile }) {
   // --- QUICK SET TO CURRENT SHIFT ---
   async function setToActiveShift() {
     if (!user?.station_id) return
+    setLoading(true)
+
     const { data: openShifts } = await supabase
       .from('shifts')
       .select('*')
@@ -52,19 +55,32 @@ export default function FuelCards({ profile }) {
     if (openShifts && openShifts.length > 0) {
       const s = openShifts[0]
       const openedAt = new Date(s.opened_at)
+      const endedAt = s.closed_at ? new Date(s.closed_at) : new Date()
       
+      // Find all files uploaded during this shift's time window
+      const { data: shiftUploads } = await supabase
+        .from('card_uploads')
+        .select('id')
+        .eq('station_id', user.station_id)
+        .gte('uploaded_at', openedAt.toISOString())
+        .lte('uploaded_at', endedAt.toISOString())
+
+      const ids = shiftUploads ? shiftUploads.map(u => u.id) : []
+
       setFilters({
         fromDate: openedAt.toISOString().slice(0, 10),
         fromTime: openedAt.toTimeString().slice(0, 5),
-        toDate: today,
-        toTime: new Date().toTimeString().slice(0, 5)
+        toDate: endedAt.toISOString().slice(0, 10),
+        toTime: endedAt.toTimeString().slice(0, 5),
+        uploadIds: ids // Save these to filter by
       })
     } else {
       alert('No active shift found.')
+      setLoading(false)
     }
   }
 
-  // --- LOAD DATA WITH CROSS-MIDNIGHT LOGIC ---
+  // --- LOAD DATA ---
   async function loadAll() {
     setLoading(true)
     setErrorMsg('')
@@ -76,63 +92,86 @@ export default function FuelCards({ profile }) {
     }
 
     try {
-      const tf = filters.fromTime
-      const tt = filters.toTime
-      const fromDate = filters.fromDate
-      const toDate = filters.toDate
-
       let windowStartISO, windowEndISO
 
-      if (tf && tt) {
-        const [fh, fm] = tf.split(':').map(Number)
-        const [th, tm] = tt.split(':').map(Number)
-        const fromMin = fh * 60 + fm
-        const toMin = th * 60 + tm
+      // 1. If we have specific upload IDs (from Current Shift), ONLY show those files.
+      // 2. Otherwise, use the date/time picker.
+      if (filters.uploadIds && filters.uploadIds.length > 0) {
+        
+        // Fetch Sales by Upload ID
+        const { data: s } = await supabase
+          .from('card_sales')
+          .select('*')
+          .eq('station_id', user.station_id)
+          .in('upload_id', filters.uploadIds)
+          .order('txn_at', { ascending: false })
+        setSalesRows(s || [])
 
-        if (fromMin <= toMin) {
-          windowStartISO = eatToISO(fromDate, tf)
-          windowEndISO = eatToISO(toDate, tt)
-        } else {
-          if (fromDate === toDate) {
-            windowStartISO = eatToISO(fromDate, tf)
-            windowEndISO = eatToISO(addDaysEAT(toDate, 1), tt)
-          } else {
+        // Fetch Top-ups by Upload ID
+        const { data: t } = await supabase
+          .from('card_topups')
+          .select('*')
+          .eq('station_id', user.station_id)
+          .in('upload_id', filters.uploadIds)
+          .order('txn_at', { ascending: false })
+        setTopupRows(t || [])
+
+      } else {
+        // Fallback to standard time filter
+        const tf = filters.fromTime
+        const tt = filters.toTime
+        const fromDate = filters.fromDate
+        const toDate = filters.toDate
+
+        if (tf && tt) {
+          const [fh, fm] = tf.split(':').map(Number)
+          const [th, tm] = tt.split(':').map(Number)
+          const fromMin = fh * 60 + fm
+          const toMin = th * 60 + tm
+
+          if (fromMin <= toMin) {
             windowStartISO = eatToISO(fromDate, tf)
             windowEndISO = eatToISO(toDate, tt)
+          } else {
+            if (fromDate === toDate) {
+              windowStartISO = eatToISO(fromDate, tf)
+              windowEndISO = eatToISO(addDaysEAT(toDate, 1), tt)
+            } else {
+              windowStartISO = eatToISO(fromDate, tf)
+              windowEndISO = eatToISO(toDate, tt)
+            }
           }
+        } else if (tf) {
+          windowStartISO = eatToISO(fromDate, tf)
+          windowEndISO = eatToISO(toDate, '23:59')
+        } else if (tt) {
+          windowStartISO = eatToISO(fromDate, '00:00')
+          windowEndISO = eatToISO(toDate, tt)
+        } else {
+          windowStartISO = eatToISO(fromDate, '00:00')
+          windowEndISO = eatToISO(toDate, '23:59')
         }
-      } else if (tf) {
-        windowStartISO = eatToISO(fromDate, tf)
-        windowEndISO = eatToISO(toDate, '23:59')
-      } else if (tt) {
-        windowStartISO = eatToISO(fromDate, '00:00')
-        windowEndISO = eatToISO(toDate, tt)
-      } else {
-        windowStartISO = eatToISO(fromDate, '00:00')
-        windowEndISO = eatToISO(toDate, '23:59')
+
+        const { data: s } = await supabase
+          .from('card_sales')
+          .select('*')
+          .eq('station_id', user.station_id)
+          .gte('txn_at', windowStartISO)
+          .lte('txn_at', windowEndISO)
+          .order('txn_at', { ascending: false })
+        setSalesRows(s || [])
+
+        const { data: t } = await supabase
+          .from('card_topups')
+          .select('*')
+          .eq('station_id', user.station_id)
+          .gte('txn_at', windowStartISO)
+          .lte('txn_at', windowEndISO)
+          .order('txn_at', { ascending: false })
+        setTopupRows(t || [])
       }
 
-      // 1. Fetch Sales
-      const { data: s } = await supabase
-        .from('card_sales')
-        .select('*')
-        .eq('station_id', user.station_id)
-        .gte('txn_at', windowStartISO)
-        .lte('txn_at', windowEndISO)
-        .order('txn_at', { ascending: false })
-      setSalesRows(s || [])
-
-      // 2. Fetch Top-ups
-      const { data: t } = await supabase
-        .from('card_topups')
-        .select('*')
-        .eq('station_id', user.station_id)
-        .gte('txn_at', windowStartISO)
-        .lte('txn_at', windowEndISO)
-        .order('txn_at', { ascending: false })
-      setTopupRows(t || [])
-
-      // 3. Fetch Uploads
+      // 3. Fetch Uploads Log (always last 20)
       const { data: u } = await supabase
         .from('card_uploads')
         .select('*')
@@ -141,39 +180,32 @@ export default function FuelCards({ profile }) {
         .limit(20)
       setUploads(u || [])
 
-      // 4. Fetch App Users
-      const { data: au } = await supabase
-        .from('app_users')
-        .select('*')
-        .eq('station_id', user.station_id)
-        .gte('txn_at', windowStartISO)
-        .lte('txn_at', windowEndISO)
-        .order('txn_at', { ascending: false })
+      // 4. Fetch App Users (filtering by the same logic)
+      let auQuery = supabase.from('app_users').select('*').eq('station_id', user.station_id)
+      
+      if (filters.uploadIds && filters.uploadIds.length > 0) {
+         // App users don't have upload_id, so we fall back to time window based on the shift
+         auQuery = auQuery.gte('txn_at', windowStartISO).lte('txn_at', windowEndISO)
+      } else {
+         auQuery = auQuery.gte('txn_at', windowStartISO).lte('txn_at', windowEndISO)
+      }
 
+      const { data: au } = await auQuery.order('txn_at', { ascending: false })
       let finalAppUsers = au || []
 
-      if (finalAppUsers.length === 0) {
-        const { data: fromSales } = await supabase
-          .from('card_sales')
-          .select('txn_id, card_number, customer_name, staff_name, original_amount, txn_at')
-          .eq('station_id', user.station_id)
-          .gte('txn_at', windowStartISO)
-          .lte('txn_at', windowEndISO)
-        
-        if (fromSales && fromSales.length > 0) {
-          finalAppUsers = fromSales
-            .filter(r => String(r.staff_name || '').replace(/\s+/g, '').toLowerCase().includes('appuser'))
-            .map(s => ({
-              id: s.txn_id,
-              txn_id: s.txn_id,
-              card_number: s.card_number,
-              customer_name: s.customer_name,
-              amount: s.original_amount,
-              txn_at: s.txn_at,
-              claimed_by: null,
-              is_fallback: true
-            }))
-        }
+      if (finalAppUsers.length === 0 && salesRows.length > 0) {
+        finalAppUsers = salesRows
+          .filter(r => String(r.staff_name || '').replace(/\s+/g, '').toLowerCase().includes('appuser'))
+          .map(s => ({
+            id: s.txn_id,
+            txn_id: s.txn_id,
+            card_number: s.card_number,
+            customer_name: s.customer_name,
+            amount: s.original_amount,
+            txn_at: s.txn_at,
+            claimed_by: null,
+            is_fallback: true
+          }))
       }
       setAppUsers(finalAppUsers)
 
@@ -220,7 +252,7 @@ export default function FuelCards({ profile }) {
   // Trigger load when user or filters change
   useEffect(() => { 
     loadAll() 
-  }, [user?.station_id, filters.fromDate, filters.toDate, filters.fromTime, filters.toTime])
+  }, [user?.station_id, filters.fromDate, filters.toDate, filters.fromTime, filters.toTime, filters.uploadIds])
 
   // --- MAIN STATS ---
   const stats = useMemo(() => {
@@ -348,23 +380,24 @@ export default function FuelCards({ profile }) {
 
       {/* DATE AND TIME FILTERS */}
       <div className="staff-filters" style={{ flexWrap: 'wrap', alignItems: 'center' }}>
+        
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 13, fontWeight: 600, color: '#6b85a0' }}>From:</span>
-          <input type="date" value={filters.fromDate} onChange={e => setFilters({...filters, fromDate: e.target.value})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
-          <input type="time" value={filters.fromTime} onChange={e => setFilters({...filters, fromTime: e.target.value})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
+          <input type="date" value={filters.fromDate} onChange={e => setFilters({...filters, fromDate: e.target.value, uploadIds: null})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
+          <input type="time" value={filters.fromTime} onChange={e => setFilters({...filters, fromTime: e.target.value, uploadIds: null})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
         </div>
         
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 13, fontWeight: 600, color: '#6b85a0' }}>To:</span>
-          <input type="date" value={filters.toDate} onChange={e => setFilters({...filters, toDate: e.target.value})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
-          <input type="time" value={filters.toTime} onChange={e => setFilters({...filters, toTime: e.target.value})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
+          <input type="date" value={filters.toDate} onChange={e => setFilters({...filters, toDate: e.target.value, uploadIds: null})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
+          <input type="time" value={filters.toTime} onChange={e => setFilters({...filters, toTime: e.target.value, uploadIds: null})} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #e2e8f0' }} />
         </div>
 
-        <button className="btn-ghost btn-sm" onClick={setToActiveShift} style={{ background: '#d1fae5', color: '#065f46' }}>
+        <button className="btn-ghost btn-sm" onClick={setToActiveShift} style={{ background: filters.uploadIds ? '#10b981' : '#d1fae5', color: filters.uploadIds ? '#fff' : '#065f46' }}>
           <i className="fas fa-clock" /> Current Shift
         </button>
         
-        <button className="btn-ghost btn-sm" onClick={() => setFilters({ fromDate: today, toDate: today, fromTime: '', toTime: '' })}>
+        <button className="btn-ghost btn-sm" onClick={() => setFilters({ fromDate: today, toDate: today, fromTime: '', toTime: '', uploadIds: null })}>
           Today
         </button>
         
@@ -522,7 +555,8 @@ export default function FuelCards({ profile }) {
                 fromDate: dateFrom, 
                 toDate: dateTo, 
                 fromTime: '', 
-                toTime: '' 
+                toTime: '',
+                uploadIds: null
               })
             }
             await loadAll() 
@@ -856,22 +890,17 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
       p1 = Number(p1); p2 = Number(p2); y = Number(y)
       if (y < 100) y += 2000
 
-      // If the first number is greater than 12, it MUST be the day (DD/MM/YYYY).
-      // If the second number is greater than 12, the first MUST be the month (MM/DD/YYYY).
-      // If both are <= 12, we assume DD/MM/YYYY (standard in Uganda/UK).
       let d, mo
       if (p1 > 12) { d = p1; mo = p2; }
       else if (p2 > 12) { mo = p1; d = p2; }
-      else { d = p1; mo = p2; } // Default to DD/MM/YYYY
+      else { d = p1; mo = p2; }
 
       const dt = new Date(Date.UTC(y, mo - 1, d, Number(h || 0), Number(mi || 0), Number(sec || 0)))
       if (!isNaN(dt.getTime())) return dt.toISOString()
     }
 
-    // 3. Fallback to standard JS date parsing
     const iso = new Date(s)
     if (!isNaN(iso.getTime())) return iso.toISOString()
-    
     return null
   }
 
@@ -943,7 +972,7 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
             card_number: r.card_number,
             customer_name: r.customer_name,
             amount: r.original_amount,
-            txn_at: r.txn_at // SAVING txn_at HERE
+            txn_at: r.txn_at 
           }))
         
         if (appUserRows.length > 0) {
@@ -951,7 +980,6 @@ function UploadModal({ profile, fileType, onClose, onSaved }) {
         }
       }
 
-      // Pass BOTH dates back to the parent
       onSaved(dateFrom, dateTo)
     } catch (e) {
       console.error(e)
@@ -1087,9 +1115,31 @@ function ReconcileModal({ profile, onClose, onSaved }) {
       let insertedCount = 0
 
       if (toInsert.length > 0) {
+        // Create an upload record so we can track this reconciliation
+        const dates = toInsert.map(r => r.txn_at).sort()
+        const dateFrom = dates[0]?.slice(0, 10)
+        const dateTo = dates[dates.length-1]?.slice(0, 10)
+
+        const { data: up, error: uErr } = await supabase
+          .from('card_uploads')
+          .insert({
+            station_id: user.station_id,
+            file_type: fileType,
+            file_name: file?.name || 'reconciled_file',
+            uploaded_by: user.id,
+            date_from: dateFrom,
+            date_to: dateTo,
+            row_count: toInsert.length,
+          })
+          .select('id')
+          .single()
+        
+        if (uErr) throw uErr
+
         const insertRows = toInsert.map(r => ({ 
           ...r, 
           station_id: user.station_id,
+          upload_id: up.id, // LINK TO UPLOAD
           updated_at: new Date().toISOString()
         }))
         
@@ -1099,22 +1149,22 @@ function ReconcileModal({ profile, onClose, onSaved }) {
           if (error) throw error
           insertedCount += batch.length
         }
-      }
 
-      if (fileType === 'sales' && insertedCount > 0) {
-        const appUserRows = toInsert
-          .filter(r => String(r.staff_name).replace(/\s+/g, '').toLowerCase().includes('appuser'))
-          .map(r => ({
-            station_id: user.station_id,
-            txn_id: r.txn_id,
-            card_number: r.card_number,
-            customer_name: r.customer_name,
-            amount: r.original_amount,
-            txn_at: r.txn_at // SAVING txn_at HERE
-          }))
-        
-        if (appUserRows.length > 0) {
-          await supabase.from('app_users').upsert(appUserRows, { onConflict: 'txn_id' })
+        if (fileType === 'sales' && insertedCount > 0) {
+          const appUserRows = toInsert
+            .filter(r => String(r.staff_name).replace(/\s+/g, '').toLowerCase().includes('appuser'))
+            .map(r => ({
+              station_id: user.station_id,
+              txn_id: r.txn_id,
+              card_number: r.card_number,
+              customer_name: r.customer_name,
+              amount: r.original_amount,
+              txn_at: r.txn_at
+            }))
+          
+          if (appUserRows.length > 0) {
+            await supabase.from('app_users').upsert(appUserRows, { onConflict: 'txn_id' })
+          }
         }
       }
 

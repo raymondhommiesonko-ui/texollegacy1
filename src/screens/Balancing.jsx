@@ -18,6 +18,12 @@ function isPartnerOfPump(pumpA, pumpB) {
   return pa.includes(Number(pumpB))
 }
 
+function cleanName(str) {
+  return String(str || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '')
+}
+
 const C = {
   bg: '#f8fafc',
   card: '#ffffff',
@@ -45,7 +51,6 @@ export default function Balancing({ profile }) {
   const isAdminManagerSup = isManager || isSupervisor
   const isAttendant = user.role === 'attendant' || user.role === 'ambassador'
   
-  // NEW: Only Admin can edit opening meters
   const isAdmin = user.role === 'admin'
 
   const canEditAll = isAdminManagerSup || powers.edit_balancing
@@ -55,7 +60,7 @@ export default function Balancing({ profile }) {
 
   const today = new Date().toISOString().slice(0, 10)
   const [viewDate, setViewDate] = useState(today)
-  const [viewShiftType, setViewShiftType] = useState('') // '' = any
+  const [viewShiftType, setViewShiftType] = useState('')
   const [searched, setSearched] = useState(false)
 
   const [shift, setShift] = useState(null)
@@ -164,6 +169,7 @@ export default function Balancing({ profile }) {
       const startTime = cur.opened_at
       const endTime = cur.closed_at || new Date().toISOString()
 
+      // 1. Fetch standard live data
       const [txnsRes, appUsersRes, dropsRes] = await Promise.all([
         supabase.from('transactions').select('*')
           .eq('station_id', user.station_id).eq('status', 'claimed')
@@ -175,20 +181,58 @@ export default function Balancing({ profile }) {
           .eq('shift_id', cur.id).eq('status', 'active'),
       ])
 
+      // 2. Fetch Fuel Card uploads specifically for this shift's window
+      // This prevents pulling in old test files or files from other days
+      const { data: shiftsUploads } = await supabase
+        .from('card_uploads')
+        .select('id')
+        .eq('station_id', user.station_id)
+        .gte('uploaded_at', startTime)
+        .lte('uploaded_at', endTime)
+
+      const uploadIds = (shiftsUploads || []).map(u => u.id)
+      
+      let cardSalesRes = { data: [] }
+      if (uploadIds.length > 0) {
+        // Fetch only sales linked to these specific upload files
+        cardSalesRes = await supabase
+          .from('card_sales')
+          .select('staff_name, original_amount')
+          .eq('station_id', user.station_id)
+          .in('upload_id', uploadIds)
+      }
+
       const live = {}
-      const initLive = id => { if (!live[id]) live[id] = { momo: 0, app: 0, drops: 0 } }
+      const initLive = id => { if (!live[id]) live[id] = { momo: 0, app: 0, drops: 0, diff: 0 } }
+      
       ;(txnsRes.data || []).forEach(t => {
         if (t.claimed_by) {
           initLive(t.claimed_by)
           if (['airtel', 'mtn'].includes(t.provider)) live[t.claimed_by].momo += Number(t.amount)
         }
       })
+      
       ;(appUsersRes.data || []).forEach(a => {
         if (a.claimed_by) { initLive(a.claimed_by); live[a.claimed_by].app += Number(a.amount) }
       })
+      
       ;(dropsRes.data || []).forEach(d => {
         if (d.attendant_id) { initLive(d.attendant_id); live[d.attendant_id].drops += Number(d.amount) }
       })
+
+      // 3. Map Card Sales to Attendants
+      const staffNameMap = {}
+      ;(us || []).forEach(u => { staffNameMap[cleanName(u.name)] = u.id })
+      
+      ;(cardSalesRes.data || []).forEach(sale => {
+        const sName = cleanName(sale.staff_name)
+        const userId = staffNameMap[sName]
+        if (userId) {
+          initLive(userId)
+          live[userId].diff += Number(sale.original_amount || 0)
+        }
+      })
+
       setLiveData(live)
 
       const ids = visibleEntries.map(e => e.id)
@@ -373,11 +417,11 @@ export default function Balancing({ profile }) {
     const agoS = agoL * prices.AGO
     const totalSales = pmsS + agoS
 
-    const live = liveData[e.user_id] || { momo: 0, app: 0, drops: 0 }
+    const live = liveData[e.user_id] || { momo: 0, app: 0, drops: 0, diff: 0 }
     const momo = Number(e.momo) || live.momo
     const drops = Number(e.drops) || live.drops
     const app = Number(e.app_users) || live.app
-    const salesDiff = Number(e.sales_difference || 0)
+    const salesDiff = Number(e.sales_difference) || live.diff
     const cash = Number(e.cash || 0)
     const visa = Number(e.visa || 0)
 
@@ -662,7 +706,6 @@ export default function Balancing({ profile }) {
                     </div>
                     <div style={{ fontSize: 10, color: C.muted, marginBottom: 8 }}>{p.product}</div>
 
-                    {/* FIXED BUTTON LAYOUT HERE */}
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                       {entry && !shiftLocked && (canEditAll || entry.user_id === user.id) && (
                         <button onClick={() => setOpenPumpModal(p)}
@@ -896,7 +939,7 @@ export default function Balancing({ profile }) {
           canEditFinances={canEditFinances}
           canApproveExpenses={canApproveExpenses}
           canAddExpenses={canAddExpenses}
-          isAdmin={isAdmin} // <-- NEW: Passed to modal
+          isAdmin={isAdmin}
           locked={shiftLocked}
           onClose={() => setOpenPumpModal(null)}
           onSaved={() => loadShift(viewDate, viewShiftType, { silent: true })}
@@ -924,7 +967,10 @@ function SearchBar({ viewDate, setViewDate, viewShiftType, setViewShiftType, onS
         <select value={viewShiftType}
           onChange={e => setViewShiftType(e.target.value)}
           style={{ ...input(), width: 140, marginBottom: 0 }}>
+          <option value="">All shifts</option>
+          <option value="morning">Morning</option>
           <option value="day">Day</option>
+          <option value="evening">Evening</option>
           <option value="night">Night</option>
         </select>
       </div>
