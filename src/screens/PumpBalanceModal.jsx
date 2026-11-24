@@ -32,22 +32,19 @@ export default function PumpBalanceModal({
 }) {
   const user = profile.user
   const pumpNumber = Number(pump?.pump_number)
+  const isPmsOnly = [5, 6].includes(pumpNumber)
 
   const isActuallyLocked = locked && !isAdmin
-
   const editFinances = !isActuallyLocked && (canEditFinances ?? false)
   const approveExpenses = !isActuallyLocked && (canApproveExpenses ?? false)
   const addExpenses = !isActuallyLocked && (canAddExpenses ?? false)
-  const editOpenMeters = editFinances && isAdmin 
-
-  // FIX 4: Determine if pump is PMS only
-  const isPmsOnly = pump?.product?.toUpperCase() === 'PMS' || [5, 6].includes(pumpNumber)
+  const editOpenMeters = editFinances && isAdmin
 
   const [form, setForm] = useState({
     pms_open: '0', pms_close: '0', ago_open: '0', ago_close: '0',
     cash: '0', visa: '0', sales_difference: '0', drops: '0', momo: '0', app_users: '0',
   })
-  
+
   const [cashApproval, setCashApproval] = useState({
     approved_amount: '', status: 'pending'
   })
@@ -55,10 +52,14 @@ export default function PumpBalanceModal({
   const [expenses, setExpenses] = useState([])
   const [adjustments, setAdjustments] = useState([])
   const [newExpense, setNewExpense] = useState({ type: '', amount: '', note: '' })
-  
-  const [adjustModal, setAdjustModal] = useState(null) 
+
+  // Inline edit state for expenses (attendants editing own pending / managers editing any)
+  const [editingExpenseId, setEditingExpenseId] = useState(null)
+  const [editExpenseForm, setEditExpenseForm] = useState({ type: '', amount: '', note: '' })
+
+  const [adjustModal, setAdjustModal] = useState(null)
   const [adjustForm, setAdjustForm] = useState({ amount: '', reason: '' })
-  
+
   const [cashInput, setCashInput] = useState('')
   const [cashReason, setCashReason] = useState('')
 
@@ -98,7 +99,7 @@ export default function PumpBalanceModal({
     if (field === 'pms_open' || field === 'ago_open') {
       if (!editOpenMeters) return
     } else if (field === 'cash') {
-      if (isActuallyLocked) return
+      if (!editFinances) return
     } else {
       if (!editFinances) return
     }
@@ -106,16 +107,12 @@ export default function PumpBalanceModal({
   }
 
   const digitCount = v => String(v ?? '').replace(/[^0-9]/g, '').length
-  
-  // FIX 4: Only validate AGO if the pump is NOT PMS only
-  const closeMeterInvalid = editFinances && (
-    digitCount(form.pms_close) < 2 || 
-    (!isPmsOnly && digitCount(form.ago_close) < 2)
-  )
+  const closeMeterInvalid = editFinances && !isPmsOnly && (digitCount(form.pms_close) < 2 || digitCount(form.ago_close) < 2)
 
   const calc = useMemo(() => {
     const pmsL = Math.max(0, Number(form.pms_close || 0) - Number(form.pms_open || 0))
-    const agoL = Math.max(0, Number(form.ago_close || 0) - Number(form.ago_open || 0))
+    const agoL = isPmsOnly ? 0 : Math.max(0, Number(form.ago_close || 0) - Number(form.ago_open || 0))
+
     const pmsSales = pmsL * Number(globalPrices?.PMS || globalPrices?.pms || 0)
     const agoSales = agoL * Number(globalPrices?.AGO || globalPrices?.ago || 0)
     const totalSales = pmsSales + agoSales
@@ -123,11 +120,10 @@ export default function PumpBalanceModal({
     const totalApprovedExpenses = expenses.filter(e => e.status === 'approved').reduce((sum, e) => sum + Number(e.amount), 0)
     const adjTotal = adjustments.reduce((sum, a) => sum + Number(a.amount), 0)
 
-    // For managers, we use their typed direct cash. For attendants, we use approved.
-    const baseCash = editFinances ? Number(form.cash) : (cashApproval.status === 'approved' ? Number(cashApproval.approved_amount) : Number(form.cash))
-    
-    const deductions = totalApprovedExpenses + adjTotal + baseCash + 
-      Number(form.drops || 0) + Number(form.momo || 0) + Number(form.sales_difference || 0) + 
+    const baseCash = form.cash !== '0' && editFinances ? Number(form.cash) : (cashApproval.status === 'approved' ? Number(cashApproval.approved_amount) : Number(form.cash))
+
+    const deductions = totalApprovedExpenses + adjTotal + baseCash +
+      Number(form.drops || 0) + Number(form.momo || 0) + Number(form.sales_difference || 0) +
       Number(form.app_users || 0) + Number(form.visa || 0)
 
     const netBalance = totalSales - deductions
@@ -137,7 +133,7 @@ export default function PumpBalanceModal({
     else if (netBalance < -300) status = 'EXCESS'
 
     return { pmsL, agoL, pmsSales, agoSales, totalSales, deductions, netBalance, status, adjTotal }
-  }, [form, expenses, adjustments, globalPrices, cashApproval, editFinances])
+  }, [form, expenses, adjustments, globalPrices, cashApproval, editFinances, isPmsOnly])
 
   async function saveBalance() {
     if (!entry?.id || !editFinances) return
@@ -146,14 +142,11 @@ export default function PumpBalanceModal({
     try {
       const { error } = await supabase.from('balance_entries').update({
         pms_open: Number(form.pms_open || 0), pms_close: Number(form.pms_close || 0),
-        ago_open: isPmsOnly ? 0 : Number(form.ago_open || 0), 
-        ago_close: isPmsOnly ? 0 : Number(form.ago_close || 0),
-        cash: Number(form.cash || 0), 
-        cash_approved: Number(form.cash || 0),
-        cash_status: 'approved',
+        ago_open: isPmsOnly ? 0 : Number(form.ago_open || 0), ago_close: isPmsOnly ? 0 : Number(form.ago_close || 0),
         visa: Number(form.visa || 0),
         sales_difference: Number(form.sales_difference || 0),
         drops: Number(form.drops || 0), momo: Number(form.momo || 0), app_users: Number(form.app_users || 0),
+        cash: editFinances ? Number(form.cash || 0) : undefined
       }).eq('id', entry.id)
       if (error) throw error
       onSaved?.()
@@ -182,13 +175,18 @@ export default function PumpBalanceModal({
     setSaving(false)
   }
 
-  async function deleteAdjustment(id) {
-    if (!window.confirm('Delete this adjustment record?')) return
+  async function approveCash() {
+    if (!approveExpenses) return
     setSaving(true)
     try {
-      const { error } = await supabase.from('balance_adjustments').delete().eq('id', id)
+      const { error } = await supabase.from('balance_entries').update({
+        cash_approved: Number(cashApproval.approved_amount),
+        cash_status: 'approved',
+        cash_approved_by: user.id,
+        cash_approved_at: new Date().toISOString()
+      }).eq('id', entry.id)
       if (error) throw error
-      await loadData(entry.id)
+      setCashApproval(prev => ({ ...prev, status: 'approved' }))
       onSaved?.()
     } catch (err) { alert(err.message) }
     setSaving(false)
@@ -215,6 +213,18 @@ export default function PumpBalanceModal({
     setSaving(false)
   }
 
+  async function deleteAdjustment(id) {
+    if (!window.confirm('Delete this adjustment record?')) return
+    setSaving(true)
+    try {
+      const { error } = await supabase.from('balance_adjustments').delete().eq('id', id)
+      if (error) throw error
+      await loadData(entry.id)
+      onSaved?.()
+    } catch (err) { alert(err.message) }
+    setSaving(false)
+  }
+
   async function addExpense() {
     if (!entry?.id || !addExpenses) return
     if (!newExpense.amount) return alert('Enter amount')
@@ -233,6 +243,39 @@ export default function PumpBalanceModal({
       onSaved?.()
     } catch (err) { alert("Failed to add expense: " + err.message) }
     setSaving(false)
+  }
+
+  // ---- INLINE EDIT EXPENSE (attendants -> own pending; managers -> any) ----
+  function startEditExpense(ex) {
+    setEditingExpenseId(ex.id)
+    setEditExpenseForm({
+      type: ex.expense_type || '',
+      amount: String(ex.amount ?? ''),
+      note: ex.note || '',
+    })
+  }
+
+  function cancelEditExpense() {
+    setEditingExpenseId(null)
+    setEditExpenseForm({ type: '', amount: '', note: '' })
+  }
+
+  async function saveEditedExpense(id) {
+    if (!editExpenseForm.amount) return alert('Enter amount')
+    if (!editExpenseForm.type.trim()) return alert('Enter expense name/type')
+    setBusyExpenseId(id)
+    try {
+      const { error } = await supabase.from('balance_expenses').update({
+        expense_type: editExpenseForm.type.trim().toUpperCase(),
+        amount: Number(editExpenseForm.amount),
+        note: editExpenseForm.note,
+      }).eq('id', id)
+      if (error) throw error
+      cancelEditExpense()
+      await loadData(entry.id)
+      onSaved?.()
+    } catch (err) { alert(err.message) }
+    setBusyExpenseId(null)
   }
 
   async function setExpenseStatus(id, status) {
@@ -337,26 +380,29 @@ export default function PumpBalanceModal({
               <NumberInput label="App Users" value={form.app_users} onChange={val => handleChange('app_users', val)} disabled={financesLocked} isLive liveValue={liveData?.app} action={<AdjBtn item="app_users" />} />
               <NumberInput label="Sales Diff" value={form.sales_difference} onChange={val => handleChange('sales_difference', val)} disabled={financesLocked} action={<AdjBtn item="sales_difference" />} />
               <NumberInput label="Visa" value={form.visa} onChange={val => handleChange('visa', val)} disabled={financesLocked} action={<AdjBtn item="visa" />} />
-              
+
               {/* CASH FIELD */}
               <div style={{ position: 'relative' }}>
-                <label style={{ fontSize: 11, color: C.muted, marginBottom: 4, display: 'block' }}>Cash</label>
-                
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                  <label style={{ fontSize: 11, color: C.muted }}>Cash</label>
+                  <AdjBtn item="cash" />
+                </div>
+
                 {editFinances ? (
                   <input type="text" inputMode="numeric" value={form.cash} onChange={e => handleChange('cash', e.target.value)} style={{ width: '100%', padding: '8px 10px', borderRadius: 6, border: `1px solid ${C.border}`, background: C.card, color: C.text, fontSize: 13 }} />
                 ) : (
-                  <div style={{ padding: '8px 10px', background: C.soft, borderRadius: 6, fontSize: 13, fontWeight: 600, color: C.text, border: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span>{Number(totalCashSubmitted).toLocaleString()}</span>
-                  </div>
-                )}
-
-                {/* Attendant Input for Cash */}
-                {!locked && !editFinances && (
-                  <div style={{ marginTop: 8, padding: 8, background: '#f8fafc', borderRadius: 6, border: `1px dashed #cbd5e1` }}>
-                    <input type="text" inputMode="numeric" placeholder="Amount submitted" value={cashInput} onChange={e => setCashInput(e.target.value)} style={{ width: '100%', padding: 6, borderRadius: 4, border: '1px solid #cbd5e1', marginBottom: 4, fontSize: 12 }} />
-                    <input type="text" placeholder="Reason/Note" value={cashReason} onChange={e => setCashReason(e.target.value)} style={{ width: '100%', padding: 6, borderRadius: 4, border: '1px solid #cbd5e1', marginBottom: 6, fontSize: 12 }} />
-                    <button onClick={submitCashAdjustment} style={{ width: '100%', padding: 6, background: C.accent, color: 'white', border: 'none', borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>Submit Cash</button>
-                  </div>
+                  <>
+                    <div style={{ padding: '8px 10px', background: C.soft, borderRadius: 6, fontSize: 13, fontWeight: 600, color: C.text, border: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span>{Number(totalCashSubmitted).toLocaleString()}</span>
+                    </div>
+                    {!locked && (
+                      <div style={{ marginTop: 8, padding: 8, background: '#f8fafc', borderRadius: 6, border: `1px dashed #cbd5e1` }}>
+                        <input type="text" inputMode="numeric" placeholder="Amount submitted" value={cashInput} onChange={e => setCashInput(e.target.value)} style={{ width: '100%', padding: 6, borderRadius: 4, border: '1px solid #cbd5e1', marginBottom: 4, fontSize: 12 }} />
+                        <input type="text" placeholder="Reason/Note" value={cashReason} onChange={e => setCashReason(e.target.value)} style={{ width: '100%', padding: 6, borderRadius: 4, border: '1px solid #cbd5e1', marginBottom: 6, fontSize: 12 }} />
+                        <button onClick={submitCashAdjustment} style={{ width: '100%', padding: 6, background: C.accent, color: 'white', border: 'none', borderRadius: 4, fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>Submit Cash</button>
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             </div>
@@ -367,6 +413,7 @@ export default function PumpBalanceModal({
               </button>
             )}
 
+            {/* ADJUSTMENTS LIST */}
             {adjustments.length > 0 && (
               <div style={{ marginBottom: 16 }}>
                 {cashAdjustments.length > 0 && (
@@ -423,8 +470,35 @@ export default function PumpBalanceModal({
                 const isPending = ex.status === 'pending'
                 const busy = busyExpenseId === ex.id
                 const canDelete = !locked && (editFinances || (isPending && ex.created_by === user.id))
+                // Attendant can edit their own pending expense inline; managers can edit any
+                const canInlineEdit = !locked && !editFinances && isPending && ex.created_by === user.id
                 const badgeBg = ex.status === 'approved' ? C.successBg : ex.status === 'rejected' ? C.dangerBg : C.warnBg
                 const badgeColor = ex.status === 'approved' ? '#166534' : ex.status === 'rejected' ? '#991b1b' : C.warn
+
+                if (editingExpenseId === ex.id) {
+                  return (
+                    <div key={ex.id} style={{ padding: '8px 0', borderBottom: `1px solid ${C.border}` }}>
+                      <div style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
+                        <input list="expense-types" value={editExpenseForm.type}
+                          onChange={e => setEditExpenseForm({ ...editExpenseForm, type: e.target.value })}
+                          style={{ flex: 1, padding: '6px 8px', borderRadius: 6, border: `1px solid ${C.border}`, background: C.card, color: C.text, fontSize: 12 }} />
+                        <input type="text" inputMode="numeric" value={editExpenseForm.amount}
+                          onChange={e => setEditExpenseForm({ ...editExpenseForm, amount: e.target.value })}
+                          style={{ width: 100, padding: '6px 8px', borderRadius: 6, border: `1px solid ${C.border}`, background: C.card, color: C.text, fontSize: 12 }} />
+                      </div>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <input placeholder="Note (optional)" value={editExpenseForm.note}
+                          onChange={e => setEditExpenseForm({ ...editExpenseForm, note: e.target.value })}
+                          style={{ flex: 1, padding: '6px 8px', borderRadius: 6, border: `1px solid ${C.border}`, background: C.card, color: C.text, fontSize: 12 }} />
+                        <button disabled={busy} onClick={() => saveEditedExpense(ex.id)}
+                          style={{ padding: '4px 12px', background: C.success, color: '#fff', border: 'none', borderRadius: 4, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Save</button>
+                        <button disabled={busy} onClick={cancelEditExpense}
+                          style={{ padding: '4px 12px', background: C.soft, color: C.muted, border: 'none', borderRadius: 4, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Cancel</button>
+                      </div>
+                    </div>
+                  )
+                }
+
                 return (
                   <div key={ex.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: `1px solid ${C.border}` }}>
                     <div>
@@ -433,6 +507,10 @@ export default function PumpBalanceModal({
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                       <span style={{ fontSize: 10, padding: '2px 8px', borderRadius: 4, background: badgeBg, color: badgeColor, fontWeight: 700 }}>{ex.status.toUpperCase()}</span>
+                      {canInlineEdit && (
+                        <button disabled={busy} onClick={() => startEditExpense(ex)}
+                          style={{ padding: '3px 8px', background: C.accentSoft, color: C.accent, border: 'none', borderRadius: 4, fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>Edit</button>
+                      )}
                       {isPending && approveExpenses && !locked && (
                         <>
                           <button disabled={busy} onClick={() => setExpenseStatus(ex.id, 'approved')} style={{ padding: '3px 8px', background: C.success, color: '#fff', border: 'none', borderRadius: 4, fontSize: 12, cursor: 'pointer' }}>✓</button>
@@ -474,14 +552,6 @@ export default function PumpBalanceModal({
                 <span style={{ fontSize: 20, fontWeight: 900, color: calc.status === 'SHORTAGE' ? C.danger : calc.status === 'EXCESS' ? C.success : C.text }}>{calc.netBalance.toLocaleString()}</span>
               </div>
               <div style={{ textAlign: 'right', fontSize: 12, fontWeight: 700, color: calc.status === 'SHORTAGE' ? C.danger : calc.status === 'EXCESS' ? C.success : C.text }}>{calc.status}</div>
-            </div>
-
-            {/* FIX 6: Small comments explaining the status */}
-            <div style={{ marginTop: 16, paddingTop: 12, borderTop: `1px dashed ${C.border}`, fontSize: 11, color: C.muted, lineHeight: 1.5 }}>
-              <div style={{ fontWeight: 700, marginBottom: 4 }}>Understanding Your Status:</div>
-              {calc.status === 'BALANCED' && <div>🟢 <b>BALANCED:</b> The cash and payments match the sales perfectly (within UGX 300).</div>}
-              {calc.status === 'SHORTAGE' && <div>🔴 <b>SHORTAGE:</b> The deductions are higher than the sales. The attendant needs to explain the missing funds.</div>}
-              {calc.status === 'EXCESS' && <div>🟢 <b>EXCESS:</b> The sales are higher than deductions. This usually means extra money was collected or expenses were forgotten.</div>}
             </div>
           </>
         )}
