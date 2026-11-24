@@ -42,7 +42,8 @@ export default function Balancing({ profile }) {
   const canEditAll = isAdminManagerSup || powers.edit_balancing
   const canEditFinances = isAdminManagerSup
   const canApproveExpenses = isAdminManagerSup
-  const canAddExpenses = isAttendant || isAdminManagerSup
+  // FIX 3: Attendants cannot add expenses anymore (only managers/supervisors)
+  const canAddExpenses = isAdminManagerSup 
 
   const today = new Date().toISOString().slice(0, 10)
   const [viewDate, setViewDate] = useState(today)
@@ -56,6 +57,7 @@ export default function Balancing({ profile }) {
   const [entries, setEntries] = useState({})
   const [staff, setStaff] = useState([])
   const [expenses, setExpenses] = useState({})
+  const [adjustments, setAdjustments] = useState({})
   const [loading, setLoading] = useState(true)
 
   const [prices, setPrices] = useState({ PMS: 6789, AGO: 7039 })
@@ -85,7 +87,6 @@ export default function Balancing({ profile }) {
     return m
   }, [entries])
 
-  // Get unique list of ALL approved expense names for the dynamic rows
   const allExpenseTypes = useMemo(() => {
     const types = new Set()
     Object.values(expenses).flat().forEach(ex => {
@@ -137,7 +138,7 @@ export default function Balancing({ profile }) {
       setStaff(us || [])
 
       if (!cur) {
-        setEntries({}); setLiveData({}); setExpenses({})
+        setEntries({}); setLiveData({}); setExpenses({}); setAdjustments({})
         if (!silent) setLoading(false)
         return
       }
@@ -196,6 +197,8 @@ export default function Balancing({ profile }) {
 
       const ids = visibleEntries.map(e => e.id)
       const expMap = {}
+      const adjMap = {}
+      
       if (ids.length > 0) {
         const { data: exp } = await supabase.from('balance_expenses').select('*').in('entry_id', ids)
         ;(exp || []).forEach(x => {
@@ -206,34 +209,36 @@ export default function Balancing({ profile }) {
             expMap[p].push(x)
           }
         })
+
+        const { data: adj } = await supabase.from('balance_adjustments').select('*').in('entry_id', ids)
+        ;(adj || []).forEach(x => {
+          const entry = visibleEntries.find(e => e.id === x.entry_id)
+          if (entry) {
+            const p = Number(entry.pump_number)
+            if (!adjMap[p]) adjMap[p] = []
+            adjMap[p].push(x)
+          }
+        })
       }
       setExpenses(expMap)
+      setAdjustments(adjMap)
     } catch (e) {
       console.error('Load error:', e)
     }
     if (!silent) setLoading(false)
   }, [user.station_id, canEditAll, user.id]) 
 
-  // --- REALTIME SUBSCRIPTION FOR LIVE TRANSACTIONS ---
   useEffect(() => {
     if (!shift?.id) return
 
     const channel = supabase.channel('realtime-balancing')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'transactions', filter: `station_id=eq.${user.station_id}` }, () => {
-        // Silently reload when a transaction is claimed elsewhere
-        loadShift(viewDate, viewShiftType, { silent: true })
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_users', filter: `station_id=eq.${user.station_id}` }, () => {
-        loadShift(viewDate, viewShiftType, { silent: true })
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'balance_expenses' }, () => {
-        loadShift(viewDate, viewShiftType, { silent: true })
-      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'transactions', filter: `station_id=eq.${user.station_id}` }, () => loadShift(viewDate, viewShiftType, { silent: true }))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_users', filter: `station_id=eq.${user.station_id}` }, () => loadShift(viewDate, viewShiftType, { silent: true }))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'balance_expenses' }, () => loadShift(viewDate, viewShiftType, { silent: true }))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'balance_adjustments' }, () => loadShift(viewDate, viewShiftType, { silent: true }))
       .subscribe()
 
-    return () => {
-      supabase.removeChannel(channel)
-    }
+    return () => { supabase.removeChannel(channel) }
   }, [shift?.id, user.station_id, viewDate, viewShiftType, loadShift])
 
   useEffect(() => {
@@ -270,7 +275,7 @@ export default function Balancing({ profile }) {
   }
 
   async function assignPump(pumpNumber, userId) {
-    if (!shift || shiftLocked) return
+    if (!shift || (shiftLocked && !isAdmin)) return
     try {
       const pumpNum = Number(pumpNumber)
       const userIdToSave = userId === '' || userId === undefined ? null : userId
@@ -334,7 +339,6 @@ export default function Balancing({ profile }) {
 
   function handleExpensesChanged(pumpNum, list) {
     setExpenses(prev => ({ ...prev, [Number(pumpNum)]: list }))
-    // Also silently refresh the shift data so totals update instantly
     loadShift(viewDate, viewShiftType, { silent: true })
   }
 
@@ -345,6 +349,7 @@ export default function Balancing({ profile }) {
       pmsLiters: 0, agoLiters: 0, totalSales: 0, netBalance: 0,
       momo: 0, drops: 0, app: 0, cash: 0, visa: 0, salesDiff: 0,
       pms_open: 0, pms_close: 0, ago_open: 0, ago_close: 0, pmsSales: 0, agoSales: 0,
+      totalExp: 0, expMap: {}
     }
 
     const pmsL = Math.max(0, Number(e.pms_close || 0) - Number(e.pms_open || 0))
@@ -357,14 +362,24 @@ export default function Balancing({ profile }) {
     const pair = pairOf(n)
     const isPrimary = !pair || n === pair[0]
     
-    const momo = Number(e.momo) || (isPrimary ? live.momo : 0)
-    const drops = Number(e.drops) || (isPrimary ? live.drops : 0)
-    const app = Number(e.app_users) || (isPrimary ? live.app : 0)
-    const salesDiff = Number(e.sales_difference) || (isPrimary ? live.diff : 0)
-    const cash = Number(e.cash || 0)
-    const visa = Number(e.visa || 0)
+    let momo = Number(e.momo) || (isPrimary ? live.momo : 0)
+    let drops = Number(e.drops) || (isPrimary ? live.drops : 0)
+    let app = Number(e.app_users) || (isPrimary ? live.app : 0)
+    let salesDiff = Number(e.sales_difference) || (isPrimary ? live.diff : 0)
+    let baseCash = e.cash_status === 'approved' ? Number(e.cash_approved) : Number(e.cash || 0)
+    let visa = Number(e.visa || 0)
 
-    // Create a map of expense totals for this pump
+    const adjList = adjustments[n] || []
+    adjList.forEach(adj => {
+      const amt = Number(adj.amount)
+      if (adj.item === 'cash') baseCash += amt
+      else if (adj.item === 'drops') drops += amt
+      else if (adj.item === 'momo') momo += amt
+      else if (adj.item === 'app_users') app += amt
+      else if (adj.item === 'sales_difference') salesDiff += amt
+      else if (adj.item === 'visa') visa += amt
+    })
+
     const expMap = {}
     let totalExp = 0
     ;(expenses[n] || []).forEach(x => {
@@ -375,14 +390,14 @@ export default function Balancing({ profile }) {
       }
     })
 
-    const deductions = totalExp + drops + momo + salesDiff + app + cash + visa
+    const deductions = totalExp + baseCash + drops + momo + salesDiff + app + visa
     const netBalance = totalSales - deductions
 
     return {
       pms_open: Number(e.pms_open || 0), pms_close: Number(e.pms_close || 0),
       ago_open: Number(e.ago_open || 0), ago_close: Number(e.ago_close || 0),
       pmsLiters: pmsL, agoLiters: agoL, pmsSales: pmsS, agoSales: agoS,
-      totalSales, momo, drops, app, salesDiff, totalExp, expMap, cash, visa, netBalance,
+      totalSales, momo, drops, app, salesDiff, totalExp, expMap, cash: baseCash, visa, netBalance,
     }
   }
 
@@ -403,7 +418,6 @@ export default function Balancing({ profile }) {
 
     const other = calcPump(partner)
     
-    // Combine expense maps
     const combinedExpMap = { ...own.expMap }
     Object.keys(other.expMap).forEach(k => {
       combinedExpMap[k] = (combinedExpMap[k] || 0) + other.expMap[k]
@@ -501,7 +515,6 @@ export default function Balancing({ profile }) {
     pushRow('VISA', p => pumpDisplay(p.pump_number, 'visa'))
     pushRow('CASH', p => pumpDisplay(p.pump_number, 'cash'))
     
-    // DYNAMIC EXPENSES
     allExpenseTypes.forEach(type => {
       pushRow(type, p => {
         const expMap = pumpDisplay(p.pump_number, 'expMap') || {}
@@ -566,7 +579,7 @@ export default function Balancing({ profile }) {
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <button onClick={exportMeters} style={btn('#0ea5e9')}><i className="fas fa-file-export" style={{ marginRight: 6 }} /> Export Meters</button>
           <button onClick={exportFullSheet} style={btn(C.accent)}><i className="fas fa-file-csv" style={{ marginRight: 6 }} /> Export Full Sheet</button>
-          {canEditAll && !shiftLocked && (
+          {canEditAll && (
             <button onClick={() => setShowPriceSettings(true)} style={btn(C.muted)}><i className="fas fa-cog" style={{ marginRight: 6 }} /> Price Settings</button>
           )}
         </div>
@@ -602,10 +615,10 @@ export default function Balancing({ profile }) {
                     </div>
                     <div style={{ fontSize: 10, color: C.muted, marginBottom: 8 }}>{p.product}</div>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                      {entry && !shiftLocked && (canEditAll || entry.user_id === user.id) && (
+                      {entry && (!shiftLocked || isAdmin) && (canEditAll || entry.user_id === user.id) && (
                         <button onClick={() => setOpenPumpModal(p)} style={{ ...btn(C.accent), width: '100%', padding: '4px 10px', fontSize: 11 }}><i className="fas fa-edit" style={{ marginRight: 4 }} /> Edit Data</button>
                       )}
-                      {canEditAll && !shiftLocked && (
+                      {canEditAll && (!shiftLocked || isAdmin) && (
                         <button onClick={() => setOpenAssign(pn)} style={{ ...btn(null, true), width: '100%', padding: '4px 10px', fontSize: 11, background: '#fff', borderColor: C.accent, color: C.accent }}>
                           {entry ? '↻ Reassign' : '+ Assign'}
                         </button>
@@ -686,7 +699,6 @@ export default function Balancing({ profile }) {
             <ReadonlyRow label="VISA" pumps={visiblePumps} getValue={p => pumpDisplay(p.pump_number, 'visa')} render={renderAggregatedCell} />
             <ReadonlyRow label="CASH" pumps={visiblePumps} getValue={p => pumpDisplay(p.pump_number, 'cash')} render={renderAggregatedCell} />
 
-            {/* DYNAMIC EXPENSE ROWS */}
             {allExpenseTypes.length > 0 && (
               <>
                 <tr>
