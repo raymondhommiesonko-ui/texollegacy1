@@ -25,6 +25,12 @@ export default function Transactions({ profile }) {
   const [firstLoad, setFirstLoad] = useState(true)
   const [onShift, setOnShift] = useState(true)
   const [errorMsg, setErrorMsg] = useState('')
+  
+  // Attendance State
+  const [attendanceId, setAttendanceId] = useState(null)
+  const [isClockedIn, setIsClockedIn] = useState(false)
+  const [checkingAttendance, setCheckingAttendance] = useState(true)
+
   const [openReassign, setOpenReassign] = useState(null)
   const [openClaim, setOpenClaim] = useState(null)
   const [openReconcile, setOpenReconcile] = useState(false)
@@ -46,6 +52,33 @@ export default function Transactions({ profile }) {
     const t = setTimeout(() => setDebouncedFilter(filter), 400)
     return () => clearTimeout(t)
   }, [filter])
+
+  // Check Attendance Status
+  useEffect(() => {
+    async function checkAttendance() {
+      setCheckingAttendance(true)
+      const today = new Date().toISOString().slice(0, 10)
+      
+      const { data } = await supabase
+        .from('attendance')
+        .select('id, clock_in_at')
+        .eq('user_id', user.id)
+        .is('clock_out_at', null)
+        .gte('clock_in_at', today + 'T00:00:00')
+        .order('clock_in_at', { ascending: false })
+        .limit(1)
+      
+      if (data && data.length > 0) {
+        setAttendanceId(data[0].id)
+        setIsClockedIn(true)
+      } else {
+        setAttendanceId(null)
+        setIsClockedIn(false)
+      }
+      setCheckingAttendance(false)
+    }
+    checkAttendance()
+  }, [user.id])
 
   async function loadStaffCodes() {
     try {
@@ -110,11 +143,9 @@ export default function Transactions({ profile }) {
         const toMin = th * 60 + tm
 
         if (fromMin <= toMin) {
-          // Normal window (same day or multi-day daytime)
           windowStartISO = eatToISO(fromDate, tf)
           windowEndISO = eatToISO(toDate, tt)
         } else {
-          // Cross-midnight window (e.g. 17:00 → 02:06)
           if (fromDate === toDate) {
             windowStartISO = eatToISO(fromDate, tf)
             windowEndISO = eatToISO(addDaysEAT(toDate, 1), tt)
@@ -360,6 +391,17 @@ export default function Transactions({ profile }) {
         </div>
       </div>
 
+      {/* NOT CLOCKED IN WARNING BANNER */}
+      {!checkingAttendance && !isClockedIn && isStaff && (
+        <div style={{ margin: '0 32px 16px', padding: '12px 16px', background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 8, color: '#991b1b', display: 'flex', alignItems: 'center', gap: 12 }}>
+          <i className="fas fa-exclamation-triangle" style={{ fontSize: 20 }} />
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 14 }}>You are not clocked in</div>
+            <div style={{ fontSize: 13 }}>You must clock in on the Attendance page before you can claim any transactions.</div>
+          </div>
+        </div>
+      )}
+
       <div className="staff-filters">
         <label style={{ alignSelf: 'center', fontSize: 13, color: '#6b85a0', fontWeight: 600 }}>From</label>
         <input type="date" value={filter.from} onChange={e => setFilter(f => ({ ...f, from: e.target.value }))} />
@@ -485,7 +527,17 @@ export default function Transactions({ profile }) {
                     </td>
                     <td>
                       {canClaim && isUnclaimed && !isClaimedByMe && (
-                        <button className="btn-tiny success" onClick={() => setOpenClaim(r)}>
+                        <button 
+                          className="btn-tiny success" 
+                          onClick={() => {
+                            if (!isClockedIn) {
+                              alert("You must CLOCK IN before you can claim transactions. Please go to the Attendance page.")
+                              return
+                            }
+                            setOpenClaim(r)
+                          }}
+                          style={!isClockedIn ? { opacity: 0.5, cursor: 'not-allowed' } : {}}
+                        >
                           <i className="fas fa-hand-paper" /> Claim
                         </button>
                       )}
@@ -521,6 +573,7 @@ export default function Transactions({ profile }) {
         <ClaimModal
           transaction={openClaim}
           myCode={myCode}
+          attendanceId={attendanceId}
           onClose={() => setOpenClaim(null)}
           onSaved={async () => { setOpenClaim(null); await loadTransactions() }}
         />
@@ -551,6 +604,7 @@ function ReassignModal({ transaction, staffCodes, onClose, onSaved }) {
     const { data, error } = await supabase.rpc('claim_transaction', {
       p_txn_id: transaction.txn_id,
       p_code: code.trim(),
+      // Reassignment doesn't pass attendanceId (handled by DB logic)
     })
     setBusy(false)
     if (error) { setErr(error.message); return }
@@ -591,7 +645,7 @@ function ReassignModal({ transaction, staffCodes, onClose, onSaved }) {
 /* ============================================================
    CLAIM MODAL
    ============================================================ */
-function ClaimModal({ transaction, myCode, onClose, onSaved }) {
+function ClaimModal({ transaction, myCode, attendanceId, onClose, onSaved }) {
   const [code, setCode] = useState(myCode || '')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
@@ -599,10 +653,13 @@ function ClaimModal({ transaction, myCode, onClose, onSaved }) {
   async function save() {
     if (!code.trim()) { setErr('Enter your 2-digit code'); return }
     setBusy(true); setErr('')
+    
     const { data, error } = await supabase.rpc('claim_transaction', {
       p_txn_id: transaction.txn_id,
       p_code: code.trim(),
+      p_attendance_id: attendanceId 
     })
+    
     setBusy(false)
     if (error) { setErr(error.message); return }
     if (!data?.ok) { setErr(data?.error || 'Could not claim'); return }
