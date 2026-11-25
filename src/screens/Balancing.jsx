@@ -365,13 +365,18 @@ export default function Balancing({ profile }) {
     let drops = Number(e.drops) || (isPrimary ? live.drops : 0)
     let app = Number(e.app_users) || (isPrimary ? live.app : 0)
     let salesDiff = Number(e.sales_difference) || (isPrimary ? live.diff : 0)
+    
     let baseCash = e.cash_status === 'approved' ? Number(e.cash_approved) : Number(e.cash || 0)
     let visa = Number(e.visa || 0)
 
     const adjList = adjustments[n] || []
     adjList.forEach(adj => {
       const amt = Number(adj.amount)
-      if (adj.item === 'cash') baseCash += amt
+      if (adj.item === 'cash') {
+        if (adj.status === 'approved') {
+          baseCash += amt
+        }
+      }
       else if (adj.item === 'drops') drops += amt
       else if (adj.item === 'momo') momo += amt
       else if (adj.item === 'app_users') app += amt
@@ -437,7 +442,7 @@ export default function Balancing({ profile }) {
       cash: own.cash + other.cash, visa: own.visa + other.visa,
       netBalance: own.netBalance + other.netBalance,
       aggregated: true,
-      cashStatus: 'mixed' // Fallback for aggregated display
+      cashStatus: 'mixed'
     }
   }
 
@@ -552,11 +557,13 @@ export default function Balancing({ profile }) {
     return Number(value || 0).toLocaleString()
   }
 
-  // Calculate overall net balance for the status comment
   const overallNetBalance = visiblePumps.reduce((sum, p) => {
     const val = pumpDisplay(p.pump_number, 'netBalance')
     return sum + (val === null ? 0 : Number(val) || 0)
   }, 0)
+
+  // Lock logic: You can add your custom rule here (e.g., user.role === 'attendant' && someCondition)
+  const isAttendantLocked = shiftLocked && user.role !== 'admin' && user.role !== 'manager' && user.role !== 'supervisor'
 
   if (!shift) {
     return (
@@ -706,7 +713,7 @@ export default function Balancing({ profile }) {
             <ReadonlyRow label="SALES DIFF" pumps={visiblePumps} getValue={p => pumpDisplay(p.pump_number, 'salesDiff')} render={renderAggregatedCell} />
             <ReadonlyRow label="VISA" pumps={visiblePumps} getValue={p => pumpDisplay(p.pump_number, 'visa')} render={renderAggregatedCell} />
             
-            {/* CASH DROPDOWN ROW */}
+            {/* CASH ROW */}
             <tr>
               <td style={{ ...td(), fontSize: 12, color: C.text }}>CASH</td>
               {visiblePumps.map(p => {
@@ -718,29 +725,14 @@ export default function Balancing({ profile }) {
                 
                 const displayCash = pumpDisplay(pn, 'cash') || 0
                 const status = e.cash_status || 'pending'
-                const submitted = Number(e.cash || 0)
-                const approved = Number(e.cash_approved || 0)
-
+                
                 return (
                   <td key={p.id} style={{ ...td(), textAlign: 'right', padding: '4px 8px' }}>
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
                       <span style={{ fontWeight: 600 }}>{Number(displayCash).toLocaleString()}</span>
-                      {isAdminManagerSup ? (
-                         <select 
-                           style={{ fontSize: 10, padding: 2, marginTop: 4, borderRadius: 4, border: `1px solid ${C.border}`, background: C.soft }}
-                           onChange={(ev) => {
-                             // Placeholder for direct status change from sheet if needed
-                           }}
-                           value={status}
-                         >
-                           <option value="pending">Pending ({submitted.toLocaleString()})</option>
-                           <option value="approved">Approved ({approved.toLocaleString()})</option>
-                         </select>
-                      ) : (
-                        <span style={{ fontSize: 10, color: status === 'approved' ? C.success : C.warn, marginTop: 2 }}>
-                          {status.toUpperCase()}
-                        </span>
-                      )}
+                      <span style={{ fontSize: 10, color: status === 'approved' ? C.success : C.warn, marginTop: 2 }}>
+                        {status.toUpperCase()}
+                      </span>
                     </div>
                   </td>
                 )
@@ -790,34 +782,33 @@ export default function Balancing({ profile }) {
               )}
             </tr>
             
-            {/* STATUS COMMENT */}
             {/* PER-PUMP STATUS COMMENT */}
-<tr>
-  <td style={{ ...td(), fontSize: 11, color: C.muted, fontStyle: 'italic' }}>STATUS</td>
-  {visiblePumps.map(p => {
-    const v = pumpDisplay(p.pump_number, 'netBalance')
-    if (v === null) {
-      return <td key={p.id} style={{ ...td(), textAlign: 'center', fontSize: 10, color: C.muted }}>—</td>
-    }
-    const n = Number(v) || 0
-    let label = 'BALANCED'
-    let color = C.text
-    let bg = C.soft
-    if (n > 300) { label = 'SHORTAGE'; color = C.danger; bg = C.dangerBg }
-    else if (n < -300) { label = 'EXCESS'; color = C.success; bg = C.successBg }
-    return (
-      <td key={p.id} style={{ ...td(), textAlign: 'center', fontSize: 10, fontWeight: 800, color, background: bg, letterSpacing: 0.3 }}>
-        {label}
-      </td>
-    )
-  })}
-  {canEditAll && (
-    <td style={{ ...td(), background: C.band, textAlign: 'center', fontSize: 10, fontWeight: 800,
-      color: overallNetBalance > 300 ? C.danger : overallNetBalance < -300 ? C.success : C.text }}>
-      {overallNetBalance > 300 ? 'SHORTAGE' : overallNetBalance < -300 ? 'EXCESS' : 'BALANCED'}
-    </td>
-  )}
-</tr>
+            <tr>
+              <td style={{ ...td(), fontSize: 11, color: C.muted, fontStyle: 'italic' }}>STATUS</td>
+              {visiblePumps.map(p => {
+                const v = pumpDisplay(p.pump_number, 'netBalance')
+                if (v === null) {
+                  return <td key={p.id} style={{ ...td(), textAlign: 'center', fontSize: 10, color: C.muted }}>—</td>
+                }
+                const n = Number(v) || 0
+                let label = 'BALANCED'
+                let color = C.text
+                let bg = C.soft
+                if (n > 300) { label = 'SHORTAGE'; color = C.danger; bg = C.dangerBg }
+                else if (n < -300) { label = 'EXCESS'; color = C.success; bg = C.successBg }
+                return (
+                  <td key={p.id} style={{ ...td(), textAlign: 'center', fontSize: 10, fontWeight: 800, color, background: bg, letterSpacing: 0.3 }}>
+                    {label}
+                  </td>
+                )
+              })}
+              {canEditAll && (
+                <td style={{ ...td(), background: C.band, textAlign: 'center', fontSize: 10, fontWeight: 800,
+                  color: overallNetBalance > 300 ? C.danger : overallNetBalance < -300 ? C.success : C.text }}>
+                  {overallNetBalance > 300 ? 'SHORTAGE' : overallNetBalance < -300 ? 'EXCESS' : 'BALANCED'}
+                </td>
+              )}
+            </tr>
 
           </tbody>
         </table>
@@ -848,7 +839,7 @@ export default function Balancing({ profile }) {
           profile={profile} pump={openPumpModal} entry={entries[Number(openPumpModal.pump_number)]}
           liveData={liveData[entries[Number(openPumpModal.pump_number)]?.user_id]} globalPrices={prices}
           canEditFinances={canEditFinances} canApproveExpenses={canApproveExpenses} canAddExpenses={canAddExpenses}
-          isAdmin={isAdmin} locked={shiftLocked}
+          isAdmin={isAdmin} locked={isAttendantLocked}
           onClose={() => setOpenPumpModal(null)} onSaved={() => loadShift(viewDate, viewShiftType, { silent: true })}
           onExpensesChanged={handleExpensesChanged}
         />
