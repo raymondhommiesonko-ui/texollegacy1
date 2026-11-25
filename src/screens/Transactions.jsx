@@ -2,7 +2,13 @@ import { useEffect, useMemo, useState } from 'react'
 import ExcelJS from 'exceljs'
 import { supabase } from '../supabase'
 import { todayEAT, timeEAT, eatToISO, addDaysEAT } from '../lib/time'
-import { parseStatementCsv, reconcileStatement } from '../lib/reconcile'
+import { 
+  parseStatementCsv, 
+  reconcileStatement, 
+  deleteReconciledBatch,
+  getRecentReconciliations,
+  deleteReconciliationRun
+} from '../lib/reconcile'
 
 export default function Transactions({ profile }) {
   const user = profile.user
@@ -34,6 +40,7 @@ export default function Transactions({ profile }) {
   const [openReassign, setOpenReassign] = useState(null)
   const [openClaim, setOpenClaim] = useState(null)
   const [openReconcile, setOpenReconcile] = useState(false)
+  const [openManageImports, setOpenManageImports] = useState(false)
 
   const [filter, setFilter] = useState({
     from: todayEAT(),
@@ -126,9 +133,7 @@ export default function Transactions({ profile }) {
       }
       setOnShift(true)
 
-      // ============================================================
-      // Build ONE combined date+time window
-      // ============================================================
+      // Build date+time window
       const tf = debouncedFilter.timeFrom
       const tt = debouncedFilter.timeTo
       const fromDate = debouncedFilter.from
@@ -370,9 +375,14 @@ export default function Transactions({ profile }) {
         </div>
         <div className="txns-actions">
           {canReconcile && (
-            <button className="btn-ghost" onClick={() => setOpenReconcile(true)}>
-              <i className="fas fa-balance-scale" /> Reconcile
-            </button>
+            <>
+              <button className="btn-ghost" onClick={() => setOpenManageImports(true)}>
+                <i className="fas fa-history" /> Recent Imports
+              </button>
+              <button className="btn-ghost" onClick={() => setOpenReconcile(true)}>
+                <i className="fas fa-balance-scale" /> Reconcile
+              </button>
+            </>
           )}
           {canExport ? (
             <>
@@ -586,6 +596,16 @@ export default function Transactions({ profile }) {
           onDone={async () => { setOpenReconcile(false); await loadTransactions() }}
         />
       )}
+
+      {openManageImports && (
+        <ManageImportsModal
+          stationId={user.station_id}
+          onClose={() => setOpenManageImports(false)}
+          onDeleted={async () => { 
+            await loadTransactions() 
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -704,8 +724,11 @@ function ReconcileModal({ profile, onClose, onDone }) {
   const [file, setFile] = useState(null)
   const [preview, setPreview] = useState([])
   const [busy, setBusy] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [err, setErr] = useState('')
   const [result, setResult] = useState(null)
+  
+  const [timeWindow, setTimeWindow] = useState({ min: null, max: null })
 
   async function handleFile(f) {
     if (!f) return
@@ -714,7 +737,13 @@ function ReconcileModal({ profile, onClose, onDone }) {
       const text = await f.text()
       const rows = parseStatementCsv(text)
       setPreview(rows)
-      if (rows.length === 0) setErr('No valid rows found in file')
+      
+      if (rows.length === 0) {
+        setErr('No valid rows found in file')
+      } else {
+        const times = rows.map(r => r.received_at).sort()
+        setTimeWindow({ min: times[0], max: times[times.length - 1] })
+      }
     } catch (e) {
       setErr(e.message || 'Could not read file')
     }
@@ -738,6 +767,29 @@ function ReconcileModal({ profile, onClose, onDone }) {
     setBusy(false)
   }
 
+  async function undoUpload() {
+    if (!window.confirm(`Are you sure you want to delete this upload? This will remove the ${provider.toUpperCase()} pending transactions inserted from this file.`)) {
+      return
+    }
+
+    setDeleting(true); setErr('')
+    try {
+      await deleteReconciledBatch({
+        stationId: user.station_id,
+        provider: provider,
+        userId: user.id,
+        minTime: timeWindow.min,
+        maxTime: timeWindow.max,
+      })
+      
+      alert("Upload successfully deleted.")
+      onDone()
+    } catch (e) {
+      setErr(e.message || 'Failed to delete batch')
+      setDeleting(false)
+    }
+  }
+
   return (
     <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
       <div className="modal modal-wide">
@@ -748,7 +800,7 @@ function ReconcileModal({ profile, onClose, onDone }) {
         </div>
 
         <label>Provider</label>
-        <select value={provider} onChange={e => setProvider(e.target.value)} disabled={!!result}>
+        <select value={provider} onChange={e => setProvider(e.target.value)} disabled={!!result || deleting}>
           <option value="mtn">MTN MoMo</option>
           <option value="airtel">Airtel Money</option>
         </select>
@@ -758,7 +810,7 @@ function ReconcileModal({ profile, onClose, onDone }) {
           type="file"
           accept=".csv,.txt"
           onChange={e => handleFile(e.target.files?.[0])}
-          disabled={!!result}
+          disabled={!!result || deleting}
         />
 
         {preview.length > 0 && !result && (
@@ -818,13 +870,29 @@ function ReconcileModal({ profile, onClose, onDone }) {
                 Insert error: {result.insertError}
               </div>
             )}
+            
+            {result.inserted_count > 0 && (
+              <div style={{ marginTop: 16, padding: 12, background: '#fef2f2', borderRadius: 8, border: '1px solid #fecaca' }}>
+                <div style={{ fontSize: 13, color: '#991b1b', marginBottom: 10 }}>
+                  <i className="fas fa-exclamation-triangle" /> Uploaded the wrong file or provider?
+                </div>
+                <button 
+                  className="btn-ghost-full" 
+                  onClick={undoUpload} 
+                  disabled={deleting}
+                  style={{ background: '#fff', color: '#dc2626', borderColor: '#fca5a5', width: '100%' }}
+                >
+                  {deleting ? <i className="fas fa-spinner fa-spin" /> : <><i className="fas fa-trash" /> Delete Recent Upload ({result.inserted_count} txns)</>}
+                </button>
+              </div>
+            )}
           </div>
         )}
 
         {err && <div className="auth-err" style={{ marginTop: 12 }}>{err}</div>}
 
         <div className="modal-actions">
-          <button className="btn-ghost-full" onClick={onClose}>
+          <button className="btn-ghost-full" onClick={onClose} disabled={deleting}>
             {result ? 'Close' : 'Cancel'}
           </button>
           {!result && (
@@ -837,10 +905,125 @@ function ReconcileModal({ profile, onClose, onDone }) {
             </button>
           )}
           {result && (
-            <button className="btn-primary-full" onClick={onDone}>
+            <button className="btn-primary-full" onClick={onDone} disabled={deleting}>
               <i className="fas fa-check" /> Done
             </button>
           )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ============================================================
+   MANAGE IMPORTS MODAL
+   ============================================================ */
+function ManageImportsModal({ stationId, onClose, onDeleted }) {
+  const [runs, setRuns] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [deletingId, setDeletingId] = useState(null)
+  const [err, setErr] = useState('')
+
+  async function loadRuns() {
+    setLoading(true)
+    try {
+      const data = await getRecentReconciliations(stationId)
+      setRuns(data)
+    } catch (e) {
+      setErr(e.message || 'Failed to load imports')
+    }
+    setLoading(false)
+  }
+
+  useEffect(() => {
+    loadRuns()
+  }, [stationId])
+
+  async function handleDelete(run) {
+    const confirmMsg = `Are you sure you want to delete this ${run.provider.toUpperCase()} upload?\n\nFile: ${run.file_name || 'Unknown'}\nRows: ${run.total_rows}\nDate: ${new Date(run.created_at).toLocaleString()}\n\nThis will delete the ${run.inserted_count} pending transactions generated by this upload.`
+    
+    if (!window.confirm(confirmMsg)) return
+
+    setDeletingId(run.id)
+    setErr('')
+    
+    try {
+      await deleteReconciliationRun(run.id, stationId)
+      await loadRuns()
+      onDeleted()
+    } catch (e) {
+      setErr(e.message || 'Failed to delete run')
+    }
+    setDeletingId(null)
+  }
+
+  return (
+    <div className="modal-bg" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal modal-wide">
+        <h3>Recent Reconciliations</h3>
+        <div className="modal-sub">
+          Manage and undo previous statement uploads. Deleting a run will remove the unclaimed transactions it generated.
+        </div>
+
+        {err && <div className="auth-err" style={{ marginBottom: 12 }}>{err}</div>}
+
+        {loading ? (
+          <div style={{ textAlign: 'center', padding: 20, color: '#64748b' }}>
+            <i className="fas fa-spinner fa-spin" /> Loading imports…
+          </div>
+        ) : runs.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: 20, color: '#64748b' }}>
+            No recent imports found.
+          </div>
+        ) : (
+          <div style={{ maxHeight: 400, overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: 8 }}>
+            <table className="drops-table" style={{ fontSize: 13 }}>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Provider</th>
+                  <th>File</th>
+                  <th>Inserted</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {runs.map(run => (
+                  <tr key={run.id}>
+                    <td style={{ whiteSpace: 'nowrap' }}>
+                      {new Date(run.created_at).toLocaleDateString('en-GB')} <br/>
+                      <span style={{ color: '#64748b', fontSize: 11 }}>{new Date(run.created_at).toLocaleTimeString('en-GB')}</span>
+                    </td>
+                    <td>
+                      <span className={`pill ${run.provider === 'airtel' ? 'red' : 'amber'}`}>
+                        {run.provider}
+                      </span>
+                    </td>
+                    <td style={{ maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {run.file_name || '—'}
+                    </td>
+                    <td>{run.inserted_count}</td>
+                    <td>
+                      <button 
+                        className="btn-tiny" 
+                        style={{ background: '#fee2e2', color: '#dc2626', border: '1px solid #fca5a5' }}
+                        onClick={() => handleDelete(run)}
+                        disabled={deletingId === run.id}
+                      >
+                        {deletingId === run.id ? <i className="fas fa-spinner fa-spin" /> : <><i className="fas fa-trash" /> Delete</>}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="modal-actions" style={{ marginTop: 16 }}>
+          <button className="btn-ghost-full" onClick={onClose}>
+            Close
+          </button>
         </div>
       </div>
     </div>
